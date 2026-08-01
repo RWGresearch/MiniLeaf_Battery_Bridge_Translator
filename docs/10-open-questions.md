@@ -1,0 +1,131 @@
+# Open Questions
+
+## New to this project
+
+1. **`full_charge_flag` re-arm without a physical replug.** The real Leaf requires an unplug/
+   replug cycle to resume charging after this flag fires; the RZ450e side has no equivalent
+   signal. Candidate approaches (needs a decision before milestone 1's charging path is
+   considered done): re-arm once SoC drops below the charge target by a hysteresis margin (e.g.
+   2-3%), or a manual "reset charge stop" action in the GUI. See
+   `05-battery-management-safety.md`. **Still open as of 2026-07-31's charger-request ramp
+   feature** (`06-realtime-engine-and-watchdog.md` section 6) — the new Leaf-wants-to-charge-but-
+   RZ450e-hasn't-authorized mismatch is a SECOND place `full_charge_flag` gets set, using the exact
+   same non-latching, recomputed-fresh-every-tick approach as the existing AC-target case; a genuine
+   replug (a fresh `0x1F2` request) does clear it in practice for that specific trigger, but a real
+   sticky-latch mechanism generally is still undecided.
+2. **Exact staleness-watchdog behavior when only some source groups go stale.** The watchdog
+   (`06-realtime-engine-and-watchdog.md`) is specified per source-group (fast raw-CAN vs. DID/PID),
+   but the interaction when, say, only the DID/PID group goes stale while raw-CAN stays fresh
+   hasn't been fully specified — likely fine (raw-CAN covers voltage/current/temp, the safety-
+   critical fast-response quantities) but worth confirming once implemented.
+3. **GIDS threshold interaction.** The Leaf project found real thresholds (GIDS≈49 = low-battery
+   warning, GIDS≈5 = turtle mode) baked into the VCM itself. This project's derived GIDS formula
+   (`04-signal-mapping.md`) needs to be checked against these once real numbers are flowing, to
+   make sure the cell-voltage-driven `discharge_power_taper` (full power ≥3.50V, zero ≤3.00V/cell)
+   and `low_voltage_cutoff` (soft cut at 3.00V/cell, `min_soc_pct` a backup check only — see
+   `05-battery-management-safety.md`'s 2026-07-31 correction) don't put the bridge in an unexpected
+   VCM-side low-battery state before its own protection features would have acted. Since both are
+   now voltage-driven rather than SoC-driven, this is really a question of whether the *voltage*
+   defaults (3.50V/3.00V) map to a GIDS range comfortably above 49/5, not a SoC-floor question
+   anymore.
+4. **Whether the `charge_permission_input` interlock (`0x358`) needs a "no interlock present"
+   default behavior** — i.e. what should happen if this bridge is ever run without that specific
+   RZ450e signal wired up (e.g. an earlier hardware revision). Not expected to come up in the
+   current bench setup, but worth a documented default (likely: interlock defaults to "not
+   permitted" / fail-safe, not "permitted") before milestone 1 ships. **Partially answered in
+   practice as of 2026-07-31**: every place that reads this signal (`charge_target_taper`'s
+   `charging_active`, and the new charger-request ramp's `rz_authorized`/`charge_authorized`, `06-
+   realtime-engine-and-watchdog.md` section 6) already does `bool(rz_state.get_input(...))`, and
+   `SharedState.get_input()` returns `None` for a signal that's never arrived - so the fail-safe
+   "not permitted" default already holds for every code path touched so far. Not yet a documented,
+   deliberate project-wide policy, just an emergent consequence of the existing helper's behavior -
+   still worth writing down explicitly before milestone 1 ships.
+5. **Single combined RZ450e adapter — needs hardware confirmation, not just a software assumption.**
+   Collapsing bus1/bus2 onto one PCAN connection (per the user's 2026-07-31 correction) assumes
+   both logical buses are visible on the same physical CAN wire pair from the adapter's vantage
+   point. If the battery's two internal buses are actually electrically isolated networks (not
+   just an address-space split on a shared line), one adapter genuinely can't see both and this
+   would need to revert to two connections. Confirm against the real bench pack before relying on
+   this for anything beyond the current software's assumption.
+6. **Dashboard bar-gauge display ranges are estimates, not confirmed safety limits.** The `range`
+   metadata added to `02-source-signals-rz450e.md`'s signal registry (e.g. cell voltage 2.5-5.0V,
+   temp -40..160°F) is only there to scale the dashboard's bar gauges sensibly — it is a separate,
+   looser number from the actual researched/confirmed thresholds in `05-battery-management-
+   safety.md`. Don't confuse "the bar looks full" with "this is at a safety-relevant limit" — the
+   management panel's status text is the authoritative source for that, not the dashboard bar
+   position.
+7. **Does the RZ450e pack's internal cell-supervision hardware still balance cells in this
+   configuration?** Added 2026-07-31 alongside the new `cell_imbalance_monitor` feature
+   (`05-battery-management-safety.md`) — this bridge only monitors/warns on cell spread, it cannot
+   balance. If the pack's own internal BMS electronics are still powered and performing passive
+   balancing while connected to this bridge (rather than a real Toyota vehicle), spread should stay
+   roughly stable over time; if not, spread will likely grow over weeks/months of use, making the
+   monitor more important than it might first appear. No way to answer this without extended
+   real-hardware observation — track cell spread over several sessions once running against the
+   real bench pack.
+8. **Overcurrent monitor thresholds (150A discharge / 30A charge-regen) are provisional, not tuned
+   to a real drive cycle — and the monitor as a whole cannot see this pack's real operating
+   range.** Added 2026-07-31 alongside `05-battery-management-safety.md`'s new `overcurrent_monitor`
+   feature — derived from this project's own confirmed specs (comfortably below the `0x023`
+   sensor's ±204.7A saturation ceiling; above the Leaf AC charger's ~19A max) as a defensible
+   starting point, not from any cell datasheet (none exists for this pack) or observed real driving
+   current. **Corrected same day**: the ±204.7A ceiling is a limit of this specific CAN signal's
+   12-bit encoding, not the battery — the real pack is rated to a 500A discharge fuse and the
+   factory RZ450E's 230kW peak output is ~660A for short bursts (user-confirmed, `02-source-
+   signals-rz450e.md`). This monitor is therefore structurally unable to see anywhere near the
+   pack's real high-current range; a future hardware revision (a wider-range current sensor/shunt)
+   would be needed before real fuse-relevant or peak-relevant current could ever be monitored.
+   Real drive-cycle current logging is still needed to confirm the *sub-205A* thresholds don't
+   nuisance-warn during ordinary sustained acceleration/hill-climbing, but that's a separate,
+   narrower question from the sensor-range gap.
+9. **DC fast charging (150kW, ~430A into the pack) is a real pack capability not currently
+   addressed anywhere in this project.** User-confirmed 2026-07-31 (`02-source-signals-
+   rz450e.md`) that the RZ450e pack is rated for 150kW DC fast charging, separate from the Leaf's
+   6.6kW onboard AC charger this bridge's charge-taper/target features are built around
+   (`05-battery-management-safety.md`). `03-target-signals-leaf.md` has no DC fast-charge (CHAdeMO)
+   signal path documented today, and every current-based safety consideration in this project
+   (the charge/regen voltage taper's proactive margins, the overcurrent monitor's thresholds) was
+   sized against AC-charger-scale current (~19A), not DC-fast-charge-scale current (~430A). If DC
+   fast charging is ever brought into this bridge's scope, every charge-side feature needs
+   re-evaluating against that much higher current, not assumed to already cover it.
+
+## Inherited from `Refrance/RZ450e_battery_can_decode_Project/`
+
+7. **Amps vs. kilowatts for the wide-range current/power tap** (raw CAN `0x371`/`0x021`) — still
+   genuinely unresolved upstream; excluded from `02-source-signals-rz450e.md` entirely until
+   settled. Needs a much bigger pack-voltage swing test than any capture so far.
+8. **`0x4AF` usage-history table units** — behaves like a charge-throughput accumulator but real
+   units (coulombs? Wh? raw ADC-seconds?) never confirmed. Not used by this project.
+9. **DID `0x1F9A` vs. PID `0x9A` voltage resolution** — user suspects PID `0x9A`'s voltage copy may
+   have finer resolution than the currently-labeled-primary `0x1F9A`. Doesn't block this project
+   (both are slow DID/PID sources, secondary to raw-CAN anyway) but worth knowing about if a future
+   sanity-check feature is added.
+
+## Inherited from `Refrance/Leaf_BMS_Emulator/`
+
+10. **RESOLVED 2026-07-31 — Dash SOC% formula (`soc_correction`, `0x59E`).** Inherited from
+    Leaf_BMS_Emulator as unsolved there ("confirmed to be the dash-% source but confirmed not a 1:1
+    raw-to-percent mapping; the real formula was never derived... not something to try to solve
+    independently here"). **User confirmed on real hardware** (their own Leaf + this project's own
+    bench RZ450e pack, not a Leaf-project capture): **raw 0-200 = 0-100%** (2 raw counts per
+    percent) — a plain linear `soc_pct × 2.0` tie, added as a shipped default
+    (`bridge/mapping_engine.py`'s `default_ties()`). This project solved independently what the
+    reference project's own open question said not to attempt — worth remembering this is *our*
+    finding, not sourced from or yet fed back to `Refrance/Leaf_BMS_Emulator` (which stays
+    read-only regardless — see `01-project-goals.md`). See `04-signal-mapping.md`'s mismatch #2 and
+    `11-manual-verification-checklist.md` for the confirmation record. Reference profile saved by
+    the user: `config/7-31-2026-new-SOC-dash-fix.json`.
+11. **0x1ED (62kWh charger-limit) field** — unverified upstream, no real 62kWh capture exists yet.
+    If this project is ever run against a 62kWh ZE1 pack/car, treat this field's values as unproven
+    until confirmed.
+12. **Several Leaf dash-behavior signals with "no observed effect, more testing required"**
+    (discharge/charge power status, IR sensor malfunction, output power limit reason, voltage
+    latch) — these have confirmed defaults but unconfirmed real dash/car effects. Not expected to
+    matter for this project's mapping (none of them are currently planned mapping targets from
+    RZ450e data), but flagged here in case that changes.
+
+## Process note
+
+New open items discovered while building milestone 1 should be added here, following the same
+format: what's unresolved, why it doesn't block current work, and what would need to happen to
+resolve it.
