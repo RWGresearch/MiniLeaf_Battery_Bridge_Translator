@@ -71,6 +71,14 @@ def apply_style(root):
                  foreground=FG, arrowcolor=FG)
     st.map('TCombobox', fieldbackground=[('readonly', FIELD)],
            foreground=[('readonly', FG)])
+    # Warn.TCombobox (added 2026-08-03, docs/13 item 4.3): flags a mapping
+    # tie that references a key no longer present in the current signal
+    # registry (orphaned/renamed) - visually distinct from the ordinary
+    # "(unused)" blank state, which uses the plain TCombobox style above.
+    st.configure('Warn.TCombobox', fieldbackground=FIELD, background=PANEL,
+                 foreground=ERR, arrowcolor=ERR)
+    st.map('Warn.TCombobox', fieldbackground=[('readonly', FIELD)],
+           foreground=[('readonly', ERR)])
     st.configure('Vertical.TScrollbar', background=PANEL, troughcolor=BG, arrowcolor=FG)
     st.configure('Horizontal.TScrollbar', background=PANEL, troughcolor=BG, arrowcolor=FG)
     st.configure('TPanedwindow', background=BG)

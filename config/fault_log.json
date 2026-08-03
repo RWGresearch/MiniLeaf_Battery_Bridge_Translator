@@ -1,0 +1,192 @@
+{
+  "low_voltage_emergency": {
+    "label": "Low-voltage EMERGENCY hard cut (per-cell)",
+    "level": "hard",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok"
+  },
+  "low_voltage_soft": {
+    "label": "Low-voltage soft cut (capacity_empty)",
+    "level": "soft",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok"
+  },
+  "overvoltage_emergency": {
+    "label": "Cell overvoltage EMERGENCY hard cut - regen (per-cell)",
+    "level": "hard",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "proactive regen taper factor=1.00 (worst cell 3.612V - full <= 3.9V, zero >= 4.1V)"
+  },
+  "ac_overvoltage_emergency": {
+    "label": "Cell overvoltage EMERGENCY hard cut - AC charger (per-cell)",
+    "level": "hard",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "AC charger taper factor=1.00 (worst cell 3.612V - full <= 4.0V, zero >= 4.15V)"
+  },
+  "over_temp_emergency": {
+    "label": "Over-temperature EMERGENCY hard cut (hottest probe)",
+    "level": "hard",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 78.8F, hottest probe 80.6F)"
+  },
+  "charge_cold_block": {
+    "label": "Charge/regen blocked - coldest probe at/below freezing",
+    "level": "warn",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 78.8F, hottest probe 80.6F)"
+  },
+  "discharge_temp_zero": {
+    "label": "Discharge power at zero - over-temperature",
+    "level": "warn",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 78.8F, hottest probe 80.6F)"
+  },
+  "charge_temp_zero": {
+    "label": "Charge/regen power at zero - over-temperature",
+    "level": "warn",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 78.8F, hottest probe 80.6F)"
+  },
+  "cell_imbalance_warn": {
+    "label": "Cell imbalance warning (spread)",
+    "level": "warn",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok (spread 4mV)"
+  },
+  "overcurrent_discharge_warn": {
+    "label": "Overcurrent warning - discharge",
+    "level": "warn",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok (charge 0.2A)"
+  },
+  "overcurrent_charge_warn": {
+    "label": "Overcurrent warning - charge/regen",
+    "level": "warn",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok (charge 0.2A)"
+  },
+  "config_sanity": {
+    "label": "Battery-management config has an inverted/nonsensical threshold ordering",
+    "level": "warn",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok"
+  },
+  "input_validation_reject": {
+    "label": "Input plausibility check rejected a value",
+    "level": "warn",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok"
+  },
+  "cell_data_mismatch": {
+    "label": "Cell data cross-check mismatch (per-cell vs 0x020 pack summary)",
+    "level": "soft",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok (delta 0mV)"
+  },
+  "cell_data_mismatch_hard": {
+    "label": "Cell data cross-check mismatch - hard cut escalation",
+    "level": "hard",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok (delta 0mV)"
+  },
+  "staleness_soft": {
+    "label": "Staleness watchdog - soft cut (stale data)",
+    "level": "soft",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok (worst age 2.8s, counter:counter_5s)"
+  },
+  "staleness_hard": {
+    "label": "Staleness watchdog - hard cut escalation",
+    "level": "hard",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok (worst age 2.8s, counter:counter_5s)"
+  },
+  "hard_cut_latch": {
+    "label": "Hard cut LATCHED (relay_cut_request/interlock still asserted)",
+    "level": "hard",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "not latched"
+  },
+  "clamp_qc_full_wh": {
+    "label": "Output clamped: qc_full_wh",
+    "level": "warn",
+    "count": 2,
+    "active": false,
+    "first_triggered": 1785640788.7667143,
+    "last_triggered": 1785642792.6308026,
+    "last_cleared": null,
+    "last_detail": "67459.62 -> 51100 (out of documented encodable range)"
+  }
+}

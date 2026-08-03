@@ -43,10 +43,18 @@ available both ways (see `04-signal-mapping.md`).
 | `0x3F1` | `alive_counter` | 4-bit, wraps every 16 frames | Usable for the staleness watchdog. |
 | `0x424` | `counter_5s` | +1 every 5.000s, wraps mod 73 | Usable for the staleness watchdog. |
 
-**Checksum**: 10 of these 12 messages carry Toyota's additive checksum in byte 7 —
-`(ID_hi + ID_lo + DLC + sum(bytes[0:7])) & 0xFF`, confirmed 100% match across thousands of frames.
-The RZ450e project chose not to wire this into its own downstream logic, but **this project
-should**, as an additional staleness/corruption check (`06-realtime-engine-and-watchdog.md`).
+**Checksum**: Toyota's additive checksum format is `(ID_hi + ID_lo + DLC + sum(bytes[0:7])) & 0xFF`
+in byte 7. Confirmed 100% match on 5 of these messages — `0x020`, `0x023`, `0x358`, `0x3F1`,
+`0x424` — while `0x4A7`/`0x4A9`/`0x4C0`/`0x4AA` were checked and confirmed to be real payload data
+in byte 7, not a checksum (0% match). The RZ450e project chose not to wire this into its own
+downstream logic; this project does, as of 2026-08-03 (`docs/13` item 13.5) — every incoming frame
+on the 5 confirmed IDs is checksum-validated in `bridge/rz450e_signals.py`'s `frame_checksum_ok()`
+before decode, rejecting (and logging via `SharedState.note_checksum_failure()`) anything that
+fails, as an additional staleness/corruption check (`06-realtime-engine-and-watchdog.md`). Given a
+real enable/disable toggle the same day (`checksum_validation`, docs/13 item 15.15, default ON,
+Battery Management tab) — the checksum formula and the 5-ID set stay fixed, but whether the check
+actually runs at all is now editable, for deliberately testing how the rest of the pipeline handles
+a corrupt frame.
 
 **Multiplexing**: `0x4A9`/`0x4C0` round-robin `cell_block_mux` 0,4,8,...92 (4 cells per frame);
 `0x4AA` round-robins `temp_block_mux` 0,7,14. A cantools-based decode against the DBC handles this

@@ -118,6 +118,16 @@ class ShutdownSequencer:
         with self.lock:
             self._manual_shutdown_requested = True
 
+    def get_session_start(self):
+        """Thread-safe read of when the CURRENT bridge session began (the
+        last waiting_for_wake -> startup transition - real Leaf-bus traffic
+        seen after Start Bridge was pressed, whether that wake was manual or
+        a natural re-arm). Added 2026-08-04 for RealtimeEngine.
+        _charge_data_ready(), which needs actual bridge-session boundaries -
+        see docs/06 section 3."""
+        with self.lock:
+            return self.session_start
+
     def _run_state_fresh(self, now):
         times = list(self.ignition_last_seen.values())
         return bool(times) and (now - max(times) <= leaf_signals.IGNITION_QUIET_S)
@@ -163,14 +173,29 @@ class ShutdownSequencer:
             return self._chg_fresh(now) and \
                 (self.chg_trans == 1 or (self.chg_cmd or 0) > leaf_signals.CHG_CMD_IDLE)
 
-    def _should_wind_down(self, hard_cut_this_tick, charge_authorized=True):
+    def _should_wind_down(self, staleness_hard_cut, charge_authorized=True):
+        """`staleness_hard_cut` (docs/13 item 14.3, fixed 2026-08-03; was
+        `hard_cut_this_tick`, ANY hard cut) - deliberately narrowed to the
+        staleness watchdog's own hard-cut escalation specifically, per user
+        directive: "the bridge should not wind down unless there is a real
+        trigger to do so... a hard cut should not stop the bridge... all
+        fail safes are triggered and the bridge still operates" unless one
+        of the four Leaf-side triggers (or this staleness-specific 5th one)
+        actually fires. A voltage/temperature/cross-check emergency hard cut
+        latches relay_cut_request/interlock (see ManagementEngine._hard_
+        latched) and the bridge keeps running and broadcasting that cut
+        indefinitely - it does NOT wind down, which would make the bridge go
+        silent on the Leaf bus during an active emergency instead of holding
+        the cut asserted. Staleness is different: it means the bridge can no
+        longer safely read the battery AT ALL, which is a genuine reason to
+        stop transmitting entirely, not just assert a cut."""
         with self.lock:
             now = time.monotonic()
             if self._manual_shutdown_requested:
                 self._manual_shutdown_requested = False
                 return True
-            if hard_cut_this_tick:
-                return True   # 5th trigger, specific to this bridge (docs/06/07)
+            if staleness_hard_cut:
+                return True   # 5th trigger, specific to this bridge (docs/06/07) - staleness ONLY
 
             # `charge_authorized` (user directive, 2026-07-31): the Leaf
             # asking to charge (0x1F2) is only treated as a REAL, ongoing
@@ -216,8 +241,11 @@ class ShutdownSequencer:
 
             return False
 
-    def tick(self, hard_cut_this_tick, charge_authorized=True):
+    def tick(self, staleness_hard_cut, charge_authorized=True):
         """Advance the phase state machine. Returns (phase, t_ms_or_elapsed).
+        `staleness_hard_cut` (docs/13 item 14.3, fixed 2026-08-03; renamed
+        from `hard_cut_this_tick` - see _should_wind_down's docstring): ONLY
+        the staleness watchdog's own hard-cut escalation, not any hard cut.
         `charge_authorized` (docs/06/07, added 2026-07-31): whether RZ450e's
         own charge_permission_input interlock currently grants a charge
         request the Leaf is making - see _should_wind_down. Defaults to True
@@ -233,7 +261,7 @@ class ShutdownSequencer:
                 t_ms = (now - self.session_start) * 1000.0
                 if t_ms >= leaf_signals.T_RUNNING:
                     self.phase = 'running'
-                if self._should_wind_down(hard_cut_this_tick, charge_authorized):
+                if self._should_wind_down(staleness_hard_cut, charge_authorized):
                     self.phase = 'winding_down'
                     self.shutdown_t0 = now
                 return self.phase, t_ms
@@ -299,9 +327,20 @@ class RealtimeEngine:
         self._chg_ramp_raw = None
         self._chg_ramp_last_t = None
         self._chg_uprate_current = 0
+        # Last computed reason the charge ramp itself (not ManagementEngine)
+        # is holding at 0/blocked, if any (docs/13 item 14.4, added
+        # 2026-08-03) - None while the ramp is active or idle-with-no-
+        # request. Read by charge_status_summary() below so the GUI can show
+        # the SAME reason that's actually logged, instead of a hardcoded
+        # guess - see that method's own docstring for why this exists.
+        self._last_charge_gate_reason = None
         # Charge-replug edge detector (added 2026-08-01) - see
         # _apply_charge_ramp()'s notify_charge_replug() call below.
         self._prev_charge_active = False
+        # How long charge_active() has been continuously False (added
+        # 2026-08-03, docs/13 item 13.4) - a resumption only counts as a
+        # genuine replug if this gap was long enough; see _apply_charge_ramp.
+        self._chg_inactive_since = None
         # Heartbeat (added 2026-08-01, user request) - updated every _tx_loop
         # iteration. sequencer.phase alone can't reveal a dead TX thread: if
         # _tx_loop crashes, phase just freezes at its last value and the GUI
@@ -381,6 +420,23 @@ class RealtimeEngine:
                 self.trc_logger.log_frame('rz450e', False, arb_id, len(data), data)
             if self.did_client.feed(arb_id, data):
                 continue
+            # Checksum validation (docs/13 item 13.5, added 2026-08-03, user
+            # directive): reject a frame that fails its confirmed Toyota
+            # additive checksum BEFORE decoding it at all - this project's
+            # own docs said this check "should" be wired in as a corruption
+            # detector, but it never actually was until now. A frame that
+            # fails this is never decoded, same treatment as a plausibility-
+            # check rejection (see _ingest_validated below). Toggleable
+            # (docs/13 item 15.15, added 2026-08-03, default ON) - reading
+            # this live every frame (not cached) so flipping the checkbox
+            # takes effect immediately, same as every other management
+            # feature; when off, corrupt frames are decoded anyway (for
+            # deliberately testing what happens downstream with bad data).
+            if self.management.config['checksum_validation']['enabled'] \
+                    and not rz450e_signals.frame_checksum_ok(arb_id, data):
+                self.state.note_checksum_failure(arb_id)
+                self.log_fn(f'REJECTED corrupt frame (checksum mismatch): CAN 0x{arb_id:03X}')
+                continue
             if arb_id == rz450e_signals.ID_TICK_424:
                 vals = rz450e_signals.decode_424(data)
                 if vals:
@@ -409,7 +465,16 @@ class RealtimeEngine:
         (source_label = 'DID ...'), so validation applies uniformly to every
         source, fast or slow. A rejection is logged and recorded via
         note_rejected_input() so ManagementEngine.apply() can surface a
-        fault_log entry for it on the normal tick cycle."""
+        fault_log entry for it on the normal tick cycle.
+
+        Toggleable (docs/13 item 15.14, added 2026-08-03, default ON) - read
+        live every call, not cached, so the checkbox takes effect on the very
+        next frame. When off, every decoded value passes straight through
+        unfiltered (for deliberately testing what happens downstream with an
+        implausible value, rather than having it silently dropped here)."""
+        if not self.management.config['input_validation']['enabled']:
+            self.state.update_inputs(vals)
+            return
         valid, rejected = rz450e_signals.validate_inputs(vals)
         if valid:
             self.state.update_inputs(valid)
@@ -514,25 +579,67 @@ class RealtimeEngine:
         chg_cfg = self.state.charge_emulation
         emulate_on = bool(chg_cfg.get('charge_emulate'))
         leaf_wants_charge = self.sequencer.charge_active(now)
-        # Charger replug detection (added 2026-08-01, docs/12 finding F8) -
-        # a fresh 0x1F2 request following a period with none active is what
-        # a genuine unplug/replug looks like on the bus (same reasoning
-        # already used elsewhere for full_charge_flag's own re-arm). Clears
-        # a latched hard cut - independent of whether "Emulate charger
-        # request" is even enabled, since a real replug happens regardless.
-        if leaf_wants_charge and not self._prev_charge_active:
-            self.management.notify_charge_replug()
+
+        # Replug detection (docs/13 item 13.4, fixed 2026-08-03): a bare
+        # rising edge of leaf_wants_charge is NOT reliable evidence of an
+        # actual physical unplug/replug - a single dropped/delayed 0x1F2
+        # frame (goes stale >CHG_CMD_FRESH_S=0.5s, then resumes) or the VCM's
+        # own charge-negotiation retry behavior can produce the exact same
+        # rising edge with the plug never having moved, which would silently
+        # clear an emergency-tier latch with no relation to a real replug -
+        # exactly the gap an independent review pass found in the original
+        # (2026-08-01) version of this fix. Require the request to have been
+        # genuinely ABSENT for at least leaf_signals.CHG_END_STOP_S (3.0s -
+        # the same threshold the shutdown sequencer itself uses to decide a
+        # charge session has really ended, not a new invented number) before
+        # a resumption counts as a "replug" allowed to clear the latch. A
+        # shorter gap just resumes the ramp normally without touching it.
+        if not leaf_wants_charge:
+            if self._chg_inactive_since is None:
+                self._chg_inactive_since = now
+        else:
+            if not self._prev_charge_active:
+                gap = (now - self._chg_inactive_since) if self._chg_inactive_since is not None else 0.0
+                if gap >= leaf_signals.CHG_END_STOP_S:
+                    self.management.notify_charge_replug()
+                else:
+                    self.log_fn(f'0x1F2 charge request resumed after only {gap:.2f}s - too brief to '
+                                f'count as a real unplug/replug (need >= {leaf_signals.CHG_END_STOP_S:g}s); '
+                                f'ramp resumes normally, any latched hard cut is NOT cleared by this')
+            self._chg_inactive_since = None
         self._prev_charge_active = leaf_wants_charge
+
         rz_authorized = bool(self.state.get_input('charge_permission_input'))
-        active = emulate_on and leaf_wants_charge and rz_authorized
+
+        # Data-presence gate (docs/13 item 13.1b, added 2026-08-03, REWORKED
+        # same day after user clarification): driving is allowed to run on
+        # cached/last-known-good values until the general staleness watchdog
+        # (bridge/management_engine.py) would object - charging must not,
+        # full stop. This checks only that every required signal has been
+        # seen LIVE at least once this session (not a custom freshness
+        # timer - a separate stricter timer was the first version of this
+        # fix and was explicitly rejected by the user in favor of reusing
+        # the same watchdog driving already gets). Once this gate passes
+        # once, ongoing staleness protection is entirely the general
+        # watchdog's job - it already forces a charge stop (and, per the
+        # same clarification, now also sets full_charge_flag) when it
+        # fires, so there is no separate/duplicate timer here. See
+        # _charge_data_ready().
+        data_ready, missing_key = True, None
+        if chg_cfg.get('require_live_data_to_charge', True):
+            data_ready, missing_key = self._charge_data_ready()
+
+        active = emulate_on and leaf_wants_charge and rz_authorized and data_ready
 
         if active:
+            self._last_charge_gate_reason = None   # docs/13 item 14.4 - no gate reason while genuinely ramping
             level = int(chg_cfg.get('chg_uprate_level', 0)) & 7
             rate = leaf_signals.CHG_RAMP_RAW_PER_S / (2 ** (7 - level))
             if self._chg_ramp_raw is None:
                 self._chg_ramp_raw = float(leaf_signals.CHG_RAMP_START_RAW)
-                self.log_fn(f'0x1F2 charge request active + RZ450e permission granted - starting '
-                            f'0x1DC charger ramp: level {level}, 0 kW rising {rate * 0.1:.3g} kW/s')
+                self.log_fn(f'0x1F2 charge request active + RZ450e permission granted + battery data '
+                            f'genuinely live - starting 0x1DC charger ramp: level {level}, 0 kW rising '
+                            f'{rate * 0.1:.3g} kW/s')
             target_kw = float(chg_cfg.get('charge_target_kw', 0.0))
             target_raw = round((target_kw + 10) / 0.1)
             self._chg_ramp_raw = min(self._chg_ramp_raw + rate * dt,
@@ -542,29 +649,133 @@ class RealtimeEngine:
             self._chg_uprate_current = level
         else:
             if self._chg_ramp_raw is not None:
-                self.log_fn('Charge request ended (or permission withdrawn) - 0x1DC charger ramp '
+                self.log_fn('Charge request ended (or permission/data withheld) - 0x1DC charger ramp '
                             'back to idle (uprate 0, charger limit from slider)')
             self._chg_ramp_raw = None
             self._chg_uprate_current = 0
 
-            # Mismatch: the Leaf is actively asking to charge but RZ450e has
-            # not authorized it (user directive, 2026-07-31) - force an
-            # explicit stop instead of leaving whatever static/mapped value
-            # is already sitting in leaf_state. full_charge_flag is the
-            # confirmed real-hardware "instant charge stop + contactor drop,
-            # needs a physical replug" bit (docs/03) - exactly matching the
-            # desired "charger stops, sleeps till replugged" behavior, since
-            # a real replug is what makes the Leaf send a fresh 0x1F2 request
-            # in the first place. ShutdownSequencer._should_wind_down's
-            # `charge_authorized` parameter treats this same mismatch as "not
-            # really charging" too, so the bridge is free to wind down/sleep
-            # here rather than staying awake forever just because the Leaf
-            # keeps asking.
-            if emulate_on and leaf_wants_charge and not rz_authorized:
+            # Mismatch: the Leaf is actively asking to charge but something
+            # is blocking it - either RZ450e hasn't authorized it (user
+            # directive, 2026-07-31) or the battery data isn't fresh/present
+            # enough to trust (2026-08-03) - force an explicit stop instead
+            # of leaving whatever static/mapped value is already sitting in
+            # leaf_state. full_charge_flag is the confirmed real-hardware
+            # "instant charge stop + contactor drop, needs a physical
+            # replug" bit (docs/03) - exactly matching the desired "charger
+            # stops, sleeps till replugged" behavior. ShutdownSequencer.
+            # _should_wind_down's `charge_authorized` parameter treats this
+            # same mismatch as "not really charging" too, so the bridge is
+            # free to wind down/sleep here rather than staying awake forever
+            # just because the Leaf keeps asking.
+            if emulate_on and leaf_wants_charge and not active:
+                if not rz_authorized:
+                    reason = 'RZ450e has not granted charge_permission_input'
+                elif not data_ready:
+                    reason = f'no genuinely live battery data yet, cannot start on cached/default values (missing: {missing_key})'
+                else:
+                    reason = 'blocked'
+                self._last_charge_gate_reason = reason
                 leaf_state['full_charge_flag'] = 1
                 leaf_state['charge_limit_kw'] = 0.0
                 leaf_state['charger_limit_kw'] = -10.0
+                self.log_fn(f'Charge stop - Leaf wants to charge but {reason}')
+            else:
+                # Not this gate's doing (docs/13 item 14.4) - either the ramp
+                # is genuinely idle (no request/not enabled) or it's active;
+                # clear any stale reason from a PREVIOUS stop so
+                # charge_status_summary() doesn't keep repeating an old
+                # explanation once this specific gate is no longer the cause.
+                self._last_charge_gate_reason = None
         return leaf_state
+
+    def charge_status_summary(self):
+        """One accurate, human-readable line describing the charger-request
+        ramp's current state, for both GUI surfaces (gui/panels.py's
+        ChargeEmulationPanel, gui/dashboard.py's Charge emulation section) to
+        share instead of each re-deriving their own (docs/13 item 14.4, fixed
+        2026-08-03).
+
+        Bug this replaces: both GUI spots used to check only `bool(tx.get(
+        'full_charge_flag'))` and, if set, always print "RZ450e permission
+        not granted" - but full_charge_flag can now be forced true for
+        SEVERAL different reasons that have nothing to do with the interlock:
+        the live-data gate (13.1b) not yet satisfied, the general staleness
+        watchdog (13.1) escalating mid-charge, or - not a fault at all - the
+        AC daily/extended target SoC being reached (a normal, successful
+        charge-complete). Showing "permission not granted" for any of those
+        actively misleads a user troubleshooting why charging won't start
+        when RZ450e's permission was never the actual problem.
+
+        Resolves the reason from the SAME live status text/state each
+        subsystem already produces, in priority order (most specific/most
+        likely to be the actual current cause first), rather than guessing:
+        1. `ManagementEngine`'s own staleness_watchdog status (covers the
+           general watchdog forcing a charge-stop, docs/13 item 13.1).
+        2. `ManagementEngine`'s own ac_charge_taper status (covers the target
+           SoC reached - a SUCCESS case, not a fault).
+        3. This engine's own `_last_charge_gate_reason` (covers the ramp's
+           own dual/triple-gate check: RZ450e permission or the live-data
+           gate)."""
+        cfg = self.state.charge_emulation
+        if not bool(cfg.get('charge_emulate')):
+            return 'disabled - "Max power for charger" uses the Signal Mapping value'
+
+        tx = self.state.snapshot_leaf_tx()
+        full_stop = bool(tx.get('full_charge_flag'))
+        if full_stop:
+            mgmt_status = self.state.snapshot_management_status()
+            stale = mgmt_status.get('staleness_watchdog', '')
+            if 'charging stopped' in stale:
+                return f'STOPPED - staleness watchdog: {stale}'
+            ac_status = mgmt_status.get('ac_charge_taper', '')
+            if 'target' in ac_status and 'reached' in ac_status:
+                return f'CHARGE COMPLETE - {ac_status}'
+            reason = self._last_charge_gate_reason or 'blocked (reason unavailable)'
+            return f'STOPPED - Leaf wants to charge but {reason}'
+
+        now = time.monotonic()
+        leaf_wants = self.sequencer.charge_active(now)
+        rz_auth = bool(self.state.get_input('charge_permission_input'))
+        if leaf_wants and rz_auth:
+            return 'ramping/active - both triggers present'
+        return 'idle - no active, authorized charge request'
+
+    def _charge_data_ready(self):
+        """True if every one of the 96 per-cell voltages AND the pack temp
+        extremes has been seen LIVE at least once during the CURRENT bridge
+        session (docs/13 item 13.1b, reworked 2026-08-03, corrected
+        2026-08-04). Deliberately strict - ALL 96 cells, not a pack-level
+        summary or a fallback to last_known_good - since the whole point of
+        this gate is "don't start moving current into/out of the pack on
+        data we haven't actually confirmed is flowing right now."
+
+        "Current session" means since the last waiting_for_wake -> startup
+        transition (ShutdownSequencer.get_session_start()), NOT since the
+        app process launched. Bug found 2026-08-04: this originally checked
+        SharedState.age_of() is not None, i.e. "has this key EVER updated
+        since SharedState was created" - since SharedState lives for the
+        whole app run and rz450e_ts is never cleared, once a cell went live
+        ONCE this gate stayed satisfied FOREVER, even across a full sleep
+        -> wake cycle where RZ450e might now be completely disconnected.
+        Comparing each signal's last-update timestamp against the CURRENT
+        session's start time closes that gap: a contact from a previous
+        session doesn't count, only one from this one does.
+
+        This is still NOT an ongoing freshness/age check - once a signal has
+        gone live this session it stays "ready" here even if it later goes
+        stale within the same session; that ongoing case is deliberately
+        left to the general staleness watchdog (bridge/management_engine.py),
+        which already forces a charge stop (see its full_charge_flag note)
+        on the same 60s/+5s schedule driving gets - no separate/duplicate
+        timer at this layer. Returns (ready, first_missing_key_found)."""
+        session_start = self.sequencer.get_session_start()
+        keys = rz450e_signals.cell_voltage_keys() + ['temp_max', 'temp_min']
+        timestamps = self.state.timestamps_of(keys)
+        for key in keys:
+            ts = timestamps.get(key)
+            if ts is None or ts < session_start:
+                return False, key
+        return True, None
 
     def _compose_leaf_state(self):
         leaf_state = dict(leaf_signals.DEFAULTS)
@@ -597,8 +808,14 @@ class RealtimeEngine:
         return leaf_state
 
     def _build_frame(self, arb_id, s, t_ms, in_startup):
-        prun, tick10, latch = self._prun, self._tick10, self._latch
+        tick10, latch = self._tick10, self._latch
         gen = self.state.generated_enabled
+        # 'prun' checkbox (fixed 2026-08-01, item 12.5): previously had zero
+        # effect - unchecking it now forces the free-running PRUN counter to
+        # a constant 0 in every frame that carries it, instead of the real
+        # rolling value. Doesn't touch CRC/timing, purely the PRUN field
+        # itself and whichever opaque table entry it happens to index.
+        prun = self._prun if gen.get('prun', True) else 0
 
         if arb_id == 0x1DB:
             if in_startup and t_ms < leaf_signals.T_VALID:
@@ -619,7 +836,9 @@ class RealtimeEngine:
             # this read the static chg_uprate_level slider directly any
             # time the checkbox was on, regardless of charge state - wrong
             # per that same confirmation.
-            return leaf_signals.build_1dc(s, prun, uprate=self._chg_uprate_current)
+            code_override = None if gen.get('code_1dc', True) else (0, 0, 0)
+            return leaf_signals.build_1dc(s, prun, uprate=self._chg_uprate_current,
+                                           code_1dc_override=code_override)
 
         if arb_id == leaf_signals.HVBAT_ID_1C2:
             if not gen.get('heartbeat_1c2', True):
@@ -638,13 +857,16 @@ class RealtimeEngine:
             if in_startup and tick10 <= 1:
                 return leaf_signals.build_5bc_first(s, tick10)
             gids_raw = 0x3FF if (in_startup and t_ms < leaf_signals.T_VALID + 50) else None
-            return leaf_signals.build_5bc(s, tick10, gids_raw=gids_raw)
+            chg_time_override = None if gen.get('chg_time_5bc', True) else (0, 0, 0)
+            return leaf_signals.build_5bc(s, tick10, gids_raw=gids_raw,
+                                           chg_time_override=chg_time_override)
 
         if arb_id == 0x59E:
             return leaf_signals.build_59e(s)
 
         if arb_id == 0x5C0:
-            return leaf_signals.build_5c0(s, tick10)
+            hist_override = None if gen.get('hist_5c0', True) else (0, 0, 0)
+            return leaf_signals.build_5c0(s, tick10, hist_override=hist_override)
 
         if arb_id == leaf_signals.HVBAT_ID_5EB:
             if not gen.get('seq_5eb', True):
@@ -688,7 +910,14 @@ class RealtimeEngine:
             last_hard_cut, last_soft_cut = hard_cut, soft_cut
 
             charge_authorized = bool(self.state.get_input('charge_permission_input'))
-            phase, timing = self.sequencer.tick(hard_cut, charge_authorized)
+            # Wind-down trigger 5 is staleness-specific ONLY (docs/13 item
+            # 14.3, fixed 2026-08-03) - `hard_cut` above (used for the Log
+            # panel/last_hard_cut tracking) reflects ANY hard-cut source, but
+            # only the staleness watchdog's own escalation is allowed to wind
+            # the bridge down; every other hard cut just latches and keeps
+            # the bridge running/transmitting (see ManagementEngine.
+            # staleness_hard_cut's docstring).
+            phase, timing = self.sequencer.tick(self.management.staleness_hard_cut, charge_authorized)
             if phase != last_phase:
                 if phase == 'startup' and last_phase == 'waiting_for_wake' and self.sequencer.rearmed_naturally:
                     # A waiting_for_wake -> startup transition following a

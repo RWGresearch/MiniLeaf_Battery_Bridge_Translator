@@ -11,12 +11,16 @@ on-schedule Leaf HVBAT CAN frames.
 
 ## Status
 
-Documentation/planning stage. See [`docs/01-project-goals.md`](docs/01-project-goals.md) for the
-full picture. No application code has been written yet.
+Phase 1 is a working application: `bridge/` (mapping, battery-management, real-time engine,
+config profiles) and `gui/` (tkinter/ttk configurator + live bridge) are implemented and covered by
+an automated test suite under `tests/`. See [`docs/01-project-goals.md`](docs/01-project-goals.md)
+for the full picture, and `docs/13-review-checklist-2026-08-01.md` /
+`docs/14-validation-test-plan.md` for what's still open (mostly real-hardware confirmation of
+threshold values, not missing features).
 
 ## Two phases
 
-- **Phase 1 (active)** — a Python/customtkinter GUI app, run on a PC with two (up to eight) PEAK
+- **Phase 1 (active)** — a Python/tkinter GUI app, run on a PC with two (up to eight) PEAK
   PCAN-USB adapters. It's both a **configurator** (build the signal-mapping and battery-management
   config with no code) and a **live bridge** (real CAN in from the RZ450e pack, real CAN out to the
   Leaf car) — used to validate every mapping and safety feature against real hardware.

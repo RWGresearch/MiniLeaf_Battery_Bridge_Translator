@@ -13,17 +13,31 @@ moment it sees the bus wake, sending placeholder "signal invalid" values while i
 completing precharge, then switching to normal content. **The staged bring-up timing itself *is*
 the handshake.**
 
-## Startup timeline (t=0 = first VCM traffic detected on the Leaf bus)
+## Startup timeline (t=0 = first VCM traffic detected on the Leaf bus, i.e. `0x1C2`'s own start)
 
 | t (ms) | Event |
 |---|---|
-| 60 | `0x1C2` starts (trigger: VCM traffic appearing) |
+| 0 | `0x1C2` starts, immediately, no delay — trigger: VCM traffic appearing on the bus. Every other offset below is measured from this same moment, not from a separate "bus wake" instant. |
 | 65 | `0x1DB` + `0x1DC` start, phase A (invalid placeholders) |
 | 155 | `0x55B` + `0x5BC` start — SOC/SOH valid immediately, other fields invalid |
 | 565 | `0x59E` + `0x5C0` start, **fully normal from their first frame** — no invalid phase |
 | 865 | `0x1DB`/`0x1DC` limits/voltage become fully valid |
 | 915 | `0x5BC` GIDS becomes valid (last field to clear invalid) |
 | 2105 | `0x1DB` failsafe status switches from forced startup value 0 to normal running value |
+
+**Corrected 2026-08-03 (`docs/13` item 14.2)** — this table previously listed `0x1C2` at t=60ms.
+Traced to the source: the Leaf project's own `HVBAT_PowerUp_Handshake_Report.md` §2 measures from
+the very first frame in that specific `.trc` recording (including *other* ECUs' one-shot alive
+frames, which arrive before the VCM's real 10ms stream) and observes `0x1C2` at "+60ms" in THAT
+recording's own absolute timeline — but its §4 summary, and `04-startup-sequence.md`'s own summary,
+both say to **"immediately start 0x1C2"** the instant real bus traffic is detected, with no
+separate gate/delay constant, and `04-startup-sequence.md`'s own named-constants list
+(`T_1DB_START=65`/`T_55B_START=155`/etc., "all milliseconds from bus wake / `0x1C2` start" — i.e.
+those two are meant to be the same instant) never includes a `T_1C2_START` either. The "+60ms"
+figure is an artifact of when VCM traffic happened to first appear in that one recording relative
+to an earlier absolute start point, not a deliberate timing gate the real battery or the emulator
+enforces. `bridge/realtime_engine.py`'s `_tx_loop()` already sends `0x1C2` immediately (no
+start-offset gate) — the code was correct; this table was the stale side.
 
 `0x1DB` walks phases A→B→C→D→E automatically on this wall-clock schedule — no external condition
 needed to advance. Full byte-level phase content is in the Leaf project's own

@@ -24,9 +24,8 @@ data actually came from). Read in order:
     confirmed status per feature as testing happens.
 12. **`12-nmc-bms-design-research.md`** — researched NMC/BMS design fundamentals (voltage,
     temperature, C-rate, imbalance, protection architecture) with sources, plus an audit of our
-    design against them. Findings F1, F3, F4, F5, F6 implemented; F2 implemented as monitor-only
-    by deliberate scope choice; F8 (fault latching) discovered but not yet implemented — needs a
-    decision.
+    design against them. Findings F1, F3, F4, F5, F6, F8 implemented; F2 implemented as monitor-only
+    by deliberate scope choice.
 
 ## Mission
 

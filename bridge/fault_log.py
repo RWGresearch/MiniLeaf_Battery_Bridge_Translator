@@ -49,6 +49,7 @@ FAULT_DEFINITIONS = [
     ('staleness_soft', 'Staleness watchdog - soft cut (stale data)', 'soft'),
     ('staleness_hard', 'Staleness watchdog - hard cut escalation', 'hard'),
     ('input_validation_reject', 'Input plausibility check rejected a value', 'warn'),
+    ('checksum_reject', 'Toyota checksum validation rejected a corrupt frame', 'warn'),
     ('cell_data_mismatch', 'Cell data cross-check mismatch (per-cell vs 0x020 pack summary)', 'soft'),
     ('cell_data_mismatch_hard', 'Cell data cross-check mismatch - hard cut escalation', 'hard'),
     ('config_sanity', 'Battery-management config has an inverted/nonsensical threshold ordering', 'warn'),

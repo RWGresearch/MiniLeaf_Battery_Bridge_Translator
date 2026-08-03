@@ -13,6 +13,7 @@ import os
 from bridge.fault_log import FaultLog
 from bridge.mapping_engine import MappingEngine
 from bridge.management_engine import ManagementEngine
+from bridge import rz450e_signals
 
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config')
 DEFAULT_PROFILE_PATH = os.path.join(CONFIG_DIR, 'profile.json')
@@ -55,10 +56,31 @@ def apply_profile(profile, state):
         return MappingEngine(), ManagementEngine()
     state.vehicle.update(profile.get('vehicle', {}))
     state.generated_enabled.update(profile.get('generated_signals', {}))
-    state.charge_emulation.update(profile.get('charge_emulation', {}))
+    _apply_charge_emulation(state, profile.get('charge_emulation', {}))
     mapping = MappingEngine.from_list(profile.get('mappings', []))
     management = ManagementEngine.from_dict(profile.get('management_features', {}))
     return mapping, management
+
+
+def _apply_charge_emulation(state, loaded):
+    """Clamps every numeric field to leaf_signals.CHARGE_EMULATION_BOUNDS
+    before applying it (docs/13 items 13.3/13.9, fixed 2026-08-03) - same
+    reasoning as ManagementEngine.from_dict()'s bounds clamp: a hand-edited
+    or corrupted profile.json must not be able to set an AC-charger/regen
+    threshold to an arbitrary value just because it bypasses the GUI. A
+    value that can't be coerced to a number is dropped, leaving the
+    existing default in place, rather than written through as-is."""
+    from bridge import leaf_signals
+    for key, value in loaded.items():
+        if key not in state.charge_emulation:
+            continue
+        bounds = leaf_signals.CHARGE_EMULATION_BOUNDS.get(key)
+        if bounds is not None:
+            try:
+                value = max(bounds[0], min(bounds[1], float(value)))
+            except (TypeError, ValueError):
+                continue
+        state.charge_emulation[key] = value
 
 
 def save_last_known_good(state, path=LAST_KNOWN_GOOD_PATH):
@@ -69,13 +91,25 @@ def save_last_known_good(state, path=LAST_KNOWN_GOOD_PATH):
 
 
 def load_last_known_good(path=LAST_KNOWN_GOOD_PATH):
+    """Returns (valid, rejected) - docs/13 item 13.2 (fixed 2026-08-03): live
+    CAN/DID data is plausibility-checked (rz450e_signals.validate_inputs())
+    before it ever reaches SharedState, but this disk-persisted cache
+    previously was NOT - a corrupted file, a hand edit, or a copy-pasted
+    cache from a different pack would inject an unvalidated number straight
+    into every safety cutoff/taper calculation via SharedState.get_input()'s
+    fallback. Now runs through the exact same check as live data. `rejected`
+    is for the caller to log - a rejected key is just dropped, same as a
+    rejected live sample."""
     if not os.path.exists(path):
-        return {}
+        return {}, {}
     try:
         with open(path, 'r') as f:
-            return json.load(f)
+            raw = json.load(f)
     except (json.JSONDecodeError, OSError):
-        return {}
+        return {}, {}
+    if not isinstance(raw, dict):
+        return {}, {}
+    return rz450e_signals.validate_inputs(raw)
 
 
 def save_fault_log(management_engine, path=FAULT_LOG_PATH):

@@ -5,7 +5,7 @@ user request, see gui/theme.py)."""
 import tkinter as tk
 from tkinter import ttk
 
-from bridge import can_backend, leaf_signals, rz450e_signals
+from bridge import can_backend, leaf_signals, management_engine, rz450e_signals
 from bridge.mapping_engine import MappingTie, COMBINE_TYPES, explain_tie
 from gui.info_popup import show_info_popup, help_btn
 from gui.theme import VScrollFrame, BASE_FONT, FG, FIELD, FG_DIM, ERR, OK
@@ -150,6 +150,25 @@ AC_CHARGE_TAPER_HELP = (
     "session, never from simply driving above the target SoC. Toggle "
     "'Extended mode' for a road-trip charge to the extended target instead "
     "of the daily one."
+)
+REQUIRE_LIVE_DATA_HELP = (
+    "Require live data to charge (docs/13 item 13.1b, added 2026-08-03)\n\n"
+    "Driving is allowed to run on cached/last-known-good values until the "
+    "general staleness watchdog (Battery Management tab, 60s soft cut / +5s "
+    "hard escalation) would object. Charging must NOT start on cached or "
+    "default values at all - when enabled (recommended), the ramp will not "
+    "start unless EVERY ONE of the 96 per-cell voltages plus the pack's max/"
+    "min temperature has been seen LIVE at least once this session - not a "
+    "pack-level summary, all 96 individually, and not from the startup cache. "
+    "Blocked the same way as an RZ450e permission mismatch: full_charge_flag "
+    "set, charger ramp held at 0, needs a fresh charge request to try again "
+    "once live data has actually arrived.\n\n"
+    "This is a ONE-TIME startup gate, not an ongoing freshness timer - once "
+    "live data has arrived and the ramp is running, protection against data "
+    "going stale later is the SAME 60s/+5s watchdog driving gets (which also "
+    "sets full_charge_flag when it fires), not a separate/stricter timer. "
+    "Per user directive: charging gets a different STARTUP requirement than "
+    "driving, not different ongoing protection."
 )
 MANAGEMENT_FEATURE_HELP = {
     'low_voltage_cutoff': (
@@ -332,6 +351,34 @@ MANAGEMENT_FEATURE_HELP = {
         "genuinely unreliable reading, not a real physical condition, so "
         "this is a data-integrity check, not a voltage-level protection "
         "feature (that's low_voltage_cutoff/charge_target_taper's job)."
+    ),
+    'input_validation': (
+        "Input plausibility validation (docs/13 item 15.14, added 2026-08-03)\n\n"
+        "Every RZ450e-decoded value is checked against a generous physical-"
+        "plausibility range (rz450e_signals.PLAUSIBLE_RANGES - much wider "
+        "than any actual safety threshold, meant only to catch obvious bus/"
+        "decode garbage) before it's ever written into live state. A "
+        "rejected value is simply dropped, not written - the field keeps "
+        "aging under its last-good value instead, eventually caught by the "
+        "staleness watchdog if the rejections keep happening.\n\n"
+        "Default ON - this is a genuine safety net. Turning it off lets "
+        "every decoded value through unfiltered regardless of how "
+        "physically implausible it is, which is useful for deliberately "
+        "testing how the rest of the pipeline handles a bad reading, but "
+        "should not be left off during real operation."
+    ),
+    'checksum_validation': (
+        "Toyota checksum validation (docs/02, docs/13 item 15.15, added 2026-08-03)\n\n"
+        "The 5 RZ450e messages confirmed to carry Toyota's additive "
+        "checksum (0x020/0x023/0x358/0x3F1/0x424) are checksum-verified "
+        "before they're decoded at all - a mismatch (or a too-short frame) "
+        "means the frame is corrupt and it's rejected outright, never "
+        "handed to a decoder.\n\n"
+        "Default ON - this is a genuine safety net. Turning it off lets "
+        "every frame on these 5 IDs through for decoding regardless of "
+        "whether its checksum is valid, which is useful for deliberately "
+        "testing how the rest of the pipeline handles a corrupt frame, but "
+        "should not be left off during real operation."
     ),
 }
 
@@ -533,6 +580,14 @@ class MappingPanel(ttk.Frame):
     unused) + combine selector + output dropdown + '?' popup + remove."""
 
     BLANK = '(unused)'
+    # Orphan/rename warning (docs/13 item 4.3, added 2026-08-03): a tie can
+    # reference an input/output key that no longer exists in the current
+    # signal registry (a field got renamed, or a saved profile predates a
+    # registry change) - previously that silently rendered exactly like a
+    # genuinely-blank slot ("(unused)"), with no way to tell "nothing here"
+    # apart from "something here that's now broken." This prefix marks that
+    # case distinctly and keeps the actual stale key visible.
+    ORPHAN_PREFIX = '(!) UNKNOWN KEY: '
 
     def __init__(self, master, state_model, mapping_engine):
         super().__init__(master)
@@ -576,6 +631,39 @@ class MappingPanel(ttk.Frame):
         for idx, tie in enumerate(self.mapping.ties):
             self.rows.append(self._make_row(idx, tie))
 
+    def _display_for_input(self, key):
+        """Resolves an input key to its dropdown display string. An empty
+        key is a genuine blank slot; a non-empty key not found in the
+        registry is orphaned (item 4.3) - flagged distinctly and registered
+        back into input_display_to_key so _update_tie() round-trips it to
+        this exact key instead of silently dropping it to blank the next
+        time any other field on the same row changes."""
+        if not key:
+            return self.BLANK
+        disp = self.input_key_to_display.get(key)
+        if disp is not None:
+            return disp
+        disp = f'{self.ORPHAN_PREFIX}{key}'
+        self.input_display_to_key[disp] = key
+        self.input_key_to_display[key] = disp
+        return disp
+
+    def _display_for_output(self, key):
+        """Output-side counterpart of _display_for_input - see there."""
+        if not key:
+            return self.BLANK
+        disp = self.output_key_to_display.get(key)
+        if disp is not None:
+            return disp
+        disp = f'{self.ORPHAN_PREFIX}{key}'
+        self.output_display_to_key[disp] = key
+        self.output_key_to_display[key] = disp
+        return disp
+
+    @staticmethod
+    def _is_orphan(display_text):
+        return display_text.startswith(MappingPanel.ORPHAN_PREFIX)
+
     def _make_row(self, idx, tie):
         card = ttk.Frame(self.scroll.inner, relief='groove', borderwidth=1)
         card.pack(fill='x', pady=4, padx=2)
@@ -584,15 +672,21 @@ class MappingPanel(ttk.Frame):
         line1.pack(fill='x', padx=6, pady=(6, 2))
         ttk.Label(line1, text='IN:', width=4).pack(side='left')
         vars_in = []
+        combos_in = []
         for i in range(3):
             key = tie.inputs[i] if i < len(tie.inputs) else ''
-            v = tk.StringVar(value=self.input_key_to_display.get(key, self.BLANK))
-            combo = ttk.Combobox(line1, values=self.input_options, textvariable=v, width=32, state='readonly')
+            disp = self._display_for_input(key)
+            v = tk.StringVar(value=disp)
+            style = 'Warn.TCombobox' if self._is_orphan(disp) else 'TCombobox'
+            combo = ttk.Combobox(line1, values=self.input_options, textvariable=v, width=32,
+                                  state='readonly', style=style)
             combo.pack(side='left', padx=2)
             combo.bind('<<ComboboxSelected>>', lambda e, i=idx: self._update_tie(i))
             _no_wheel(combo)
             vars_in.append(v)
+            combos_in.append(combo)
         card._invars = vars_in
+        card._in_combos = combos_in
 
         line2 = ttk.Frame(card)
         line2.pack(fill='x', padx=6, pady=(2, 6))
@@ -613,12 +707,16 @@ class MappingPanel(ttk.Frame):
             v.trace_add('write', lambda *_a, i=idx: self._update_tie(i))
 
         ttk.Label(line2, text='OUT:', width=5).pack(side='left', padx=(6, 0))
-        out_var = tk.StringVar(value=self.output_key_to_display.get(tie.output, self.BLANK))
-        out_combo = ttk.Combobox(line2, values=self.output_options, textvariable=out_var, width=32, state='readonly')
+        out_disp = self._display_for_output(tie.output)
+        out_var = tk.StringVar(value=out_disp)
+        out_style = 'Warn.TCombobox' if self._is_orphan(out_disp) else 'TCombobox'
+        out_combo = ttk.Combobox(line2, values=self.output_options, textvariable=out_var, width=32,
+                                  state='readonly', style=out_style)
         out_combo.pack(side='left', padx=2)
         out_combo.bind('<<ComboboxSelected>>', lambda e, i=idx: self._update_tie(i))
         _no_wheel(out_combo)
         card._out_var = out_var
+        card._out_combo = out_combo
 
         ttk.Button(line2, text='?', width=3, style='Small.TButton',
                    command=lambda i=idx: self._show_info(i)).pack(side='left', padx=(6, 2))
@@ -640,6 +738,14 @@ class MappingPanel(ttk.Frame):
         except ValueError:
             pass
         tie.output = self.output_display_to_key.get(row._out_var.get(), '')
+
+        # Re-evaluate the orphan-warning style on every combo (item 4.3) -
+        # a user picking a real replacement for a previously-orphaned slot
+        # should see the red styling clear immediately, without needing a
+        # full row rebuild.
+        for v, combo in zip(row._invars, row._in_combos):
+            combo.configure(style='Warn.TCombobox' if self._is_orphan(v.get()) else 'TCombobox')
+        row._out_combo.configure(style='Warn.TCombobox' if self._is_orphan(row._out_var.get()) else 'TCombobox')
 
     def _add_row(self):
         tie = MappingTie([], 'linear', '', {'scale': 1.0, 'offset': 0.0})
@@ -692,6 +798,14 @@ class ManagementPanel(ttk.Frame):
         'staleness_watchdog': [('soft_cut_s', 'Soft cut after (s)'), ('hard_escalation_s', 'Hard cut escalation (+s)')],
         'cell_data_cross_check': [('max_delta_v', 'Max delta vs 0x020 pack summary (V)'),
                                    ('soft_cut_s', 'Soft cut after (s)'), ('hard_escalation_s', 'Hard cut escalation (+s)')],
+        # Both below: no threshold fields, just an enable checkbox - added
+        # 2026-08-03 (docs/13 items 15.14/15.15, user directive: "we should
+        # add enable disable for our app for testing... default to on").
+        # Previously always-on with no config at all; RealtimeEngine reads
+        # the same cfg[...]['enabled'] flag to decide whether to actually
+        # run the check, not just whether to report on it.
+        'input_validation': [],
+        'checksum_validation': [],
     }
     LABELS = {
         'low_voltage_cutoff': 'Low-voltage cutoff, cell-voltage authoritative (soft -> capacity_empty)',
@@ -702,45 +816,19 @@ class ManagementPanel(ttk.Frame):
         'overcurrent_monitor': 'Overcurrent monitor (warn only, no cutoff action)',
         'staleness_watchdog': 'Staleness watchdog (soft -> hard escalation)',
         'cell_data_cross_check': 'Cell data cross-check, per-cell vs 0x020 pack summary (soft -> hard escalation)',
+        'input_validation': 'Input plausibility validation (rejects implausible decoded values)',
+        'checksum_validation': 'Toyota checksum validation (rejects corrupt frames)',
     }
 
-    # Registered (lo, hi) numeric bounds per (feature, field) - added
-    # 2026-08-01, user directive ("we need clamps on all data thats input
-    # by the user"). Deliberately generous (same "sanity range, not an
-    # operating threshold" philosophy as rz450e_signals.PLAUSIBLE_RANGES) -
-    # this exists to catch a mistyped value (an extra digit, a misplaced
-    # decimal), not to second-guess a deliberately extreme but valid
-    # threshold choice. A field with no entry here is left unclamped
-    # (numeric parse failure is still caught, just no range enforced).
-    FEATURE_FIELD_BOUNDS = {
-        ('low_voltage_cutoff', 'min_cell_v'): (0.0, 5.0),
-        ('low_voltage_cutoff', 'emergency_low_v'): (0.0, 5.0),
-        ('low_voltage_cutoff', 'soft_cut_persistence_s'): (0.0, 60.0),
-        ('low_voltage_cutoff', 'min_soc_pct'): (0.0, 100.0),
-        ('discharge_power_taper', 'taper_start_v'): (0.0, 5.0),
-        ('discharge_power_taper', 'taper_zero_v'): (0.0, 5.0),
-        ('discharge_power_taper', 'recovery_ramp_s'): (0.01, 60.0),
-        ('charge_target_taper', 'regen_full_v'): (0.0, 5.0),
-        ('charge_target_taper', 'regen_zero_v'): (0.0, 5.0),
-        ('charge_target_taper', 'emergency_high_v'): (0.0, 5.0),
-        ('charge_target_taper', 'recovery_ramp_s'): (0.01, 60.0),
-        ('over_temperature_derate', 'charge_derate_low_start_f'): (-60.0, 250.0),
-        ('over_temperature_derate', 'charge_low_block_f'): (-60.0, 250.0),
-        ('over_temperature_derate', 'charge_derate_start_f'): (-60.0, 250.0),
-        ('over_temperature_derate', 'charge_hard_stop_f'): (-60.0, 250.0),
-        ('over_temperature_derate', 'discharge_derate_start_f'): (-60.0, 250.0),
-        ('over_temperature_derate', 'discharge_hard_stop_f'): (-60.0, 250.0),
-        ('over_temperature_derate', 'emergency_temp_f'): (-60.0, 250.0),
-        ('cell_imbalance_monitor', 'warn_delta_v'): (0.0, 2.0),
-        ('overcurrent_monitor', 'continuous_discharge_warn_a'): (0.0, 210.0),
-        ('overcurrent_monitor', 'continuous_charge_warn_a'): (0.0, 210.0),
-        ('overcurrent_monitor', 'persistence_s'): (0.0, 120.0),
-        ('staleness_watchdog', 'soft_cut_s'): (1.0, 600.0),
-        ('staleness_watchdog', 'hard_escalation_s'): (0.0, 600.0),
-        ('cell_data_cross_check', 'max_delta_v'): (0.0, 2.0),
-        ('cell_data_cross_check', 'soft_cut_s'): (1.0, 600.0),
-        ('cell_data_cross_check', 'hard_escalation_s'): (0.0, 600.0),
-    }
+    # (lo, hi) numeric bounds per (feature, field) - moved into
+    # bridge/management_engine.py (2026-08-03, docs/13 items 13.3/13.9) so
+    # ManagementEngine.from_dict() (profile/file loading) can enforce the
+    # exact same bounds this panel enforces on typing - previously this
+    # table only existed here, so a hand-edited or corrupted profile.json
+    # could set any threshold to an arbitrary value with nothing standing
+    # in the way. Imported, not redefined, so the two paths can never
+    # silently diverge.
+    FEATURE_FIELD_BOUNDS = management_engine.FEATURE_FIELD_BOUNDS
 
     def __init__(self, master, state_model, management_engine, log_fn=None):
         super().__init__(master)
@@ -856,10 +944,17 @@ class ChargeEmulationPanel(ttk.Frame):
     feature's state (ramping / stopped / idle) isn't otherwise visible
     anywhere else in the GUI."""
 
-    def __init__(self, master, state_model, log_fn=None):
+    def __init__(self, master, state_model, log_fn=None, engine=None):
         super().__init__(master)
         self.state_model = state_model
         self.log_fn = log_fn or (lambda msg: None)
+        # engine (added 2026-08-03, docs/13 item 14.4): RealtimeEngine.
+        # charge_status_summary() is the single accurate source for "why is
+        # charging stopped/active right now," resolved from the SAME live
+        # status ManagementEngine/the ramp gate themselves produce - avoids
+        # this panel re-deriving (and getting wrong) its own guess at the
+        # reason. See that method's own docstring for the bug this replaces.
+        self.engine = engine
         cfg = state_model.charge_emulation
 
         head = ttk.Frame(self)
@@ -885,14 +980,16 @@ class ChargeEmulationPanel(ttk.Frame):
         ttk.Label(row1, text='Charger ramp target (kW)', width=32, anchor='w').pack(side='left')
         target_var = tk.StringVar(value=str(cfg.get('charge_target_kw', 0.0)))
         ttk.Entry(row1, textvariable=target_var, width=12).pack(side='left')
-        target_var.trace_add('write', lambda *_a: self._set_float(cfg, 'charge_target_kw', target_var, 0.0, 92.2))
+        _tgt_lo, _tgt_hi = leaf_signals.CHARGE_EMULATION_BOUNDS['charge_target_kw']
+        target_var.trace_add('write', lambda *_a: self._set_float(cfg, 'charge_target_kw', target_var, _tgt_lo, _tgt_hi))
 
         row2 = ttk.Frame(grid)
         row2.pack(fill='x', pady=1)
         ttk.Label(row2, text='Uprate level / ramp rate (0-7)', width=32, anchor='w').pack(side='left')
         level_var = tk.StringVar(value=str(cfg.get('chg_uprate_level', 0)))
         ttk.Entry(row2, textvariable=level_var, width=12).pack(side='left')
-        level_var.trace_add('write', lambda *_a: self._set_int(cfg, 'chg_uprate_level', level_var, 0, 7))
+        _lvl_lo, _lvl_hi = leaf_signals.CHARGE_EMULATION_BOUNDS['chg_uprate_level']
+        level_var.trace_add('write', lambda *_a: self._set_int(cfg, 'chg_uprate_level', level_var, _lvl_lo, _lvl_hi))
 
         self.status_label = ttk.Label(box, text='status: --', foreground=FG_DIM)
         self.status_label.pack(anchor='w', padx=6, pady=(0, 6))
@@ -923,17 +1020,22 @@ class ChargeEmulationPanel(ttk.Frame):
 
         ac_grid = ttk.Frame(ac_box)
         ac_grid.pack(fill='x', padx=28, pady=(2, 6))
-        for key, label, lo, hi in (
-                ('ac_full_v', 'Full power below (V/cell)', 0.0, 5.0),
-                ('ac_zero_v', 'Zero power at/above (V/cell)', 0.0, 5.0),
-                ('ac_emergency_v', 'Emergency high V (hard, per-cell)', 0.0, 5.0),
-                ('daily_target_pct', 'Daily target % (SoC stop point)', 0.0, 100.0),
-                ('extended_target_pct', 'Extended target % (SoC stop point)', 0.0, 100.0)):
+        # Bounds pulled from leaf_signals.CHARGE_EMULATION_BOUNDS (2026-08-03,
+        # docs/13 items 13.3/13.9) instead of hardcoded here, so this panel
+        # and the profile-loading clamp in config_profile.py can never
+        # silently diverge on what's an acceptable value for these fields.
+        for key, label in (
+                ('ac_full_v', 'Full power below (V/cell)'),
+                ('ac_zero_v', 'Zero power at/above (V/cell)'),
+                ('ac_emergency_v', 'Emergency high V (hard, per-cell)'),
+                ('daily_target_pct', 'Daily target % (SoC stop point)'),
+                ('extended_target_pct', 'Extended target % (SoC stop point)')):
             row = ttk.Frame(ac_grid)
             row.pack(fill='x', pady=1)
             ttk.Label(row, text=label, width=32, anchor='w').pack(side='left')
             var = tk.StringVar(value=str(cfg.get(key, 0.0)))
             ttk.Entry(row, textvariable=var, width=12).pack(side='left')
+            lo, hi = leaf_signals.CHARGE_EMULATION_BOUNDS[key]
             var.trace_add('write', lambda *_a, k=key, v=var, lo=lo, hi=hi: self._set_float(cfg, k, v, lo, hi))
 
         ext_var = tk.BooleanVar(value=cfg.get('extended_mode', False))
@@ -944,6 +1046,30 @@ class ChargeEmulationPanel(ttk.Frame):
 
         ttk.Checkbutton(ac_grid, text='Extended mode active (road trip - charge to extended target)',
                         variable=ext_var, command=_on_ext_toggle).pack(anchor='w', pady=(4, 0))
+
+        # Data-presence gate (added 2026-08-03, docs/13 item 13.1b; REWORKED
+        # same day per user clarification: no separate custom timer - just
+        # "has genuinely live data arrived at all," never start the ramp on
+        # cached/default values. Ongoing staleness protection once running
+        # is the same general watchdog driving gets, on the Battery
+        # Management tab, not a second timer here). Lives in the main
+        # charge box, not the AC sub-box, since it gates the ramp generally.
+        ttk.Separator(self, orient='horizontal').pack(fill='x', padx=6, pady=(4, 4))
+        data_box = ttk.Frame(self, relief='groove', borderwidth=1)
+        data_box.pack(fill='x', pady=(0, 6), padx=6)
+        req_var = tk.BooleanVar(value=cfg.get('require_live_data_to_charge', True))
+
+        def _on_req_toggle(cfg=cfg, req_var=req_var):
+            cfg['require_live_data_to_charge'] = req_var.get()
+            self.log_fn(f'Charge Emulation: "Require live data to charge" '
+                        f'{"ENABLED" if cfg["require_live_data_to_charge"] else "DISABLED"}')
+
+        req_top = ttk.Frame(data_box)
+        req_top.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Checkbutton(req_top, text='Require genuinely live battery data (not cached/default) before '
+                                       'charge ramp can start',
+                        variable=req_var, command=_on_req_toggle).pack(side='left')
+        help_btn(req_top, 'Require live data to charge', REQUIRE_LIVE_DATA_HELP).pack(side='left', padx=(6, 0))
 
         self._schedule_status_refresh()
 
@@ -966,23 +1092,20 @@ class ChargeEmulationPanel(ttk.Frame):
             return
         ac_status = self.state_model.snapshot_management_status().get('ac_charge_taper', '--')
         self.ac_status_label.configure(text=f'status: {ac_status}')
-        tx = self.state_model.snapshot_leaf_tx()
         cfg = self.state_model.charge_emulation
-        if not cfg.get('charge_emulate'):
+        if self.engine is not None:
+            # Accurate, centrally-resolved reason (docs/13 item 14.4) -
+            # replaces the old hardcoded "RZ450e permission not granted"
+            # guess, which was wrong whenever the real cause was the
+            # live-data gate, the staleness watchdog, or (not a fault at
+            # all) the AC target SoC being reached.
+            text = f'status: {self.engine.charge_status_summary()}'
+        elif not cfg.get('charge_emulate'):
             text = 'status: disabled - "Max power for charger" uses the Signal Mapping value'
         else:
-            full_stop = bool(tx.get('full_charge_flag'))
+            tx = self.state_model.snapshot_leaf_tx()
             charger_kw = tx.get('charger_limit_kw')
-            if full_stop:
-                text = 'status: STOPPED - charge requested but RZ450e permission not granted (full_charge_flag set)'
-            elif charger_kw is None:
-                text = 'status: no data yet'
-            else:
-                # 92.3kW is the idle "no limit" placeholder (leaf_signals.DEFAULTS) -
-                # anything below it means an authorized charge request is ramping
-                # (or the management engine's own safety taper has reduced it).
-                text = f'status: charger_limit_kw = {charger_kw:.1f} kW' + \
-                    (' (idle - no active/authorized request)' if charger_kw >= 92.2 else ' (ramping/active)')
+            text = 'status: no data yet' if charger_kw is None else f'status: charger_limit_kw = {charger_kw:.1f} kW'
         self.status_label.configure(text=text)
         self.after(REFRESH_MS, self._schedule_status_refresh)
 

@@ -100,6 +100,12 @@ project's own analyzer app already supports. See `docs/02-source-signals-rz450e.
 
 - **Connections**: one adapter dropdown (populated via a `detect_pcan_channels()`-style scan,
   ported from `rx450e_can_analyzer.py`), rescan button, auto-reconnect toggle, connection status.
+- **Connection-health lights (added 2026-08-01, user request: "add a dedicated CAN monitor... so we
+  know the real state... add a counter so we can see how many resets we have had")** — a small light
+  plus a text line reading `TX: OK/FAILING | reconnects: N | TX errors: N`. TX health is tracked
+  separately from Connected/RX (`BusConnection.tx_ok`) since a TX-only failure (adapter won't send,
+  bus-off) doesn't always flip the basic connected/disconnected state. Present on both this panel
+  and the Leaf-side connections panel (right panel, below).
 - **Live data monitor**: grouped by CAN message (`0x020`, `0x023`, `0x4A9`/`0x4C0` cell voltages,
   `0x4AA` temps, DID/PID values with their own slow-poll cadence indicator), latest decoded value
   per signal, with signal age shown — same informative-text-block pattern as the Leaf app's
@@ -121,6 +127,12 @@ One card per active tie, laid out on two lines so nothing gets cut off horizonta
 - **"?" popup**: shows, for the current live values, the input value(s), the conversion applied,
   and the resulting output value, so the user can visually confirm exactly what math is happening.
 - "Add mapping" control at the bottom.
+- **Orphaned/renamed key warning (added 2026-08-03, docs/13 item 4.3)**: a tie's stored input or
+  output key can outlive the signal registry entry it once pointed to (a future field rename, or a
+  saved profile that predates a registry change). Previously that fell back to displaying
+  `(unused)`, indistinguishable from a genuinely-blank slot. Now shown as `(!) UNKNOWN KEY: <raw
+  key>` in a distinct red-styled dropdown (`Warn.TCombobox`, `gui/theme.py`) instead — the warning
+  clears automatically once the user picks a real replacement from the dropdown.
 
 ### Battery Management tab
 
@@ -166,6 +178,13 @@ One block per protection feature from `05-battery-management-safety.md`:
   monitor` (warns on cell-voltage spread) and `overcurrent_monitor` (warns on sustained elevated
   current). Both are explicitly labeled "warn only, no cutoff action" — they surface information the
   bridge doesn't act on, by deliberate design (see `05`).
+- **`cell_data_cross_check` (added 2026-08-01)** — same visual pattern as every other feature block:
+  enable checkbox, max-delta-vs-`0x020`-pack-summary field plus soft-cut/hard-escalation timing
+  fields, live status text, and a "?" popup explaining the redundancy check.
+- **`input_validation` and `checksum_validation` (given real checkboxes 2026-08-03, docs/13 items
+  15.14/15.15)** — same feature-block pattern but with no threshold fields, just an enable checkbox
+  + live status + "?" popup, since these are on/off data-integrity gates, not tunable thresholds.
+  Previously always-on with no GUI representation at all; both default ON.
 
 ### Generated Signals tab
 
@@ -193,6 +212,11 @@ been — it hadn't yet at the time. One block, same visual pattern as a `Managem
 - **"?" help** — explains the dual-trigger requirement, the ramp math (0.0kW start, rate per uprate
   level), the stop-flag behavior on a permission mismatch, and that the per-cell overvoltage taper
   still gets the final say over the ramped value regardless.
+- **"Require live data to charge" checkbox (added 2026-08-03, default ON)** — a data box separate
+  from the ramp controls above it: blocks the ramp from starting until every per-cell voltage and
+  the pack's temp extremes have gone genuinely live this bridge session (`05-battery-management-
+  safety.md`'s "Charge-start data gate" section, `06-realtime-engine-and-watchdog.md` section 3).
+  Toggling it logs an ENABLED/DISABLED line, same as every other Charge Emulation control.
 - **New 2026-08-01 — "AC charger overvoltage taper" section**, split out of Battery Management's
   `charge_target_taper` (user directive: AC charging and regen are physically different enough to
   need independently-tunable curves). Own enable checkbox (`ac_taper_enabled`, default on), its own
@@ -389,19 +413,26 @@ required"), then the bottom of the Dashboard's left list ("align under the left 
 pulled out to its own window entirely once the user reported not having enough real estate left on
 the Dashboard for it on top of everything else — **"make it tall and narrow."**
 
-- **Geometry `420×900`, positioned just to the right of whichever window opened it** (computed from
+- **Geometry `460×900`, positioned just to the right of whichever window opened it** (computed from
   that window's live `winfo_x()`/`winfo_width()` at open time, not a hardcoded screen coordinate
   that might not suit every monitor layout).
 - **Single-column, top to bottom** (not the Dashboard's old two-column grid — a narrow window
   doesn't have room for two side by side), inside a `VScrollFrame` so it scrolls if content ever
   exceeds the window instead of clipping.
-- **Stacked two-line-per-entry layout**: a light + the fault's full description on the top line,
-  the trigger count + a **Reset** button on the line below — gives the description room to wrap in
-  a narrow window without cramming the count/button into a tight corner (the Dashboard's old
-  version packed all of this onto one line, workable there since it had much more horizontal room).
+- **Single-line-per-entry layout (changed 2026-08-01)**: light, trigger count, description, and a
+  **Reset** button all packed into one row — moved off the original two-line stacked layout once
+  the window was widened slightly (420→460px) to fit everything on one line cleanly.
+- **Grouped into three sections by tier (added 2026-08-03, user request: "I think that in the fault
+  window we should move 'monitor only' in to a group, and 'soft cut' in another, and 'Hard cut' in
+  to another so it's easy to tell what faults are going to do what to the system if anything")** —
+  "Monitor Only - no cut", "Soft Cut", and "Hard Cut" headings (each colored to match that tier's
+  light color), low-to-high severity top-to-bottom. Every entry's existing `level` field (from
+  `FAULT_DEFINITIONS`, or `'warn'` for a dynamic `clamp_<key>` row) drives which section it lands
+  in — no separate grouping table to keep in sync.
 - One row per entry in `bridge/fault_log.py`'s `FAULT_DEFINITIONS` (every soft/hard cut and monitor
-  warning `management_engine.py` tracks — 12 total), plus a dynamically-added row for any
-  output-clamp event (`06-realtime-engine-and-watchdog.md` section 4) that has actually occurred.
+  warning `management_engine.py` tracks — **19 total** as of 2026-08-03, up from the original 12;
+  see that file for the current catalog), plus a dynamically-added row for any output-clamp event
+  (`06-realtime-engine-and-watchdog.md` section 4) that has actually occurred.
 - **A small circular status "light"** on each row instead of relying on text color alone: **lit
   solid** in the fault's tier color (red = hard, orange = soft, yellow = warn) = active right now; a
   **hollow ring** (dark center, colored outline) = has happened before but is currently clear;

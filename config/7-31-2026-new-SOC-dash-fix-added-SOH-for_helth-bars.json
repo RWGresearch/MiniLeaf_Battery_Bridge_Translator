@@ -1,0 +1,163 @@
+{
+  "profile_name": "7-31-2026-new-SOC-dash-fix-added-SOH-for_helth-bars",
+  "vehicle": {
+    "car_gen": "ZE1",
+    "battery_gen": "ZE1",
+    "battery_kwh": 40
+  },
+  "mappings": [
+    {
+      "inputs": [
+        "pack_v"
+      ],
+      "combine": "linear",
+      "output": "pack_voltage_v",
+      "params": {
+        "scale": 1.0,
+        "offset": 0.0
+      },
+      "name": "pack_v -> pack_voltage_v"
+    },
+    {
+      "inputs": [
+        "current"
+      ],
+      "combine": "linear",
+      "output": "pack_current_a",
+      "params": {
+        "scale": -1.0,
+        "offset": 0.0
+      },
+      "name": "current -> pack_current_a (SIGN INVERTED: RZ450e +discharge -> Leaf +charge)"
+    },
+    {
+      "inputs": [
+        "soc_pct"
+      ],
+      "combine": "linear",
+      "output": "usable_soc",
+      "params": {
+        "scale": 1.0,
+        "offset": 0.0
+      },
+      "name": "soc_pct -> usable_soc"
+    },
+    {
+      "inputs": [
+        "current_b"
+      ],
+      "combine": "linear",
+      "output": "fine_soc_pct",
+      "params": {
+        "scale": 1.0,
+        "offset": 0.0
+      },
+      "name": "soc_pct -> fine_soc_pct"
+    },
+    {
+      "inputs": [
+        "temp_max"
+      ],
+      "combine": "linear",
+      "output": "batt_temp_c",
+      "params": {
+        "scale": 0.5555555555555556,
+        "offset": -17.77777777777778
+      },
+      "name": "temp_max (\u00b0F) -> batt_temp_c (\u00b0C)"
+    },
+    {
+      "inputs": [
+        "capacity_pack1_ah"
+      ],
+      "combine": "soh_percent",
+      "output": "soh_pct",
+      "params": {
+        "nameplate_ah": 201.0
+      },
+      "name": "capacity_pack1_ah -> soh_pct"
+    },
+    {
+      "inputs": [
+        "soc_pct"
+      ],
+      "combine": "linear",
+      "output": "soc_correction",
+      "params": {
+        "scale": 2.0,
+        "offset": 0.0
+      },
+      "name": " -> "
+    },
+    {
+      "inputs": [
+        "capacity_pack1_ah"
+      ],
+      "combine": "linear",
+      "output": "capacity_bars_raw",
+      "params": {
+        "scale": 0.07,
+        "offset": 0.0
+      },
+      "name": " -> "
+    }
+  ],
+  "management_features": {
+    "low_voltage_cutoff": {
+      "enabled": true,
+      "min_cell_v": 3.0,
+      "min_soc_pct": 10.0,
+      "emergency_low_v": 2.8,
+      "soft_cut_persistence_s": 2.0
+    },
+    "discharge_power_taper": {
+      "enabled": true,
+      "taper_start_v": 3.5,
+      "taper_zero_v": 3.0,
+      "recovery_ramp_s": 3.0
+    },
+    "charge_target_taper": {
+      "enabled": true,
+      "regen_full_v": 3.9,
+      "regen_zero_v": 4.1,
+      "emergency_high_v": 4.3,
+      "daily_target_pct": 80.0,
+      "extended_target_pct": 100.0,
+      "extended_mode": false
+    },
+    "over_temperature_derate": {
+      "enabled": true,
+      "charge_derate_low_start_f": 50.0,
+      "charge_low_block_f": 32.0,
+      "charge_derate_start_f": 90.0,
+      "charge_hard_stop_f": 113.0,
+      "discharge_derate_start_f": 131.0,
+      "discharge_hard_stop_f": 140.0,
+      "emergency_temp_f": 149.0
+    },
+    "cell_imbalance_monitor": {
+      "enabled": true,
+      "warn_delta_v": 0.05
+    },
+    "overcurrent_monitor": {
+      "enabled": true,
+      "continuous_discharge_warn_a": 150.0,
+      "continuous_charge_warn_a": 30.0,
+      "persistence_s": 5.0
+    },
+    "staleness_watchdog": {
+      "enabled": true,
+      "soft_cut_s": 60.0,
+      "hard_escalation_s": 5.0
+    }
+  },
+  "generated_signals": {
+    "prun": true,
+    "voltage_latch_toggle": true,
+    "heartbeat_1c2": true,
+    "code_1dc": true,
+    "chg_time_5bc": true,
+    "hist_5c0": true,
+    "seq_5eb": true
+  }
+}

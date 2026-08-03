@@ -20,7 +20,7 @@ independent Claude Code projects (each with their own git repo), kept here purel
 turns out to be wrong and the live reference project has since corrected it, update this project's
 docs to match — never the other way around.
 
-## Revision numbering (once app code exists)
+## Revision numbering
 
 Follow the same convention both reference projects use: a single `REVISION`/`APP_REVISION`
 constant plus a docstring changelog at the top of the main app file, bumped on every change, with
@@ -42,9 +42,21 @@ file.)
   `docs/05-battery-management-safety.md`, cite where the number came from (real-hardware test,
   researched industry reference, or explicit user instruction) — don't invent a "reasonable-
   looking" safety number.
-- **Write analysis/verification scripts into the repo** (a `tests/` or similar folder once one
-  exists), not into a scratchpad — this project follows both reference projects' pattern of citing
-  test scripts from reports/docs and re-running them in later sessions.
+- **Write analysis/verification scripts into `tests/`**, not into a scratchpad — this project
+  follows both reference projects' pattern of citing test scripts from reports/docs and re-running
+  them in later sessions. Pass/fail scripts are named `test_*.py`; standalone diagnostic/report
+  tools that aren't pass/fail (e.g. `check_profile_drift.py`) are named `check_*.py` instead, so
+  they're never accidentally swept into a "run every test" loop.
+
+## `config/` is git-tracked
+
+Unlike most projects, `config/*.json` (the saved profile, last-known-good data cache, fault
+history, and any named snapshot profiles) is deliberately **not** gitignored — the user treats it
+as a running backup. Before editing a default in `bridge/management_engine.py`'s `default_config()`
+or `bridge/leaf_signals.py`'s slider/check tables, run `py tests/check_profile_drift.py` afterward
+to see what it actually does to the real saved `config/profile.json` (a saved profile is loaded at
+app startup instead of fresh defaults whenever one exists — see `06-realtime-engine-and-watchdog.md`
+section 2/"Interaction with config save/load") rather than assuming nothing's affected.
 
 ## Before committing or pushing
 

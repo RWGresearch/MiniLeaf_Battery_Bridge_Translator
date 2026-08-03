@@ -62,7 +62,7 @@ just an illustrative sketch. Regenerated 2026-08-01 directly from `default_confi
     "discharge_power_taper": {"enabled": true, "taper_start_v": 3.0, "taper_zero_v": 2.6,
                               "recovery_ramp_s": 3.0},
     "charge_target_taper": {"enabled": true, "regen_full_v": 4.0, "regen_zero_v": 4.15,
-                            "emergency_high_v": 4.3, "recovery_ramp_s": 3.0},
+                            "emergency_high_v": 4.2, "recovery_ramp_s": 3.0},
     "over_temperature_derate": {"enabled": true, "charge_derate_low_start_f": 50.0,
                                 "charge_low_block_f": 32.0, "charge_derate_start_f": 90.0,
                                 "charge_hard_stop_f": 113.0, "discharge_derate_start_f": 131.0,
@@ -72,13 +72,16 @@ just an illustrative sketch. Regenerated 2026-08-01 directly from `default_confi
                             "continuous_charge_warn_a": 30.0, "persistence_s": 5.0},
     "staleness_watchdog": {"enabled": true, "soft_cut_s": 60.0, "hard_escalation_s": 5.0},
     "cell_data_cross_check": {"enabled": true, "max_delta_v": 0.15, "soft_cut_s": 60.0,
-                              "hard_escalation_s": 5.0}
+                              "hard_escalation_s": 5.0},
+    "input_validation": {"enabled": true},
+    "checksum_validation": {"enabled": true}
   },
   "generated_signals": {"prun": true, "voltage_latch_toggle": true, "heartbeat_1c2": true,
                         "code_1dc": true, "chg_time_5bc": true, "hist_5c0": true, "seq_5eb": true},
   "charge_emulation": {"charge_emulate": 1, "ac_taper_enabled": 1, "extended_mode": 0,
+                       "require_live_data_to_charge": 1,
                        "charge_target_kw": 92.2, "chg_uprate_level": 7,
-                       "ac_full_v": 4.0, "ac_zero_v": 4.15, "ac_emergency_v": 4.3,
+                       "ac_full_v": 4.0, "ac_zero_v": 4.15, "ac_emergency_v": 4.2,
                        "daily_target_pct": 80.0, "extended_target_pct": 100.0}
 }
 ```
@@ -125,12 +128,27 @@ Python source.
 
 **Fixed-logic safety nets that are NOT profile data, added 2026-08-01, but still must be
 replicated in firmware** (same category as output clamping, which this doc already didn't cover
-explicitly): `bridge/rz450e_signals.py`'s `PLAUSIBLE_RANGES`/`validate_inputs()` (rejects a decoded
-value outside a generous physical-plausibility range before it ever reaches the BMS logic) and
-`bridge/management_engine.py`'s `_check_config_sanity()` (cross-field threshold-ordering check,
-e.g. an emergency tier typed less extreme than its own soft tier). Both are fixed Python constants/
-logic, not something the GUI edits or the profile exports today - firmware needs the same bounds/
-checks hardcoded, not derived from this schema.
+explicitly): `bridge/rz450e_signals.py`'s `PLAUSIBLE_RANGES` table (the actual plausibility bounds
+per signal) and `bridge/management_engine.py`'s `_check_config_sanity()` (cross-field threshold-
+ordering check, e.g. an emergency tier typed less extreme than its own soft tier). Both are fixed
+Python constants/logic, not something the GUI edits or the profile exports - firmware needs the
+same bounds/checks hardcoded, not derived from this schema. Likewise `bridge/rz450e_signals.py`'s
+`CHECKSUM_IDS`/`frame_checksum_ok()` (docs/13 item 13.5) - the checksum formula itself and which 5
+IDs carry it (`0x020`/`0x023`/`0x358`/`0x3F1`/`0x424`, see `02-source-signals-rz450e.md`) are fixed,
+not exported.
+
+**Whether these two checks actually RUN at all is profile data, though** (docs/13 items 15.14/
+15.15, added 2026-08-03) - `management_features.input_validation.enabled` and `management_features.
+checksum_validation.enabled` (both default `true`, both shown in the example above) gate whether
+`RealtimeEngine` calls `validate_inputs()`/`frame_checksum_ok()` at all, not just whether a
+rejection gets reported. Firmware should treat these the same as every other feature's `enabled`
+flag - read from the profile, not assumed always-on. Also note `last_known_good.json` is validated
+through the same `validate_inputs()` plausibility check on load (not just live RX data, and subject
+to the same `input_validation.enabled` flag), and both `profile.json` management-feature values and
+`charge_emulation` values are clamped to documented bounds (`FEATURE_FIELD_BOUNDS`/
+`CHARGE_EMULATION_BOUNDS`) when a profile is loaded, not just when edited live in the GUI -
+firmware reading a saved profile directly should apply the same bounds rather than trusting the
+file blindly.
 
 ## What this is NOT
 

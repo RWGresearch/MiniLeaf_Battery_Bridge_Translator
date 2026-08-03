@@ -33,10 +33,11 @@ voltage (raw CAN `0x020` `pack_v`, fast). Known threshold behaviors to preserve 
 **GIDS ≈ 5 triggers turtle mode** (VCM limits to dash "6 bars"). These are real VCM-side
 thresholds, not tunable on this project's end — just something to be aware of when picking the
 **cell-voltage** thresholds in `05-battery-management-safety.md`'s `discharge_power_taper` (full
-power ≥3.50V, zero ≤3.00V/cell) and `low_voltage_cutoff` (soft cut 3.00V/cell — SoC is a backup
-check only there as of the 2026-07-31 correction, not an independent floor). A 3.00-3.50V/cell
-window on a ~194.97Ah/348V pack is nowhere near GIDS≈5, so no conflict expected, but worth
-re-checking once real GIDS values are flowing — see `10-open-questions.md`, item 3.
+power ≥3.00V, zero ≤2.60V/cell as of the 2026-08-01 re-anchoring) and `low_voltage_cutoff` (soft
+cut 3.00V/cell, emergency hard cut 2.60V/cell — SoC is a backup check only there as of the
+2026-07-31 correction, not an independent floor). A 2.60-3.00V/cell window on a ~194.97Ah/348V pack
+is nowhere near GIDS≈5, so no conflict expected, but worth re-checking once real GIDS values are
+flowing — see `10-open-questions.md`, item 3.
 
 **Dash SOC% (`soc_correction`, `0x59E` byte 7) — confirmed 2026-07-31.** A separate field from
 GIDS/QC above, and from `usable_soc`/`fine_soc_pct` — per the Leaf project's own findings, the

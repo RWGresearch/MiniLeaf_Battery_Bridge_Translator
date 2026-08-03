@@ -415,17 +415,30 @@ class DashboardWindow(tk.Toplevel):
         kw_text = 'no data' if charger_kw is None else f'{charger_kw:.1f} kW'
         self.charge_labels['charger_kw'].configure(text=kw_text, foreground=FG_DIM if charger_kw is None else FG)
 
-        if not emulate_on:
+        # Centrally-resolved status (docs/13 item 14.4, fixed 2026-08-03) -
+        # RealtimeEngine.charge_status_summary() replaces the old hardcoded
+        # "RZ450e permission not granted" guess here, which was wrong
+        # whenever the real cause was the live-data gate, the staleness
+        # watchdog, or (not a fault at all) the AC target SoC being reached -
+        # see that method's own docstring. `engine` may be None only in a
+        # test harness that builds this window without a real App/engine.
+        if engine is not None:
+            status_text = engine.charge_status_summary()
+        elif not emulate_on:
             status_text = 'disabled - "Max power for charger" uses the Signal Mapping value'
-            status_fg = FG_DIM
-        elif full_stop:
-            status_text = 'STOPPED - Leaf wants to charge but RZ450e permission not granted (full_charge_flag set)'
-            status_fg = ERR
         elif leaf_wants and rz_auth:
             status_text = 'ramping/active - both triggers present'
-            status_fg = OK
         else:
             status_text = 'idle - no active, authorized charge request'
+        # Color by message content, not just full_stop - "CHARGE COMPLETE"
+        # (target SoC reached) also sets full_charge_flag but is a SUCCESS,
+        # not a fault, and must not render in the same red as a genuine
+        # STOPPED-on-a-problem message (docs/13 item 14.4).
+        if status_text.startswith('STOPPED'):
+            status_fg = ERR
+        elif status_text.startswith('CHARGE COMPLETE') or status_text.startswith('ramping'):
+            status_fg = OK
+        else:
             status_fg = FG_DIM
         self.charge_labels['status'].configure(text=status_text, foreground=status_fg)
 

@@ -53,6 +53,29 @@ def toyota_sum_checksum(arb_id, data):
              + sum(b for j, b in enumerate(data) if j != n)) & 0xFF
 
 
+# IDs confirmed to carry the Toyota additive checksum in byte 7 (docs/02) -
+# ID_TEMP_MINMAX/ID_CELLS_A/ID_CELLS_B/ID_TEMPS do NOT (confirmed 0% match
+# upstream - byte 7 there is real payload data, not a checksum). Checked
+# 2026-08-03 (docs/13 item 13.5, user directive): this project's own docs
+# said this checksum "should" be used as an additional staleness/corruption
+# check but it was never actually wired into the ingest path until now.
+CHECKSUM_IDS = {ID_PACK_V, ID_CURRENT, ID_CHARGE_PERM, ID_ALIVE_3F1, ID_TICK_424}
+
+
+def frame_checksum_ok(arb_id, data):
+    """True if `arb_id` doesn't carry a Toyota additive checksum (nothing to
+    check - most raw-CAN IDs this project decodes don't), or if it does and
+    the checksum matches. False means either a checksum mismatch or a
+    too-short frame on an ID that's supposed to have one - both are treated
+    as corruption, not decoded at all, rather than handed to a decoder that
+    would otherwise accept whatever bytes happen to fall in range."""
+    if arb_id not in CHECKSUM_IDS:
+        return True
+    if len(data) < 8:
+        return False
+    return data[7] == toyota_sum_checksum(arb_id, data)
+
+
 def _u12_quad(d):
     return [(d[1] << 4) | (d[2] >> 4),
             ((d[2] & 0x0F) << 8) | d[3],
@@ -356,7 +379,19 @@ def validate_inputs(mapping):
             valid[key] = value
             continue
         lo, hi = bounds
-        if lo <= value <= hi:
+        # try/except (added 2026-08-03, docs/13 item 13.2): this function now
+        # also validates disk-persisted cache data (config_profile.load_
+        # last_known_good()), which - unlike a live CAN decode, which always
+        # produces a float - could contain a corrupted/hand-edited non-
+        # numeric value (a string, a list, etc.). A type that can't be
+        # compared against the bounds is exactly as untrustworthy as one
+        # that's out of range - reject it the same way instead of crashing.
+        try:
+            in_range = lo <= value <= hi
+        except TypeError:
+            rejected[key] = value
+            continue
+        if in_range:
             valid[key] = value
         else:
             rejected[key] = value

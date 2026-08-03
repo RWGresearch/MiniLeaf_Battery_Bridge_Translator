@@ -10,7 +10,8 @@ what to implement). **Findings F1, F3, F4, F5, and F6 were subsequently implemen
 after user review — see §9's per-finding status. F2 was implemented as a monitor-only feature
 rather than an active cutoff, a deliberate scope choice explained in its entry. F7 was an
 alignment note, no action needed. F8 (fault-latching, §9) was discovered while implementing the
-others and is **not yet implemented** — flagged for a decision, same as an unimplemented finding.
+others and was implemented on 2026-08-01, after explicit discussion, as `ManagementEngine.
+_hard_latched` — see §9's per-finding status for the full mechanism.
 
 All numbers below are **researched general-industry/academic values**, not RZ450e-specific
 datasheet values (Toyota publishes no per-cell limits). Same confirmed-vs-documented discipline as
@@ -208,20 +209,26 @@ The sequence is consistent across the review literature (each stage's heat feeds
 
 ## 9. Audit: our design vs. this research
 
+**Note (added 2026-08-04): the specific numbers in the table below are a snapshot from this audit's
+original 2026-07-31 pass.** Several were subsequently retuned by later user edits (2026-08-01) or
+split into separate features (regen vs. AC charging) — `05-battery-management-safety.md` is the
+current source of truth for actual defaults; this table's verdicts (✅ matches researched practice)
+still hold, just against the retuned numbers, called out inline below.
+
 ### What aligns (no change indicated)
 
 | Our default (`05-battery-management-safety.md`) | Researched range | Verdict |
 |---|---|---|
 | Per-cell voltage is sole cutoff authority; SoC backup-witness only | Worst-cell-governs is universal practice | ✅ matches |
 | Soft cut preferred, hard cut reserved for emergencies | Graduated monitor→derate→stop→disconnect | ✅ matches |
-| Min-cell soft cut 3.00 V / emergency 2.80 V | BMS floors 2.75–3.0 V; damage line ~2.5 V | ✅ in range, sensible margins |
-| Charge taper 3.90→4.10 V, emergency 4.30 V | Ceiling 4.20 V; staying below it extends life; emergency tier above | ✅ conservative in the right direction (slow-VCM lead time) |
-| Discharge taper 3.50→3.00 V, fast-attack/slow-release | Derate-before-cutoff; anti-hunting hysteresis | ✅ matches practice |
+| Min-cell soft cut 3.00 V / emergency 2.80 V (**retuned 2026-08-01 to 2.60 V emergency**) | BMS floors 2.75–3.0 V; damage line ~2.5 V | ✅ in range, sensible margins |
+| Charge taper 3.90→4.10 V, emergency 4.30 V (**retuned/split 2026-08-01: regen-only taper now 4.00→4.15 V, emergency 4.30 V; emergency tier further tightened 2026-08-03 to 4.20 V exactly, matching the ceiling below**) | Ceiling 4.20 V; staying below it extends life; emergency tier above | ✅ conservative in the right direction (slow-VCM lead time) |
+| Discharge taper 3.50→3.00 V, fast-attack/slow-release (**re-anchored 2026-08-01 to 3.00→2.60 V**) | Derate-before-cutoff; anti-hunting hysteresis | ✅ matches practice |
 | Charge temp: derate 32°C, stop 45°C, block <0°C | Derate ~30–35°C, stop 45°C, no sub-freezing charge | ✅ in range (F1, F3 fixed/added below) |
 | Discharge temp: derate 55°C, stop 60°C, no cold cutoff | Derate ~50–55°C, stop 60°C; cold side is power-only | ✅ in range (F6 added below) |
 | 80% daily / 100% extended charge target | High-SoC calendar aging is real and large | ✅ well-supported |
 | Staleness watchdog, soft→hard escalation | Defined safe state on data loss | ✅ matches |
-| Regen and AC charge share one charge-power ceiling | Regen *is* charging; same protections apply | ✅ matches |
+| Regen and AC charge shared one charge-power ceiling | Regen *is* charging; same protections apply | ✅ matched at the time — **superseded 2026-08-01**: split into two independently-tunable features (`charge_target_taper` for regen, `ac_charge_taper` for AC charging), defaulted to the same starting curve, since the two use cases warrant independent tuning (regen up to ~0.5C vs. AC charging ~0.09C) even though the underlying protection principle is unchanged |
 
 ### Findings
 
@@ -295,7 +302,8 @@ researched-defaults table only ever defined emergency defaults for voltage (2.80
 emergency temperature number existed, and the code asserted a hard cut directly at
 `discharge_hard_stop_f`/`charge_hard_stop_f` (the soft ramp's own ceiling), contradicting this
 feature's "Soft (ramp)" tier label. Fixed: both hard-stop values are now pure soft ramp-to-zero
-points; a new `emergency_temp_f` (65°C/149°F default) is the actual hard-cut trigger, mirroring
+points; a new `emergency_temp_f` (65°C/149°F default, **tightened 2026-08-01 to 61°C/141.8°F**) is
+the actual hard-cut trigger, mirroring
 the two-tier soft/emergency structure the voltage features already have. Deliberately close above
 the 60°C soft stop — self-heating onset for a cell with plated lithium can begin as low as ~60°C
 (§5), leaving very little real margin. Unit-tested: at exactly 140°F (the old combined threshold),
@@ -310,18 +318,19 @@ right shape (charge to 100% right before departure, don't live there). Worth a l
 help text someday; no design change needed.
 
 **F8 — Hard cuts don't latch; they self-clear if the triggering reading recovers. Discovered
-2026-07-31 while implementing F1–F6; NOT YET IMPLEMENTED, needs a decision.** §8 of this same
-report states standard practice: emergency-tier faults **latch** and require a deliberate human
-action to clear, because the hazardous condition they imply (e.g. a cell that hit 4.30 V may have
-plated lithium) doesn't un-happen just because the reading drifted back to normal. Our
-`hard_cut`/`relay_cut_request` is recomputed fresh from live readings on every `apply()` tick with
-no latch: if a brief emergency-level spike (voltage or temperature) subsides on its own, the hard
-cut clears itself the very next tick, re-closing `interlock`. This is a real architectural gap
-against the standard practice this same report documents — but fixing it is a bigger decision than
-the others (needs a "fault present, awaiting manual clear" state, a GUI acknowledge/clear action,
-and a decision on which tiers latch — probably all hard cuts, arguably the staleness watchdog's
-escalation too) so it wasn't bundled into this pass. Flagged for explicit discussion before
-building.
+2026-07-31 while implementing F1–F6. ✅ IMPLEMENTED 2026-08-01.** §8 of this same report states
+standard practice: emergency-tier faults **latch** and require a deliberate human action to clear,
+because the hazardous condition they imply (e.g. a cell that hit 4.30 V may have plated lithium)
+doesn't un-happen just because the reading drifted back to normal. Our
+`hard_cut`/`relay_cut_request` used to be recomputed fresh from live readings on every `apply()`
+tick with no latch: a brief emergency-level spike (voltage or temperature) subsiding on its own
+would clear the hard cut the very next tick, re-closing `interlock`. Fixed: `ManagementEngine.
+_hard_latched` now stays asserted once any hard-cut condition fires, regardless of subsequent
+readings, cleared only by `notify_session_start()` (a genuine bus-wake power cycle) or
+`notify_charge_replug()` (a genuine ≥3.0s charge-permission gap, refined `docs/13` item 13.4 after
+an independent review found the first version could be cleared by simply toggling the bridge's own
+Stop/Start button). See `05-battery-management-safety.md`'s "`full_charge_flag` re-arm" section and
+`06-realtime-engine-and-watchdog.md` section 5 for the full current behavior.
 
 ### Implementation summary
 
@@ -334,9 +343,9 @@ building.
 | F5 (soft-cut persistence) | ✅ Implemented | `bridge/management_engine.py`, `low_voltage_cutoff` |
 | F6 (emergency temp tier) | ✅ Implemented | `bridge/management_engine.py`, `over_temperature_derate` |
 | F7 (80% target alignment) | No action needed | — |
-| F8 (fault latching) | ❌ Not implemented — needs a decision | see above |
+| F8 (fault latching) | ✅ Implemented (2026-08-01) | `bridge/management_engine.py`, `_hard_latched` |
 
-All six implemented findings are unit-tested in `tests/test_management_engine.py` (run with
+All seven implemented findings are unit-tested in `tests/test_management_engine.py` (run with
 `py tests/test_management_engine.py`) and cross-referenced in
 `11-manual-verification-checklist.md`. GUI fields/help text updated in `gui/panels.py`.
 

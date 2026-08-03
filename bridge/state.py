@@ -43,6 +43,13 @@ class SharedState:
         # pattern as every other tracked condition.
         self._rejected_inputs = {}   # key -> (value, monotonic_ts of last rejection)
 
+        # Checksum failures (docs/13 item 13.5, added 2026-08-03) - same
+        # pattern as _rejected_inputs above, but for a frame that failed its
+        # Toyota additive checksum (rz450e_signals.frame_checksum_ok())
+        # before it was ever decoded, so there's no per-key value to record -
+        # just which CAN ID and how many times this session.
+        self._checksum_failures = {}   # arb_id -> (count, monotonic_ts of last failure)
+
         # Generated/opaque-table send flags (default all on).
         self.generated_enabled = {key: default for key, _, default in leaf_signals.GENERATED_SIGNALS}
 
@@ -110,11 +117,31 @@ class SharedState:
             return default
 
     def age_of(self, key):
-        """Seconds since `key` last updated, or None if never seen this
-        session (a value may still exist via last_known_good)."""
+        """Seconds since `key` last updated, or None if never updated this
+        APP RUN (a value may still exist via last_known_good) - corrected
+        wording 2026-08-04, this previously said "this session" which is
+        misleading: `rz450e_ts` is never cleared by a bridge session
+        boundary (Stop/Start Bridge, a natural wind-down/re-wake) - only by
+        the app process restarting. That's the deliberately correct behavior
+        for THIS method's purpose (the general staleness watchdog - RZ450e
+        keeps transmitting independent of whatever the Leaf-side sequencer
+        is doing, so its own staleness clock shouldn't reset just because
+        the Leaf side slept and woke up). See timestamps_of() below for the
+        one place that DOES need actual bridge-session boundaries."""
         with self.lock:
             ts = self.rz450e_ts.get(key)
             return None if ts is None else time.monotonic() - ts
+
+    def timestamps_of(self, keys):
+        """Batched raw last-update monotonic timestamps (not age) for `keys`
+        - None for a key never updated this app run. Added 2026-08-04 for
+        RealtimeEngine._charge_data_ready(): unlike age_of()/ages_of() below
+        (deliberately app-lifetime-persistent - see their own docstrings),
+        the charge-start gate needs to know WHEN a signal was last live so
+        it can be compared against a specific bridge SESSION's start time,
+        not just app launch. See docs/06 section 3's "session" clarification."""
+        with self.lock:
+            return {k: self.rz450e_ts.get(k) for k in keys}
 
     def ages_of(self, keys):
         """Batched age_of() - one lock acquisition for many keys, instead of
@@ -143,6 +170,22 @@ class SharedState:
         with self.lock:
             now = time.monotonic()
             return {k: v for k, (v, ts) in self._rejected_inputs.items() if now - ts <= window_s}
+
+    def note_checksum_failure(self, arb_id):
+        """Record a Toyota checksum mismatch (docs/13 item 13.5) - counted
+        per CAN ID, not per-signal, since a checksum failure means the whole
+        frame is suspect, not one specific field."""
+        with self.lock:
+            count, _ts = self._checksum_failures.get(arb_id, (0, 0.0))
+            self._checksum_failures[arb_id] = (count + 1, time.monotonic())
+
+    def recent_checksum_failures(self, window_s=5.0):
+        """{arb_id: count} for any CAN ID that failed its checksum within
+        the last `window_s` seconds - same live-fault_log pattern as
+        recent_rejections() above."""
+        with self.lock:
+            now = time.monotonic()
+            return {k: c for k, (c, ts) in self._checksum_failures.items() if now - ts <= window_s}
 
     # ── Locked accessors for management_status/vehicle (added 2026-08-01) ──
     # `generated_enabled`/`charge_emulation` are NOT yet retrofitted onto this

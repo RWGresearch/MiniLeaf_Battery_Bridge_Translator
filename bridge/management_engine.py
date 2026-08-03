@@ -13,6 +13,50 @@ from bridge import rz450e_signals
 from bridge.fault_log import FaultLog
 
 
+# Registered (lo, hi) numeric bounds per (feature, field) - shared by BOTH
+# the GUI (gui/panels.py's ManagementPanel, clamps on every keystroke) and
+# from_dict() below (clamps on every profile/file load), so the two paths
+# can never silently diverge (docs/13 items 13.3/13.9, fixed 2026-08-03).
+# Previously this table only existed in gui/panels.py and from_dict() didn't
+# use it at all - a hand-edited or corrupted profile.json (including the one
+# loaded automatically at every app startup) could set any threshold to an
+# arbitrary, physically-nonsensical value with nothing standing in the way,
+# and the only defense (typing in the GUI) never even ran. Deliberately
+# generous (same "sanity range, not an operating threshold" philosophy as
+# rz450e_signals.PLAUSIBLE_RANGES) - this exists to catch a mistyped/
+# corrupted value, not to second-guess a deliberately extreme but valid
+# threshold choice.
+FEATURE_FIELD_BOUNDS = {
+    ('low_voltage_cutoff', 'min_cell_v'): (0.0, 5.0),
+    ('low_voltage_cutoff', 'emergency_low_v'): (0.0, 5.0),
+    ('low_voltage_cutoff', 'soft_cut_persistence_s'): (0.0, 60.0),
+    ('low_voltage_cutoff', 'min_soc_pct'): (0.0, 100.0),
+    ('discharge_power_taper', 'taper_start_v'): (0.0, 5.0),
+    ('discharge_power_taper', 'taper_zero_v'): (0.0, 5.0),
+    ('discharge_power_taper', 'recovery_ramp_s'): (0.01, 60.0),
+    ('charge_target_taper', 'regen_full_v'): (0.0, 5.0),
+    ('charge_target_taper', 'regen_zero_v'): (0.0, 5.0),
+    ('charge_target_taper', 'emergency_high_v'): (0.0, 5.0),
+    ('charge_target_taper', 'recovery_ramp_s'): (0.01, 60.0),
+    ('over_temperature_derate', 'charge_derate_low_start_f'): (-60.0, 250.0),
+    ('over_temperature_derate', 'charge_low_block_f'): (-60.0, 250.0),
+    ('over_temperature_derate', 'charge_derate_start_f'): (-60.0, 250.0),
+    ('over_temperature_derate', 'charge_hard_stop_f'): (-60.0, 250.0),
+    ('over_temperature_derate', 'discharge_derate_start_f'): (-60.0, 250.0),
+    ('over_temperature_derate', 'discharge_hard_stop_f'): (-60.0, 250.0),
+    ('over_temperature_derate', 'emergency_temp_f'): (-60.0, 250.0),
+    ('cell_imbalance_monitor', 'warn_delta_v'): (0.0, 2.0),
+    ('overcurrent_monitor', 'continuous_discharge_warn_a'): (0.0, 210.0),
+    ('overcurrent_monitor', 'continuous_charge_warn_a'): (0.0, 210.0),
+    ('overcurrent_monitor', 'persistence_s'): (0.0, 120.0),
+    ('staleness_watchdog', 'soft_cut_s'): (1.0, 600.0),
+    ('staleness_watchdog', 'hard_escalation_s'): (0.0, 600.0),
+    ('cell_data_cross_check', 'max_delta_v'): (0.0, 2.0),
+    ('cell_data_cross_check', 'soft_cut_s'): (1.0, 600.0),
+    ('cell_data_cross_check', 'hard_escalation_s'): (0.0, 600.0),
+}
+
+
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -22,6 +66,21 @@ def _ramp_factor(value, floor, ceiling):
     if ceiling <= floor:
         return 1.0 if value >= ceiling else 0.0
     return _clamp((value - floor) / (ceiling - floor), 0.0, 1.0)
+
+
+def _clear_disabled_feature(fault_log, entries):
+    """Docs/13 item 14.5: every feature's tracked fault_log
+    entries were only ever `update()`d while that feature's own `enabled`
+    flag was True - unchecking a feature mid-active-fault froze its entry at
+    whatever active/inactive state it last had instead of reflecting that
+    it's no longer being evaluated at all. User directive: this system is
+    already a real-time engine (config changes apply live, no restart
+    needed) - a disabled feature's own fault entries should be live too, not
+    a special frozen case. Called once per disabled feature per tick so its
+    entries immediately (not eventually) show 'disabled', not a stale
+    trigger. `entries`: iterable of (key, label, level)."""
+    for key, label, level in entries:
+        fault_log.update(key, label, level, False, 'feature disabled')
 
 
 # Cross-field ordering sanity (docs/05, added 2026-08-01, user directive):
@@ -156,7 +215,12 @@ def default_config():
             # edge. Full power at/below regen_full_v, zero at/above
             # regen_zero_v, linear between.
             'regen_full_v': 4.00, 'regen_zero_v': 4.15,
-            'emergency_high_v': 4.30,
+            # emergency_high_v 4.30->4.20V (user edit, 2026-08-03, docs/13
+            # item 15.3) - set to the standard NMC charge ceiling exactly
+            # (docs/05's researched 4.20V), tightening the margin above the
+            # 4.15V zero-power point to 0.05V (still passes the
+            # regen_zero_v < emergency_high_v config-sanity check).
+            'emergency_high_v': 4.20,
             # Hysteresis (added 2026-08-01, user request: "regen we should
             # add some hysteresis? same as discharge?") - same fast-attack/
             # slow-release pattern as discharge_power_taper's recovery_ramp_s.
@@ -244,6 +308,19 @@ def default_config():
             # independently tunable from it - same 60s/5s starting point.
             'enabled': True, 'max_delta_v': 0.15, 'soft_cut_s': 60.0, 'hard_escalation_s': 5.0,
         },
+        # Both below: given a real enable/disable toggle 2026-08-03 (docs/13
+        # items 15.14/15.15, user directive) - previously hardcoded always-on
+        # with no config field at all. Default ON (these are genuine safety
+        # nets, not something to casually leave off) - the toggle exists so a
+        # deliberately-corrupted/synthetic test value can be pushed through
+        # unfiltered to confirm downstream handling, and so it's a visible
+        # feature (checkbox + live status) rather than invisible fixed logic.
+        # No threshold fields - RealtimeEngine reads these same 'enabled'
+        # flags to decide whether to actually run rz450e_signals.
+        # validate_inputs()/frame_checksum_ok() at all, not just whether to
+        # report on it.
+        'input_validation': {'enabled': True},
+        'checksum_validation': {'enabled': True},
     }
 
 
@@ -281,7 +358,29 @@ class ManagementEngine:
         # called by RealtimeEngine on the two real-world conditions above -
         # no manual GUI "unlatch" control.
         self._hard_latched = False
+        # Staleness-specific hard cut, THIS tick only (docs/13 item 14.3,
+        # fixed 2026-08-03) - RealtimeEngine's ShutdownSequencer needs to
+        # know specifically whether the CURRENT hard cut came from the
+        # staleness watchdog, not just that some hard cut is active: the
+        # 5th wind-down trigger is deliberately staleness-only (a genuine
+        # "we can no longer safely read the battery" condition), never any
+        # other emergency-tier cut. A voltage/temp/cross-check emergency
+        # must latch relay_cut_request/interlock and keep the bridge running
+        # and broadcasting that cut indefinitely - not wind down and go
+        # silent on the Leaf bus, which would only make the emergency less
+        # visible, not resolve it. User directive: "the bridge should not
+        # wind down unless there is a real trigger to do so... a hard cut
+        # should not stop the bridge... all fail safes are triggered and the
+        # bridge still operates."
+        self.staleness_hard_cut = False
         self.fault_log = FaultLog()
+        # First-ever apply() call, i.e. the moment the bridge actually starts
+        # running (docs/13 item 13.1, user directive 2026-08-03): a signal
+        # that has NEVER arrived at all must not be treated as "nothing to
+        # worry about" forever - it should start aging from the moment this
+        # engine starts actively managing, same as a signal that went stale
+        # after being live. See the staleness_watchdog block below.
+        self._first_apply_time = None
 
     def notify_session_start(self):
         """Called by RealtimeEngine when the bridge begins a fresh session
@@ -308,6 +407,8 @@ class ManagementEngine:
         now = time.monotonic()
         dt = (now - self._last_apply_time) if self._last_apply_time is not None else 0.0
         self._last_apply_time = now
+        if self._first_apply_time is None:
+            self._first_apply_time = now
 
         cell_min_raw = rz_state.get_input('cell_min')
         cell_max_raw = rz_state.get_input('cell_max')
@@ -320,6 +421,7 @@ class ManagementEngine:
 
         soft_cut = False
         hard_cut = False
+        self.staleness_hard_cut = False   # recomputed below (docs/13 item 14.3)
 
         f = cfg['low_voltage_cutoff']
         if f['enabled']:
@@ -377,6 +479,11 @@ class ManagementEngine:
                                   status['low_voltage_cutoff'])
             self.fault_log.update('low_voltage_soft', 'Low-voltage soft cut (capacity_empty)',
                                   'soft', soft_cut, status['low_voltage_cutoff'])
+        else:
+            status['low_voltage_cutoff'] = 'disabled'
+            _clear_disabled_feature(self.fault_log, [
+                ('low_voltage_emergency', 'Low-voltage EMERGENCY hard cut (per-cell)', 'hard'),
+                ('low_voltage_soft', 'Low-voltage soft cut (capacity_empty)', 'soft')])
 
         f = cfg['discharge_power_taper']
         if f['enabled']:
@@ -403,6 +510,9 @@ class ManagementEngine:
             else:
                 status['discharge_power_taper'] = (
                     f'applied factor={self._discharge_factor_applied:.2f} (no per-cell voltage data yet)')
+        else:
+            status['discharge_power_taper'] = 'disabled'
+            self._discharge_factor_applied = 1.0   # docs/13 item 14.5 - don't resume a stale ramped-down factor if re-enabled later
 
         f = cfg['charge_target_taper']
         if f['enabled']:
@@ -441,6 +551,11 @@ class ManagementEngine:
 
             self.fault_log.update('overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut - regen (per-cell)',
                                   'hard', worst_high is not None and worst_high >= f['emergency_high_v'], cell_status)
+        else:
+            status['charge_target_taper'] = 'disabled'
+            self._regen_factor_applied = 1.0   # docs/13 item 14.5 - don't resume a stale ramped-down factor if re-enabled later
+            _clear_disabled_feature(self.fault_log, [
+                ('overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut - regen (per-cell)', 'hard')])
 
         # AC-charger taper (split out 2026-08-01 from the old combined
         # charge_target_taper - see default_config()'s comment). Config
@@ -467,6 +582,12 @@ class ManagementEngine:
                 ac_factor = 0.0
                 ac_status = f'EMERGENCY hard cut ({worst_high:.3f}V >= {ac_cfg["ac_emergency_v"]}V)'
             elif worst_high is not None:
+                # Deliberately NO hysteresis here, unlike charge_target_taper's
+                # _regen_factor_applied above (docs/13 Part 9, decided
+                # 2026-08-03: "let's leave it and mark it as such so it's not
+                # confusing in the future") - ac_factor is a pure function of
+                # the current instantaneous voltage, recomputed fresh every
+                # tick, intentionally asymmetric with the regen taper.
                 ac_factor = 1.0 - _ramp_factor(worst_high, ac_cfg['ac_full_v'], ac_cfg['ac_zero_v'])
                 ac_status = (
                     f'AC charger taper factor={ac_factor:.2f} (worst cell {worst_high:.3f}V - '
@@ -507,9 +628,30 @@ class ManagementEngine:
                 status['ac_charge_taper'] = (
                     ac_status + ' | not actively charging per RZ450e interlock (charger ceiling still '
                     'active; AC target/full_charge_flag gated off)')
+        else:
+            status['ac_charge_taper'] = 'disabled'
+            _clear_disabled_feature(self.fault_log, [
+                ('ac_overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut - AC charger (per-cell)', 'hard')])
 
         f = cfg['over_temperature_derate']
-        if f['enabled'] and temp_max is not None:
+        if f['enabled'] and temp_max is None:
+            # Parity fix (docs/13 item 13.7, added 2026-08-03): previously
+            # this whole feature just went silent with no status and no
+            # fault_log entries when temp_max was missing - unlike every
+            # voltage-based feature, which explicitly reports "no per-cell
+            # voltage data yet" even with zero data (see docs/13 item 13.1
+            # for the separate, already-addressed question of what factor
+            # gets APPLIED with no data - this fix is purely about making
+            # "no temperature data" visible, not changing that behavior).
+            status['over_temperature_derate'] = 'no temperature data yet - full power (see docs/13 13.1)'
+            for key, label in (
+                    ('over_temp_emergency', 'Over-temperature EMERGENCY hard cut (hottest probe)'),
+                    ('charge_cold_block', 'Charge/regen blocked - coldest probe at/below freezing'),
+                    ('discharge_temp_zero', 'Discharge power at zero - over-temperature'),
+                    ('charge_temp_zero', 'Charge/regen power at zero - over-temperature')):
+                self.fault_log.update(key, label, 'warn' if key != 'over_temp_emergency' else 'hard',
+                                      False, status['over_temperature_derate'])
+        elif f['enabled'] and temp_max is not None:
             # Cold-side decisions use the COLDEST probe (docs/12 finding F1,
             # fixed 2026-07-31) - lithium plating happens in the coldest
             # cells, so testing temp_max here would let charging continue
@@ -554,6 +696,13 @@ class ManagementEngine:
                                   'warn', d_factor <= 0.0, status['over_temperature_derate'])
             self.fault_log.update('charge_temp_zero', 'Charge/regen power at zero - over-temperature',
                                   'warn', c_factor <= 0.0, status['over_temperature_derate'])
+        elif not f['enabled']:
+            status['over_temperature_derate'] = 'disabled'
+            _clear_disabled_feature(self.fault_log, [
+                ('over_temp_emergency', 'Over-temperature EMERGENCY hard cut (hottest probe)', 'hard'),
+                ('charge_cold_block', 'Charge/regen blocked - coldest probe at/below freezing', 'warn'),
+                ('discharge_temp_zero', 'Discharge power at zero - over-temperature', 'warn'),
+                ('charge_temp_zero', 'Charge/regen power at zero - over-temperature', 'warn')])
 
         f = cfg['cell_imbalance_monitor']
         if f['enabled']:
@@ -573,6 +722,9 @@ class ManagementEngine:
                                   worst_high is not None and worst_low is not None
                                   and (worst_high - worst_low) >= f['warn_delta_v'],
                                   status['cell_imbalance_monitor'])
+        else:
+            status['cell_imbalance_monitor'] = 'disabled'
+            _clear_disabled_feature(self.fault_log, [('cell_imbalance_warn', 'Cell imbalance warning (spread)', 'warn')])
 
         f = cfg['overcurrent_monitor']
         if f['enabled']:
@@ -625,6 +777,13 @@ class ManagementEngine:
                                   discharge_warn_active, status['overcurrent_monitor'])
             self.fault_log.update('overcurrent_charge_warn', 'Overcurrent warning - charge/regen', 'warn',
                                   charge_warn_active, status['overcurrent_monitor'])
+        else:
+            status['overcurrent_monitor'] = 'disabled'
+            self._overcurrent_since = None
+            self._overcurrent_direction = None
+            _clear_disabled_feature(self.fault_log, [
+                ('overcurrent_discharge_warn', 'Overcurrent warning - discharge', 'warn'),
+                ('overcurrent_charge_warn', 'Overcurrent warning - charge/regen', 'warn')])
 
         sanity_violations = _check_config_sanity(cfg, rz_state.charge_emulation)
         status['config_sanity'] = 'ok' if not sanity_violations else '; '.join(sanity_violations)
@@ -632,21 +791,53 @@ class ManagementEngine:
             'config_sanity', 'Battery-management config has an inverted/nonsensical threshold ordering',
             'warn', bool(sanity_violations), status['config_sanity'])
 
-        # Input plausibility rejections (docs/05, added 2026-08-01) - always
-        # on, no enable flag, same "always-on safety net" philosophy as
-        # output clamping (docs/06 section 4). rz450e_signals.validate_
-        # inputs() already keeps a rejected value out of SharedState
-        # entirely (bridge/realtime_engine.py's _ingest_validated); this
-        # just surfaces it as a live fault_log entry rather than a silent
-        # drop, per the user's request to log the reason to the fault page.
-        recent_rejections = rz_state.recent_rejections()
-        if recent_rejections:
-            status['input_validation'] = 'REJECTED (implausible): ' + '; '.join(
-                f'{k}={v!r}' for k, v in recent_rejections.items())
+        # Input plausibility rejections (docs/05, added 2026-08-01) - was
+        # always on with no enable flag; given a real toggle (docs/13 item
+        # 15.14, user directive 2026-08-03: "we should add enable disable
+        # for our app for testing... default to on") so a corrupted/synthetic
+        # test value can deliberately be pushed through unfiltered to confirm
+        # the rest of the pipeline handles it, and so it's visible as a real
+        # feature (checkbox + status line) rather than invisible hardcoded
+        # logic. Default ON - this is a genuine safety net, not something to
+        # casually leave off. RealtimeEngine._ingest_validated() reads this
+        # same cfg['input_validation']['enabled'] flag to decide whether to
+        # actually run rz450e_signals.validate_inputs() at all - disabling
+        # here doesn't just hide the fault light, it stops the rejection
+        # from happening upstream too.
+        if cfg['input_validation']['enabled']:
+            recent_rejections = rz_state.recent_rejections()
+            if recent_rejections:
+                status['input_validation'] = 'REJECTED (implausible): ' + '; '.join(
+                    f'{k}={v!r}' for k, v in recent_rejections.items())
+            else:
+                status['input_validation'] = 'ok'
+            self.fault_log.update('input_validation_reject', 'Input plausibility check rejected a value', 'warn',
+                                  bool(recent_rejections), status['input_validation'])
         else:
-            status['input_validation'] = 'ok'
-        self.fault_log.update('input_validation_reject', 'Input plausibility check rejected a value', 'warn',
-                              bool(recent_rejections), status['input_validation'])
+            status['input_validation'] = 'disabled'
+            _clear_disabled_feature(self.fault_log, [
+                ('input_validation_reject', 'Input plausibility check rejected a value', 'warn')])
+
+        # Checksum failures (docs/13 item 13.5, added 2026-08-03) - same
+        # live-fault_log pattern as input_validation_reject above, tracking
+        # rz450e_signals.frame_checksum_ok() rejections instead. Also given a
+        # real toggle (docs/13 item 15.15, same user directive as above,
+        # default ON) - RealtimeEngine._ingest_rz_bus() reads cfg[
+        # 'checksum_validation']['enabled'] to decide whether to actually run
+        # the checksum check at all.
+        if cfg['checksum_validation']['enabled']:
+            recent_checksum_failures = rz_state.recent_checksum_failures()
+            if recent_checksum_failures:
+                status['checksum_validation'] = 'REJECTED (checksum mismatch): ' + '; '.join(
+                    f'0x{arb_id:03X} x{count}' for arb_id, count in recent_checksum_failures.items())
+            else:
+                status['checksum_validation'] = 'ok'
+            self.fault_log.update('checksum_reject', 'Toyota checksum validation rejected a corrupt frame', 'warn',
+                                  bool(recent_checksum_failures), status['checksum_validation'])
+        else:
+            status['checksum_validation'] = 'disabled'
+            _clear_disabled_feature(self.fault_log, [
+                ('checksum_reject', 'Toyota checksum validation rejected a corrupt frame', 'warn')])
 
         f = cfg['cell_data_cross_check']
         if f['enabled']:
@@ -687,6 +878,12 @@ class ManagementEngine:
             self.fault_log.update(
                 'cell_data_mismatch_hard', 'Cell data cross-check mismatch - hard cut escalation',
                 'hard', cross_hard_active, status['cell_data_cross_check'])
+        else:
+            status['cell_data_cross_check'] = 'disabled'
+            self._cross_check_since = None
+            _clear_disabled_feature(self.fault_log, [
+                ('cell_data_mismatch', 'Cell data cross-check mismatch (per-cell vs 0x020 pack summary)', 'soft'),
+                ('cell_data_mismatch_hard', 'Cell data cross-check mismatch - hard cut escalation', 'hard')])
 
         f = cfg['staleness_watchdog']
         if f['enabled']:
@@ -699,18 +896,31 @@ class ManagementEngine:
             # updating counts as stale. Batched into one lock acquisition
             # (SharedState.ages_of) rather than 100+ separate age_of() calls
             # per tick.
+            # "Never seen at all this session" is now treated as aging from
+            # the moment THIS bridge started actively running (docs/13 item
+            # 13.1, user directive 2026-08-03) rather than excluded forever -
+            # a signal that has never arrived is a strictly WORSE case than
+            # one that went stale after being live, and must hit the same
+            # 60s/65s soft/hard cut, not sit outside the watchdog's view
+            # indefinitely. `since_start` anchors that clock to this
+            # engine's own first apply() call, which only starts once the
+            # sequencer reaches 'startup' (real bus wake) - see
+            # RealtimeEngine._tx_loop.
+            since_start = now - self._first_apply_time
             ages_by_key = rz_state.ages_of(rz450e_signals.INPUT_SIGNAL_KEYS)
             worst_age = 0.0
             worst_key = None
             for key, a in ages_by_key.items():
-                if a is not None and a > worst_age:
-                    worst_age = a
-                    worst_key = key
+                effective = a if a is not None else since_start
+                if effective > worst_age:
+                    worst_age = effective
+                    worst_key = key if a is not None else f'{key} (never seen)'
             for ck in ('alive_3f1', 'alive_358', 'counter_5s'):
                 a = rz_state.counter_stale_age(ck)
-                if a is not None and a > worst_age:
-                    worst_age = a
-                    worst_key = f'counter:{ck}'
+                effective = a if a is not None else since_start
+                if effective > worst_age:
+                    worst_age = effective
+                    worst_key = f'counter:{ck}' if a is not None else f'counter:{ck} (never seen)'
             stale_soft_active = False
             stale_hard_active = False
             if worst_age >= f['soft_cut_s']:
@@ -720,18 +930,28 @@ class ManagementEngine:
                 stale_soft_active = True
                 # Stale safety-relevant input data must not just soft-cut -
                 # it must also stop charging outright (user directive
-                # 2026-08-01): we can no longer verify it's safe to keep
-                # accepting charge/regen if the data behind that decision is
-                # stale, so force an explicit charge-stop here rather than
-                # relying on capacity_empty alone. Scoped to THIS feature
-                # only (not every soft cut - e.g. a low-voltage soft cut
-                # should NOT block charging, which is exactly what a
-                # depleted pack needs).
+                # 2026-08-01, reaffirmed 2026-08-03: "it should hard stop
+                # and trigger the stop charging flag"): we can no longer
+                # verify it's safe to keep accepting charge/regen if the
+                # data behind that decision is stale, so force an explicit
+                # charge-stop here rather than relying on capacity_empty
+                # alone. full_charge_flag added 2026-08-03 alongside the
+                # existing charge_limit_kw/charger_limit_kw zeroing - this
+                # is also what RealtimeEngine._apply_charge_ramp() sets for
+                # every other "Leaf wants to charge but something is
+                # blocking it" mismatch, so staleness now uses the exact
+                # same real-hardware-confirmed "instant stop, needs a fresh
+                # charge request to retry" bit instead of a different,
+                # weaker response. Scoped to THIS feature only (not every
+                # soft cut - e.g. a low-voltage soft cut should NOT block
+                # charging, which is exactly what a depleted pack needs).
                 out['charge_limit_kw'] = 0.0
                 out['charger_limit_kw'] = -10.0
+                out['full_charge_flag'] = 1
                 if time.monotonic() - self._stale_since >= f['hard_escalation_s']:
                     hard_cut = True
                     stale_hard_active = True
+                    self.staleness_hard_cut = True
                     status['staleness_watchdog'] = (
                         f'STALE {worst_age:.0f}s ({worst_key}) - escalated to HARD cut, charging stopped')
                 else:
@@ -745,6 +965,12 @@ class ManagementEngine:
                                   stale_soft_active, status['staleness_watchdog'])
             self.fault_log.update('staleness_hard', 'Staleness watchdog - hard cut escalation', 'hard',
                                   stale_hard_active, status['staleness_watchdog'])
+        else:
+            status['staleness_watchdog'] = 'disabled'
+            self._stale_since = None
+            _clear_disabled_feature(self.fault_log, [
+                ('staleness_soft', 'Staleness watchdog - soft cut (stale data)', 'soft'),
+                ('staleness_hard', 'Staleness watchdog - hard cut escalation', 'hard')])
 
         if soft_cut:
             out['capacity_empty'] = 1
@@ -788,6 +1014,21 @@ class ManagementEngine:
                 # and blindly merging them back in would silently resurrect
                 # dead config forever.
                 for key, value in values.items():
-                    if key in cfg[feature]:
-                        cfg[feature][key] = value
+                    if key not in cfg[feature]:
+                        continue
+                    # Bounds clamp (docs/13 items 13.3/13.9, fixed
+                    # 2026-08-03): a hand-edited or corrupted profile.json
+                    # must not be able to set a threshold to an arbitrary
+                    # value just because it skips the GUI's own clamp - see
+                    # FEATURE_FIELD_BOUNDS above. A value that can't even be
+                    # coerced to a number (corruption, wrong type) is
+                    # dropped entirely, leaving the safe default in place,
+                    # rather than written through as-is.
+                    bounds = FEATURE_FIELD_BOUNDS.get((feature, key))
+                    if bounds is not None:
+                        try:
+                            value = max(bounds[0], min(bounds[1], float(value)))
+                        except (TypeError, ValueError):
+                            continue
+                    cfg[feature][key] = value
         return cls(cfg)

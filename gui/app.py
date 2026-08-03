@@ -74,7 +74,15 @@ class App(tk.Tk):
             self.mapping, self.management = config_profile.apply_profile(profile, self.state_model)
         else:
             self.mapping, self.management = MappingEngine(), ManagementEngine()
-        self.state_model.seed_last_known_good(config_profile.load_last_known_good())
+        cached_good, cached_rejected = config_profile.load_last_known_good()
+        self.state_model.seed_last_known_good(cached_good)
+        if cached_rejected:
+            # docs/13 item 13.2 (fixed 2026-08-03): last_known_good.json is
+            # now plausibility-checked on load, same as live data - surface
+            # what got dropped so a corrupted/hand-edited cache file isn't a
+            # silent gap.
+            self.log(f'Ignored {len(cached_rejected)} implausible value(s) from last_known_good.json: '
+                      + '; '.join(f'{k}={v!r}' for k, v in cached_rejected.items()))
         config_profile.load_fault_log(self.management)
 
         # RZ450e is one combined connection - one physical adapter carries
@@ -268,7 +276,7 @@ class App(tk.Tk):
         MappingPanel(t_map, self.state_model, self.mapping).pack(fill='both', expand=True)
         ManagementPanel(t_mgmt, self.state_model, self.management, log_fn=self.log).pack(fill='both', expand=True)
         GeneratedSignalsPanel(t_gen, self.state_model).pack(fill='both', expand=True)
-        ChargeEmulationPanel(t_charge, self.state_model, log_fn=self.log).pack(fill='both', expand=True)
+        ChargeEmulationPanel(t_charge, self.state_model, log_fn=self.log, engine=self.engine).pack(fill='both', expand=True)
         FuturePlaceholderPanel(t_future).pack(fill='both', expand=True)
 
     # ── Right: Leaf emulator (outputs) ──────────────────────────────────

@@ -44,14 +44,21 @@ Plus `0x1C2` always; `0x5EB` if battery=ZE1; `0x1ED` if battery=ZE1 62kWh.
 ## Charge-request ramp emulation (added 2026-07-31, see `06-realtime-engine-and-watchdog.md`)
 
 "Max power for charger" above is normally just whatever the Signal Mapping tab (or the idle
-92.3kW placeholder) produces. The **Charge Emulation** GUI tab adds an opt-in feature, ported from
-`Refrance/Leaf_BMS_Emulator`'s confirmed real-hardware behavior (bit-level diff of every HVBAT ID,
-idle vs. real charge-session captures):
+92.3kW placeholder) produces. The **Charge Emulation** GUI tab adds a feature (default on as of
+2026-08-01, individually toggleable), ported from `Refrance/Leaf_BMS_Emulator`'s confirmed
+real-hardware behavior (bit-level diff of every HVBAT ID, idle vs. real charge-session captures):
 
-- **`charge_emulate`** (checkbox, default off) — enables the feature at all.
+- **`charge_emulate`** (checkbox, default **on** as of 2026-08-01 — "the charge option should be
+  set to on as default") — enables the feature at all.
 - **`charge_target_kw`** (0-92.2 kW) — the ramp's target ceiling.
 - **`chg_uprate_level`** (0-7) — ramp rate; level 7 = 2.0 kW/s, each level down halves it. Rides
   along on the `0x1DC` uprate bits (byte 4 bits 5-7), 0 at idle.
+- **`require_live_data_to_charge`** (checkbox, default on) — a one-time per-session startup gate:
+  the ramp will not begin until every per-cell voltage and both `temp_max`/`temp_min` have a
+  genuinely live (not cached/default/previous-session) reading this bridge session. Not an ongoing
+  freshness timer — once satisfied for the session it stays satisfied; ongoing staleness protection
+  during an active charge is the general staleness watchdog's job, same as driving
+  (`06-realtime-engine-and-watchdog.md`).
 
 **Requires BOTH triggers at once** (user directive, 2026-07-31) — a real `0x1F2` charge request
 from the Leaf (`Charge_StatusTransitionReqest == 1` or `CommandedChargePower` above idle) **and**
@@ -98,10 +105,9 @@ bypassed by this feature.
 - **`interlock_connected`** (`0x1DB`, clearing it) — RED message appears **instantly**. Also part
   of the same latch as `relay_cut_request` above - both assert/clear together.
 - **`main_relay_on`** (`0x1DB`, clearing it) — also prevents contactor closure, but with a delay
-  before the RED message appears (different timing from interlock, otherwise similar effect). Not
-  currently driven by this bridge at all (always sends `1`) - see `docs/13-review-checklist-2026-
-  08-01.md`'s coverage-audit findings for whether this should also be wired into the hard-cut path
-  as a third layer of redundancy.
+  before the RED message appears (different timing from interlock, otherwise similar effect).
+  Always sends `1` (no live driver) — **user decision** (`docs/13` item 12.5): this signal only has
+  any effect during startup, so a static `1` is fine; not wired into the hard-cut path.
 
 Per user instruction (`05-battery-management-safety.md`): default to soft cut for routine
 protection, reserve hard cut for genuine emergencies and the staleness-watchdog fault.

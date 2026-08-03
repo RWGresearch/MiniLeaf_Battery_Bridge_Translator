@@ -2,17 +2,17 @@
 
 ## New to this project
 
-1. **`full_charge_flag` re-arm without a physical replug.** The real Leaf requires an unplug/
-   replug cycle to resume charging after this flag fires; the RZ450e side has no equivalent
-   signal. Candidate approaches (needs a decision before milestone 1's charging path is
-   considered done): re-arm once SoC drops below the charge target by a hysteresis margin (e.g.
-   2-3%), or a manual "reset charge stop" action in the GUI. See
-   `05-battery-management-safety.md`. **Still open as of 2026-07-31's charger-request ramp
-   feature** (`06-realtime-engine-and-watchdog.md` section 6) — the new Leaf-wants-to-charge-but-
-   RZ450e-hasn't-authorized mismatch is a SECOND place `full_charge_flag` gets set, using the exact
-   same non-latching, recomputed-fresh-every-tick approach as the existing AC-target case; a genuine
-   replug (a fresh `0x1F2` request) does clear it in practice for that specific trigger, but a real
-   sticky-latch mechanism generally is still undecided.
+1. **RESOLVED 2026-08-01/03 — `full_charge_flag` re-arm without a physical replug.** The real Leaf
+   requires an unplug/replug cycle to resume charging after this flag fires; the RZ450e side has no
+   direct equivalent signal. Resolved via the general hard-cut latching mechanism (`12-nmc-bms-
+   design-research.md` finding F8): any hard-cut condition (including a charging-permission
+   mismatch) now latches via `ManagementEngine._hard_latched`, cleared only by
+   `notify_session_start()` (genuine bus-wake power cycle) or `notify_charge_replug()`
+   (`charge_permission_input` genuinely absent for at least `CHG_END_STOP_S` = 3.0s before a new
+   request — refined `docs/13` item 13.4 after an independent review found the first version could
+   be cleared by simply toggling the bridge's own Stop/Start button with the car never actually
+   losing power). See `05-battery-management-safety.md`'s "`full_charge_flag` re-arm" section for
+   full current behavior.
 2. **Exact staleness-watchdog behavior when only some source groups go stale.** The watchdog
    (`06-realtime-engine-and-watchdog.md`) is specified per source-group (fast raw-CAN vs. DID/PID),
    but the interaction when, say, only the DID/PID group goes stale while raw-CAN stays fresh
@@ -21,13 +21,13 @@
 3. **GIDS threshold interaction.** The Leaf project found real thresholds (GIDS≈49 = low-battery
    warning, GIDS≈5 = turtle mode) baked into the VCM itself. This project's derived GIDS formula
    (`04-signal-mapping.md`) needs to be checked against these once real numbers are flowing, to
-   make sure the cell-voltage-driven `discharge_power_taper` (full power ≥3.50V, zero ≤3.00V/cell)
-   and `low_voltage_cutoff` (soft cut at 3.00V/cell, `min_soc_pct` a backup check only — see
-   `05-battery-management-safety.md`'s 2026-07-31 correction) don't put the bridge in an unexpected
-   VCM-side low-battery state before its own protection features would have acted. Since both are
-   now voltage-driven rather than SoC-driven, this is really a question of whether the *voltage*
-   defaults (3.50V/3.00V) map to a GIDS range comfortably above 49/5, not a SoC-floor question
-   anymore.
+   make sure the cell-voltage-driven `discharge_power_taper` (full power ≥3.00V, zero ≤2.60V/cell
+   as of the 2026-08-01 re-anchoring) and `low_voltage_cutoff` (soft cut at 3.00V/cell, emergency
+   hard cut at 2.60V/cell, `min_soc_pct` a backup check only — see `05-battery-management-
+   safety.md`'s 2026-07-31 correction) don't put the bridge in an unexpected VCM-side low-battery
+   state before its own protection features would have acted. Since both are now voltage-driven
+   rather than SoC-driven, this is really a question of whether the *voltage* defaults
+   (3.00V/2.60V) map to a GIDS range comfortably above 49/5, not a SoC-floor question anymore.
 4. **RESOLVED 2026-08-01 — Whether the `charge_permission_input` interlock (`0x358`) needs a "no
    interlock present" default behavior.** This question is specifically about ONE signal
    (`charge_permission_input`) being physically absent/unwired entirely (e.g. an earlier hardware

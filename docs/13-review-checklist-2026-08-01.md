@@ -41,6 +41,13 @@ however, we do need the watchdog to check ALL incoming messages for stailness.
 and cut off soft, then hard, AND stop charging ( charge cut) for any and all stail data that we know we are 
 using in for th input to the the BMS. espoeshialy any safty related data. 
 
+**Outcome (2026-08-01, refined 2026-08-03): FIXED.** The watchdog now tracks freshness of every
+registered input signal (all 96 cells, all 16 temp probes, every scalar and keep-alive counter),
+not just the original 5-signal subset - docs/13 item 13.1a, `docs/06` section 3. Soft-then-hard
+(60s/+5s) escalation confirmed already correct; the soft stage was later extended (item 13.1) to
+also force an explicit charge-stop (`full_charge_flag`/`charge_limit_kw`/`charger_limit_kw`), not
+just `capacity_empty` - directly matching "cut off soft, then hard, AND stop charging" above.
+
 ### 1.2 — The "sanity cross-check" between per-cell data and pack summary is documented but not built
 - [x] Reviewed
 docs/02:34 and docs/04:77 both describe `0x020`'s `cell_min`/`cell_max` as a "sanity cross-check"
@@ -50,6 +57,13 @@ normal case where both have data.
 **Your notes:**
 fallback is OK, but we should do the live cross check and if thing start to get outside a delta that is safe we need to 
 use trigger a fail safe just like the watch dog. of corse we need to add those reasions for fail safe to the fualt page.
+
+**Outcome (2026-08-01, tested 2026-08-03): FIXED.** New `cell_data_cross_check` feature -
+continuously compares the per-cell array against the `0x020` pack summary, same soft->hard
+escalation structure as the staleness watchdog (60s/+5s, independently tunable), with two dedicated
+fault_log entries (`cell_data_mismatch`/`cell_data_mismatch_hard`, see checklist items 15.16/15.17)
+so the reason is visible on the Fault History page exactly as asked. Had zero test coverage until a
+later sweep found the gap - now covered by `test_cell_data_cross_check_soft_and_hard_escalation`.
 
 ### 1.3 — Worst-cell computation has no visibility into partial cell coverage
 - [x] Reviewed
@@ -66,6 +80,21 @@ we should most likely do some kind of CRC or cross check that the data is in a v
 amyting outside the valid data should be rejected. and checked on the next input of that data. 
 if after 60 seconds the data is still invalid. we should trigger the watchdog. as thats what it is for.  
 
+**Outcome (2026-08-01/03): FIXED - resolved as "the other mechanisms already cover this."** User
+decision, 2026-08-03: "let's mark as the staleness watchdog covers this as you show." The broader
+ask (validate every incoming message, reject anything outside a plausible range, let sustained
+invalid data escalate through the watchdog) is fully done: `rz450e_signals.PLAUSIBLE_RANGES`/
+`validate_inputs()` (per-signal plausibility check, a rejected value is never written and ages
+under its last-good value until the now-comprehensive watchdog, item 1.1, catches it after 60s)
+plus Toyota checksum validation on the 5 confirmed checksum-bearing IDs (item 13.5) - both
+toggleable, checklist items 15.14/15.15. A cell that's never arrived at all also now ages from this
+engine's first `apply()` call (item 13.1a) rather than being invisible forever. Between these three
+mechanisms, a cell missing from the array for any reason (never arrived, went stale, or was
+rejected as implausible) is always caught within the watchdog's normal 60s/+5s schedule - **no
+separate "N/96 coverage" indicator was built, and per this decision, none is needed**: it would be
+reporting the same underlying condition these three mechanisms already surface, just phrased
+differently.
+
 ---
 
 ## Part 2 — Silent-failure / observability findings
@@ -81,6 +110,13 @@ can show **"Connected" in green** while every Leaf-bound frame silently fails to
 yeah, add a decacated can moniter lights next to the conection section. so we know the real state. 
 including bus heavy. and any resets, add a counter so we can see how many resets we have had.
 
+**Outcome (2026-08-01): FIXED.** New connection-health lights on both `ConnectionsPanel`s (RZ450e
+and Leaf) - a TX-OK light (green/red) tracked separately from RX/`connected`, plus a
+`reconnects: N | TX errors: N` counter line. `bridge/can_backend.py`'s `BusConnection` gained
+`tx_ok`/`reconnect_count`/`send_errors` to back this. "Bus heavy" specifically (a bus-off/error-
+frame-rate condition) isn't separately surfaced - `tx_ok` covers "the most recent send failed,"
+which is the practical symptom, but there's no dedicated bus-load/error-rate metric if that's still
+wanted as its own thing.
 
 ### 2.2 — A dead TX-loop thread produces no warning either
 - [x] Reviewed
@@ -93,6 +129,15 @@ bars just below them, which do check `age_of()` (`gui/dashboard.py:358-362`).
 **Your notes:**
 same as 2.1, add those things in the app so we can see whats going on. if the age reaches the triggerd 60 sec.
 the watch dog takes over. 
+
+**Outcome (2026-08-01): FIXED.** New `RealtimeEngine.last_tick_monotonic` heartbeat, checked by
+`gui/app.py`'s bridge-status label every 400ms - shows "Bridge: NOT RESPONDING (TX thread
+stalled)" in red if the TX loop hasn't ticked in over `HEARTBEAT_STALE_S` (2.0s), instead of the
+phase label silently freezing forever. `gui/dashboard.py`'s output bars also now use this same
+heartbeat for their `fresh` flag instead of the old hardcoded `fresh=True` - confirmed directly,
+this was the second half of the original finding. The watchdog's own 60s/+5s escalation (item 1.1)
+is a separate, already-correct mechanism for RZ450e *input* staleness - this fix is specifically
+about the bridge's own TX thread dying, a different failure mode.
 
 ### 2.3 — DID poll cadence is slower than its own naming/docs imply **(NEW)**
 - [x] Reviewed
@@ -109,6 +154,13 @@ but if nothing for 5 seconds, go to the next and try that one again when it come
 of corse, confirm that some did's dont need more than 5 seconds. but, once the aproperate full responce is recived, 
 then yes, move on to the next one. i did nt want to flood the can network with did data. thats why i have the wait. 
 so we still may need some extra wait time to keep the network from overloading.
+
+**Outcome (2026-08-01): FIXED, exactly as described.** `_did_poll_loop` reworked: waits up to
+`DID_RESPONSE_TIMEOUT_S` (5.0s) for each DID's response, then moves to the next one immediately
+once it actually arrives - only a small `DID_INTER_REQUEST_GAP_S` (0.3s) pacing delay between
+requests, so a fast response doesn't cost a needless extra wait, but the bus still isn't hit with
+back-to-back requests. Each of the 3 DIDs is now really re-polled roughly every 5s (plus whatever
+the other two took), not ~15s as before.
 
 ---
 
@@ -131,6 +183,17 @@ to the user in `RZ450E_CONN_HELP`/`LEAF_CONN_HELP` (`gui/panels.py:19-41`).
 **Your notes:**
 yeah, can we fix this? if so lets do.
 
+**Outcome (2026-08-01): FIXED, tested 2026-08-03.** `BusConnection` gained a real lock protecting
+`_worker`/`_want_connected`/`_monitor_thread` across `connect()`/`disconnect()`/
+`_auto_reconnect_loop()`, and the monitor's flat `time.sleep(RECONNECT_INTERVAL_S)` was replaced
+with an interruptible `Event.wait()` so `disconnect()` takes effect immediately instead of up to
+3s late - closing the specific repro in this item (disconnect mid-sleep, reconnect within the
+window). Verified with a new `tests/test_can_backend.py` (first coverage for this module):
+`test_disconnect_interrupts_the_monitor_promptly_not_after_the_full_interval` (monitor exits within
+~1s, not the full 3.0s) and `test_rapid_disconnect_reconnect_cycling_never_leaves_the_connection_
+without_a_monitor` (10x stress cycle, always ends up connected with exactly one live monitor - no
+leaked-away monitor). Stable across 5 repeated runs.
+
 ### 3.2 — A concurrent auto-reconnect can silently undo an explicit Disconnect click **(NEW)**
 - [x] Reviewed
 Same root cause as 3.1 (no lock protects `_worker`/`_want_connected` across `connect()`/
@@ -144,6 +207,17 @@ when they click Disconnect in the first place, so it's not purely theoretical.
 **Your notes:**
 so we need to fix this? 
 
+**Outcome (2026-08-01): PARTIALLY FIXED, same lock as 3.1.** The same lock+interruptible-wait fix
+narrowed this race's window too - from up to ~3s down to microseconds (`connect()`'s check-and-
+mutate and `disconnect()`'s own mutation now both happen under the lock). **Not perfectly closed**:
+a vanishingly narrow window can still technically exist between `_worker.is_alive()`-style checks
+and the lock acquisition around them (see item 12.4's own follow-up note on this same gap - a
+cleaner close would use a monotonic "generation counter" on the monitor thread instead of relying
+on liveness checks, not done). Given how much smaller the window now is, this is very unlikely to
+matter in practice, but it isn't a mathematically complete fix - see `tests/test_can_backend.py`'s
+own docstring for why the *exact* race isn't practically unit-testable without adding test-only
+synchronization hooks to `can_backend.py` itself.
+
 ### 3.3 — App close doesn't cleanly shut down the CAN adapters **(NEW)**
 - [x] Reviewed
 `App._on_close()` (`gui/app.py:305-310`) calls `engine.stop()` (just flips `_running = False`, no
@@ -155,6 +229,11 @@ in-app data, but can plausibly leave the driver handle in a busy/locked state un
 delay before the adapter is usable again on next launch.
 **Your notes:**
 most effently needs to cleenly dissconnect if app is closed. 
+
+**Outcome (2026-08-01): FIXED.** `App._on_close()` now calls `rz_bus.disconnect()`/
+`leaf_bus.disconnect()` before `self.destroy()`, so both adapters run their real PCAN-shutdown path
+(`CanWorker.run()`'s `self._bus.shutdown()`) instead of just being killed by daemon-thread process
+exit.
 
 ### 3.4 — Confirmed clean on this pass (for context, not action items)
 - [x] Reviewed
@@ -168,13 +247,15 @@ most effently needs to cleenly dissconnect if app is closed.
   default rather than erroring or silently staying blank.
 **Your notes:**
 
+**Outcome:** No action needed - confirmed clean on this pass, not a defect. Still true as of
+2026-08-03 (no regressions found in the later full code sweep, item Part 14).
 
 ---
 
 ## Part 4 — Configuration & input-safety findings
 
 ### 4.1 — No sanity bounds or feedback on manually-typed safety thresholds
-- [ ] Reviewed
+- [x] Reviewed
 `ManagementPanel`'s threshold fields (`gui/panels.py:641-644, 652-657`) write straight into the
 live config on every keystroke with no min/max clamp and no cross-field validation (nothing stops
 `emergency_low_v` being typed higher than `min_cell_v`, inverting the two tiers). A bad parse is
@@ -194,6 +275,16 @@ yeah we need clamps on all data thats input by the user. and we need to clamp th
 if its wrongly computed we should set an error state? ) on the same note. this gose along with 1.3 for ths input
 can data.
 
+**Outcome (2026-08-01, extended 2026-08-03): FIXED.** Every `ManagementPanel` threshold field now
+clamps to a registered `(lo, hi)` bound on every keystroke via `FEATURE_FIELD_BOUNDS`, with a visual
+"invalid"/"clamped" flag next to the field instead of silently swallowing a bad edit - exactly the
+"set an error state" ask. Extended 2026-08-03 (items 13.3/13.9) to the profile-*loading* path too
+(`ManagementEngine.from_dict()`, `config_profile.py`'s charge_emulation loader) using the identical
+bounds tables, so a hand-edited/corrupted `profile.json` can't set a threshold the GUI itself would
+never allow. **Output clamping** (the other half of this note) was already in place before this
+item was written (`leaf_signals.clamp_state()`, docs/06 section 4) - confirmed still correct, not a
+gap.
+
 ### 4.2 — Every protection feature is a single checkbox away from being fully off, with no backstop
 - [x] Reviewed
 Each of the 7 curated features has one `enabled` checkbox (`gui/panels.py:628-630`); unchecking it
@@ -206,6 +297,15 @@ on a side note: this remineds me the charge option should be set to on as defual
 second side note: this also makes me think. we have regen power AND charge power. we should seprate those. 
 move the AC charge liments in to the charge tab? anything charger related should be there? 
 i know that there shared values. but they get used in diffrent ways depending on if th car is plgged in. 
+
+**Outcome (2026-08-01): FIXED, all three side-notes included.** (1) Every feature checkbox toggle
+(Battery Management AND Charge Emulation) now logs an ENABLED/DISABLED line. (2) `charge_emulate`
+default flipped 0->1. (3) The big one: `charge_target_taper` split into regen-only (drives
+`charge_limit_kw`, stays on the Battery Management tab) and a new `ac_charge_taper` (drives
+`charger_limit_kw`, moved to the Charge Emulation tab alongside the rest of the charger-specific
+controls) - see `05-battery-management-safety.md`'s CC->CV section for the full design. The
+original finding itself (single checkbox = fully off, no backstop) remains true by design, unchanged
+- confirmed still the intended behavior, not something to add a backstop to.
 
 ### 4.3 — A mapping tie can silently go dead after a future field rename, with a misleading GUI state **(NEW)**
 - [x] Reviewed
@@ -222,6 +322,24 @@ but worth a decision on whether a mismatch like this should surface a warning in
 looking identical to "unused."
 **Your notes:**
 yeah we need to fix this and make sure that any data is set and saved corectly. and desplayed corectlyon the dashboard page. 
+
+**Outcome (2026-08-03): FIXED.** User decision: "i want to do it all if it was supose to be in
+place and it was missed." `MappingPanel` (`gui/panels.py`) now distinguishes a genuinely-blank
+slot from an orphaned/renamed key on BOTH input and output dropdowns: `_display_for_input`/
+`_display_for_output` check the current registry first, and for a non-empty key that's no longer
+found there, build a `(!) UNKNOWN KEY: <raw key>` display string instead of silently falling back
+to `(unused)`. That combo is also styled with a new dedicated `Warn.TCombobox` ttk style
+(`gui/theme.py`, red field/foreground) so it's visually distinct at a glance, not just
+text-distinguishable. The orphan display string is registered back into
+`input_display_to_key`/`output_display_to_key` so `_update_tie()` round-trips it to the exact
+original key on every edit instead of resolving an unrecognized display string to `''` and
+silently deleting the stale reference the next time any other field on that row changes (this
+would have been a real data-loss bug if shipped as originally sketched) - verified with a smoke
+test asserting `tie.inputs`/`tie.output` survive `_update_tie()` unchanged while orphaned. Once
+the user picks a real replacement from the dropdown, `_update_tie()` re-evaluates and clears the
+warning style immediately, no row rebuild needed. Dashboard's own `_tie_for_output()` only matches
+ties against currently-valid keys, so an orphaned tie naturally shows as unmapped there already -
+no separate dashboard-side fix was needed for that part of the original note.
 
 ---
 
@@ -241,6 +359,16 @@ when we implmented this is stated that it should only reset AFTER the car has be
 and back on OR if the charger is unplugged and repluged for instance. 
 not sure why it did not getr implmented that way. it should be.
 
+**Outcome (2026-08-01, refined 2026-08-03): FIXED, exactly as specified.** New
+`ManagementEngine._hard_latched`: any hard-tier condition latches `relay_cut_request`/`interlock`
+on every subsequent tick regardless of the reading recovering, cleared ONLY by
+`notify_session_start()` (a real bus wake, i.e. the car was actually powered down and back on - not
+a bare Stop/Start Bridge toggle, a bug an independent review pass caught and fixed the same day) or
+`notify_charge_replug()` (the charger genuinely unplugged and replugged - refined 2026-08-03, item
+13.4, after a second review found the first version could be fooled by a brief dropout that wasn't
+a real replug). Soft cuts keep auto-clearing, unchanged, matching docs/12 §8's own researched
+soft/hard distinction.
+
 ### 5.2 — The two "charge status" displays (Configurator tab vs. Dashboard) can disagree during ordinary operation **(NEW)**
 - [x] Reviewed
 docs/08 (lines 334-349) states both windows "tell a consistent story" about charge-ramp state. In
@@ -258,6 +386,13 @@ plausible normal-operation scenario, not a contrived edge case.
 yeah if the charge is not active. we should not asume anything. those need otbe isolated behavor. 
 already notated this in 4.2
 
+**Outcome (2026-08-03): FIXED**, via item 14.4, well after the regen/AC split (4.2) this note
+points back to. New `RealtimeEngine.charge_status_summary()` is the single source both the
+Configurator tab and the Dashboard now read, resolved from the same live trigger signals
+(`sequencer.charge_active()`, `charge_permission_input`, the actual gate/staleness/target-reached
+status) instead of the old guess-from-the-transmitted-number approach that could disagree with the
+Dashboard during ordinary resting-voltage-taper operation.
+
 ### 5.3 — `docs/09`'s STM32 export example is stale relative to the actual config schema
 - [x] Reviewed
 The illustrative JSON in `docs/09-stm32-export-format.md` omits `emergency_temp_f`,
@@ -266,6 +401,12 @@ The illustrative JSON in `docs/09-stm32-export-format.md` omits `emergency_temp_
 just a stale doc example that could mislead a future firmware-porter.
 **Your notes:**
 yeah fix this so we dont miss it. 
+
+**Outcome (2026-08-01): FIXED, and kept current throughout this session.** `docs/09`'s example JSON
+is now regenerated directly from `default_config()`/`charge_emulation` rather than hand-transcribed,
+and has been re-verified/updated every time a field was added or a default changed since (most
+recently the 4.20V threshold change and the `input_validation`/`checksum_validation` toggles,
+2026-08-03).
 
 ### 5.4 — Shared state is mutated/read without its own lock in several places
 - [x] Reviewed
@@ -279,6 +420,15 @@ given the explicit plan to port this logic to STM32 firmware, where there's no G
 **Your notes:**
 yeah, we need to understand how the STM32 version will work. currentkly a snapshot of our settings will be used. 
 but this will work as a standalone system. this will not have some items included. we havent goten to that yet. 
+
+**Outcome (2026-08-01): PARTIALLY ADDRESSED, deliberately scoped.** New locked accessors added for
+`management_status`/`vehicle` (`SharedState.snapshot_management_status()`/`set_management_status()`/
+`snapshot_vehicle()`/`set_vehicle_item()`), applied at every touch point. `generated_enabled`/
+`charge_emulation`/`ManagementEngine.config`/`.status` were deliberately NOT retrofitted this pass -
+per this note's own point, how shared state should work on the future standalone STM32 port (not a
+live Python object graph) is still an open architecture question, so locking the Python-side access
+pattern further didn't seem worth doing until that's decided. Documented as a scope decision, not
+silently dropped - individual dict item reads/writes remain safe under CPython's GIL either way.
 
 ---
 
@@ -298,6 +448,12 @@ distinct from the dual-trigger mismatch path `test_charge_ramp.py` does cover.
 indeed i do need to test this. add it to a test plan doc. we havent made on yet but there are
  other notes else where about tests that need to be done. gather those up and make a doc / checklist about it. 
  
+**Outcome (2026-08-01): FIXED, both parts.** New
+`tests/test_management_engine.py::test_ac_charge_target_reached_sets_full_charge_flag` covers the
+contactor-drop path directly. Separately, new `docs/14-validation-test-plan.md` gathers every
+scattered "needs a test"/"needs real hardware" note from this checklist (and this session's
+implementation pass) into one working document, exactly as asked.
+
 ### 6.2 — Overvoltage emergency hard-cut has thin, indirect test coverage **(NEW)**
 - [x] Reviewed
 Unlike low-voltage emergency and over-temp emergency (each has a dedicated test checking both the
@@ -307,6 +463,11 @@ fault key `overvoltage_emergency`) is only incidentally exercised inside
 `fault_log` entry at all — a coverage gap on one of only 3 hard-cut fault types.
 **Your notes:**
 add it.
+
+**Outcome (2026-08-01): FIXED.** New
+`tests/test_management_engine.py::test_overvoltage_emergency_fault_log_entries` directly asserts
+both `overvoltage_emergency` (regen) and `ac_overvoltage_emergency` (AC charger) fault_log entries,
+not just `relay_cut_request`.
 
 ### 6.3 — Several tests skip the exact boundary they're built around **(NEW)**
 - [x] Reviewed
@@ -320,6 +481,21 @@ persistence/threshold logic as-is.
 **Your notes:**
 add to look over every min max and all and any pramiters one at a time to the test plan as a check prams section. 
 
+**Outcome (2026-08-03): FIXED.** User decision: "i want to do it all if it was supose to be in
+place and it was missed." All 6 items from `docs/14-validation-test-plan.md`'s "Boundary-value
+sweeps" section are now real tests in `tests/test_management_engine.py`, each checking just-before
+AND just-after the exact configured value (not just "clearly inside/outside"):
+`test_boundary_low_voltage_soft_cut_persistence` (1.9s / 2.1s around the 2.0s window),
+`test_boundary_overcurrent_persistence` (4.9s / 5.1s around 5.0s),
+`test_boundary_emergency_temp` (141.7°F / exactly 141.8°F / 141.9°F, also confirming the `>=`
+comparison fires right at the boundary), `test_boundary_cell_imbalance_warn_delta` (99mV / 101mV
+around the 100mV threshold), `test_boundary_cell_data_cross_check_delta_and_escalation_timing`
+(149mV/151mV around the 150mV `max_delta_v` threshold, PLUS its own soft/hard escalation timing
+boundary with the persistence windows shrunk to 0.15s each so the test doesn't need to wait the
+real 60s/+5s), and `test_boundary_staleness_watchdog_soft_and_hard_escalation` (same shrunk-window
+pattern for the watchdog's own 60s soft / +5s hard escalation). All 22 new checks pass. `docs/14`'s
+checklist items are checked off to match.
+
 ### 6.4 — A couple of assertions are looser than the underlying math requires **(NEW)**
 - [x] Reviewed
 `test_f1_cold_block_uses_coldest_probe`'s second check only asserts `charge_limit_kw > 0.0` where an
@@ -330,6 +506,18 @@ wrong. Not urgent, but worth tightening opportunistically.
 **Your notes:**
 yeah check coldest makes sence if i understand this comment corectly. do we need to corect somthing here? 
 
+**Outcome (2026-08-03): FIXED.** User decision: "i want to do it all if it was supose to be in
+place and it was missed." `test_f1_cold_block_uses_coldest_probe`'s second check now asserts the
+exact expected `charge_limit_kw` (the unclamped `DEFAULTS` value - hand-traced: cold_factor=1.0
+since the 70°F coldest probe is above `charge_derate_low_start_f`, hot_factor=1.0 since the 20°F
+hottest probe is nowhere near `charge_derate_start_f`, and the default 3.70V cell voltage doesn't
+trigger the regen taper either) instead of a bare `> 0.0`. `test_f3_cold_derate_ramp`'s midpoint
+check now asserts `abs(factor - 0.5) < 1e-9` (the linear ramp formula gives an exact 0.5 at
+`(41-32)/(50-32)`) instead of the loose `0.35 < factor < 0.65` range. Both pass. To answer the
+direct question that was asked: no correction was needed to the *feature logic* itself (the
+coldest-probe behavior was already correct, per item F1's own bug-fix confirmation) - this was
+purely about the *test assertions* being looser than the math required.
+
 ### 6.5 — `manual_reset` is only tested against an instantaneous emergency condition
 - [x] Reviewed
 `test_fault_log_manual_reset_does_not_change_live_cut_decision` only exercises reset against an
@@ -338,6 +526,10 @@ docstring emphasizes as its primary motivation — resetting a **soft** or **war
 condition has since auto-cleared.
 **Your notes:**
 ok, so we need to fix this? 
+
+**Outcome (2026-08-01): FIXED.** New
+`tests/test_fault_log.py::test_manual_reset_on_already_auto_cleared_soft_entry` covers exactly the
+scenario this item's own text calls out as the realistic, common case.
 
 ### 6.6 — Confirmed clean on this pass (for context, not action items)
 - [x] Reviewed
@@ -349,6 +541,10 @@ geometry/sizing claim checked in docs/08 (1430×835 main window, 374/680/374 pan
 Fault History window) matches the code exactly.
 **Your notes:**
 
+**Outcome:** No action needed - confirmed clean on this pass. Note: this item's own "`FAULT_
+DEFINITIONS`'s count matches docs/08's '12 total' claim" line was accurate on 2026-08-01, but the
+catalog has since grown to 19 entries (item 14.1) - that's a later drift, not something wrong with
+this confirmation at the time it was made.
 
 ---
 
@@ -369,6 +565,10 @@ Basis column cites `docs/05`/`docs/12`; Verified column reflects `docs/11`'s cur
 - [x] Reviewed — **Your notes:**
 i change to 2.6 for hard cutoff. less likely to trigger untill it truly reaches the value. 
 
+**Outcome (2026-08-01): APPLIED.** `emergency_low_v` default is now 2.60V. `min_soc_pct` also
+lowered to 8.0% the same session, for consistency alongside this change (see the Discharge power
+taper section below, where the arithmetic for that number actually came from).
+
 ### Discharge power taper
 | Field | Default | Verified | Notes |
 |---|---|---|---|
@@ -378,6 +578,10 @@ i change to 2.6 for hard cutoff. less likely to trigger untill it truly reaches 
 - [x] Reviewed — **Your notes:**
 changed zero power to 3.0 changed zero power to 2.6 so it matches the cut off.
 we should have a | Min SoC % (backup check, never acts alone) | 10.0 % - 2% this way we have redundency. 
+
+**Outcome (2026-08-01): APPLIED, both parts.** `taper_start_v`/`taper_zero_v` are now 3.00V/2.60V.
+`min_soc_pct` (`low_voltage_cutoff`, the field this note's "10.0% - 2%" arithmetic refers to) is now
+8.0%.
 
 ### Charge/regen power limit + AC target
 | Field | Default | Verified | Notes |
@@ -392,6 +596,11 @@ change to 4.0 for full regen and changed zero to 4.15.
 this now needs to be split in the same way we did charging. regen and AC charging is not the same. 
 i can regen WAY more power then i can AC charge. so the pramiters need to be split. and put on the charging tab.
 
+**Outcome (2026-08-01): APPLIED, all three parts.** `regen_full_v`/`regen_zero_v` are now 4.00V/
+4.15V. The regen/AC split happened the same session (`charge_target_taper` now regen-only, new
+`ac_charge_taper` on the Charge Emulation tab) - see item 4.2's outcome for the full design.
+`emergency_high_v` was further tightened 2026-08-03 to 4.20V (item 15.3).
+
 ### Over-temperature derate
 | Field | Default | Verified | Notes |
 |---|---|---|---|
@@ -405,12 +614,16 @@ i can regen WAY more power then i can AC charge. so the pramiters need to be spl
 - [x] Reviewed — **Your notes:**
 change hard cut to 61 
 
+**Outcome (2026-08-01): APPLIED.** `emergency_temp_f` is now 141.8°F (61°C exactly).
+
 ### Cell imbalance monitor (warn only)
 | Field | Default | Verified | Notes |
 |---|---|---|---|
 | Warn spread | 100 mV | Confirmed (software, logic only) | Never cuts/derates; see 6.3 re: threshold itself not directly tested |
 - [x] Reviewed — **Your notes:**
 changed to 100mv 
+
+**Outcome (2026-08-01): APPLIED.** `warn_delta_v` is now 0.10V (100mV).
 
 ### Overcurrent monitor (warn only)
 | Field | Default | Verified | Notes |
@@ -420,6 +633,7 @@ changed to 100mv
 | Persistence | 5.0 s | Documented | See 6.3 re: boundary itself not directly tested |
 - [x] Reviewed — **Your notes:**
 
+**Outcome:** No changes requested - 150A/30A/5.0s confirmed as-is.
 
 ### Staleness watchdog
 | Field | Default | Verified | Notes |
@@ -428,6 +642,13 @@ changed to 100mv
 | Hard cut escalation | +5 s | Documented | |
 - [x] Reviewed — **Your notes:**
 now added data validation scheem. needs its own implmentation in to the watch dog. 
+
+**Outcome (2026-08-01/03): FIXED, thresholds unchanged (60s/+5s confirmed as-is).** The data-
+validation scheme this note anticipates was built and wired directly into the watchdog's own input
+pipeline, not as a separate parallel system: `input_validation`/`checksum_validation` (items
+15.14/15.15) reject bad data before it ever reaches `SharedState`, and the watchdog itself (item
+1.1) now covers every signal those checks protect, so a signal that stays rejected/stale long enough
+is caught by this exact watchdog - the two systems are integrated, not separate implementations.
 
 ---
 
@@ -451,14 +672,30 @@ im thinking there is more than one temp output that needs to be set. the dash se
 then confirm we are not missing any other map's or output CAN data, EVERY output can message should be driven by some kind input or active logic?  
 if there are some or you think there are more missing, lets add those to the botom of this list and i will go through them one at a time as well. 
 
+**Outcome (2026-08-01): FIXED, all three parts.** (1) Mouse-wheel scrolling no longer silently
+changes a readonly Combobox's selection anywhere in the app (new `_no_wheel()` helper) - only an
+explicit click can change a mapping/vehicle/channel dropdown now. (2) New provisional default tie
+for `temp_segment_pct` (the dash temperature segment) - explicitly marked NOT hardware-confirmed
+(unlike `soc_correction`/`capacity_bars_raw`), tracked as `docs/10` open question #13. (3) A full
+output-signal coverage audit found and fixed 3 more gaps, appended to the bottom of this checklist
+as items 12.5's sub-findings - `voltage_latch` (dead mapping target, removed), `main_relay_on`
+(reviewed, decided static-1 is fine - see item 12.5's own notes), and 4 `GENERATED_SIGNALS`
+checkboxes that weren't actually gating their frames yet (fixed the same pass).
+
 ## Part 9 — Control-behavior review (the way things are controlled, not just the numbers)
 
 - [x] **Soft-cut vs. hard-cut split** — matches intended design, reserved for genuine emergencies +
   staleness escalation. **Your notes:**
+  **Outcome:** Confirmed, no changes needed. Hard cuts gained latching since this note (item 5.1) -
+  the soft/hard split itself is unchanged.
 
 - [x] **Discharge-taper hysteresis** (fast-attack / slow-release, default 3.0s) — only feature
   carrying state between ticks; confirms the intended anti-hunting behavior when valid input is
   given (see 4.1 for what an invalid input does to it). **Your notes:**
+  **Outcome:** Confirmed, no changes needed at the time. No longer the *only* feature carrying
+  state between ticks - `charge_target_taper` (regen) gained the same hysteresis pattern the next
+  bullet's note requested. Both tapers' hysteresis got direct test coverage 2026-08-03 (previously
+  neither did, despite this confirmation - see item 6.4's sibling gap).
 
 - [x] **Charge/regen taper is a pure function of instantaneous voltage** (no hysteresis, unlike
   discharge) — intentional per docs/05. Worth confirming you still want that asymmetry. **Your
@@ -466,29 +703,61 @@ if there are some or you think there are more missing, lets add those to the bot
   regen we should add some hysteresis? same as discharge? also split regen from charger as descussed.
   charger dose not have the hysteresis? 
 
+  **Outcome (2026-08-01, decided 2026-08-03): DONE, resolved as a deliberate asymmetry.** Regen
+  (`charge_target_taper`) got hysteresis (`_regen_factor_applied`, same fast-attack/slow-release
+  pattern as discharge, now with a direct test). **`ac_charge_taper` deliberately does NOT get
+  hysteresis** - explicit user decision, 2026-08-03: "let's leave it and mark it as such so it's not
+  confusing in the future." `ac_factor` stays a pure function of the current instantaneous voltage,
+  computed fresh every tick with no smoothing - unlike its regen sibling. This is now a **documented,
+  intentional difference**, not an oversight: if you're reading `ac_charge_taper`'s code later and
+  wondering why it lacks the `_regen_factor_applied`-style state the regen taper has, this is why.
+
 - [x] **`full_charge_flag` re-arm has no physical-replug equivalent** (docs/10 #1, still open).
   **Your notes:** humm. thsi was from my memory, an unplug and replug reset. i think i mentioned this already in this doc.
+  **Outcome (2026-08-01, refined 2026-08-03): FIXED.** Same mechanism as item 5.1 -
+  `notify_charge_replug()` (a genuine `charge_permission_input` absence for `CHG_END_STOP_S`=3.0s,
+  then a fresh request) is exactly the "unplug and replug" re-arm this note remembered wanting.
+  `docs/10` item #1 itself updated to RESOLVED - see `05-battery-management-safety.md`'s
+  "`full_charge_flag` re-arm" section for the full current behavior.
 
 - [x] **Charge-ramp dual-trigger requirement** — mismatch forces an explicit stop rather than
   falling back to a static value; see 5.2 re: the two status displays for this feature disagreeing.
   **Your notes:** yeah see notes on 5.2. i think that covers this one in detail. 
+  **Outcome:** The dual-trigger requirement itself was already correct, unchanged. The status-
+  display disagreement is fixed - see item 5.2's outcome.
 
 - [x] **4 ported shutdown triggers + 1 bridge-specific staleness trigger** — all five converge
   through one `_should_wind_down()` check each tick. **Your notes:**
+  **Outcome (2026-08-03): NARROWED, per a later explicit user directive (item 14.3).** The 5th
+  trigger used to fire on ANY hard cut (not just staleness); now it's staleness-only
+  (`ManagementEngine.staleness_hard_cut`) - a non-staleness hard cut (voltage/temp/cross-check
+  emergency) latches and keeps the bridge running/transmitting instead of winding down. Still all
+  converge through one `_should_wind_down()` check, just with a narrower 5th-trigger condition than
+  described when this confirmation was originally written.
 
 - [x] **Output clamping** — guarantees nothing out-of-range reaches the CAN bus regardless of what
   upstream logic produces. **Your notes:** yeah and now added user input clamping.
+  **Outcome:** Confirmed unchanged/correct. Input-side clamping is item 4.1's outcome.
 
 - [x] **DID/PID polling cadence** — see 2.3; effectively ~15s per specific DID, not ~5s.
   **Your notes:** yeah notated how to change this in 2.3
+  **Outcome:** Fixed - see item 2.3's outcome.
 
 - [x] **Auto-reconnect on connection drop** — see 3.1/3.2; can silently stop working, or silently
   override a manual disconnect, under a specific race. **Your notes:** see notes in those 3.1/3.2
+  **Outcome:** Fixed (3.1) / narrowed but not perfectly closed (3.2) - see those items' own outcomes,
+  now also directly tested (`tests/test_can_backend.py`, 2026-08-03).
 
 - [x] **Fault auto-clear vs. latching** — see 5.1; the single biggest open behavioral decision left
   in the whole management layer. **Your notes:**
 yeah we need to fix this, as notated in 5.1. unless im mestaken and the option to clear automaticaly with "power cycle"
   VS manuialy is already in place? let me know. 
+
+**Outcome (2026-08-01): FIXED - direct answer to the question asked.** Yes, exactly that option is
+now in place: a hard cut latches and clears ONLY via a genuine power-cycle-equivalent
+(`notify_session_start()`, a real bus wake) or a genuine charger replug
+(`notify_charge_replug()`) - there is deliberately NO separate manual "unlatch" button in the GUI.
+See item 5.1's outcome for the full mechanism.
 ---
 
 ## Part 10 — Safety-relevant open questions already tracked in `docs/10`
@@ -496,6 +765,8 @@ yeah we need to fix this, as notated in 5.1. unless im mestaken and the option t
 - [x] **#2 — exact staleness-watchdog behavior when only some source groups go stale.** Item 1.1
   above is a concrete, worse-than-assumed answer — the doc's own wording assumed "raw-CAN covers
   voltage/current/temp" as one group; in code it doesn't. **Your notes:** yeah we need all can added to watchdog as descussed. VALIDATE data. 
+  **Outcome:** Fixed - see item 1.1's outcome (full signal coverage) and item 1.3's outcome (input
+  validation).
 
 - [x] **#4 — `charge_permission_input` "no interlock present" default.** Currently fails safe only
   as a side effect of `get_input()` returning `None`, not a written, deliberate policy. **Your
@@ -503,15 +774,35 @@ yeah we need to fix this, as notated in 5.1. unless im mestaken and the option t
 umm explin this more? if i understand corectly. we need both interlock's? thought we changed that
  yesterday as it was implmented incorectly. and the doc's should have been updated? 
 
+**Outcome (2026-08-01): FIXED, the policy part.** `charge_permission_input` (`0x358`) missing/unwired
+now fails safe to "not permitted" as an explicit, deliberate, documented policy (`05-battery-
+management-safety.md`'s Design philosophy section, `10-open-questions.md` #4 marked RESOLVED) -
+previously true in code but only as an emergent side effect of `get_input()` returning `None`. **On
+the direct question**: this project has only the one interlock signal, `charge_permission_input` -
+there isn't a second one in this codebase to reconcile against. If you're thinking of a different
+signal from a past session, flag it and I'll trace it specifically; nothing in the current code
+suggests a second interlock was ever implemented or removed.
+
 - [x] **#7 — does the RZ450e pack's own internal cell-balancing hardware still run** in this
   configuration? Directly affects how much weight to put on the cell-imbalance monitor over time.
   **Your notes:**
 yeah need to add to the test doc jsut so it dose not get forgotten. 
 
+**Outcome (2026-08-01): TRACKED, not fixable in software.** Added to `docs/14-validation-test-plan.md`
+Part 2 (real-hardware-only) as its own line item - genuinely can't be answered without extended
+real-hardware observation (cell spread over multiple sessions), so this stays open until that
+testing happens.
+
 - [x] **#8/#9 — overcurrent monitor and DC fast-charging are both outside what the current sensor
   can see** (±204.7A signal ceiling vs. a 500A fuse / ~660A peak / ~430A DC-fast-charge pack).
   **Your notes:**
 yeah add to test doc, as we cant validate this as of yet. 
+
+**Outcome (2026-08-01): TRACKED, not fixable in software.** Both added to `docs/14-validation-test-
+plan.md` Part 2 as their own line items - the `0x023` sensor is structurally unable to see the
+pack's real ~500A/660A range at all (a hardware ceiling, not a software gap), and DC fast-charging
+is entirely outside this project's current scope. Both stay open pending a future wider-range
+current sensor / explicit scope decision, not something more code can close.
 ---
 
 ## Part 11 — Overall verification-status rollup
@@ -532,6 +823,12 @@ however that will need to be confirmed in the final hardwere as well.
 new: 
 can we add a data logger. must keep the .trc format. i want to log so that we can check and confirm things as we test. 
 
+**Outcome (2026-08-01): FIXED, both parts.** "Validation doc" -> `docs/14-validation-test-plan.md`
+(created this session, name changed as requested). Data logger -> new `bridge/trc_log.py`, ported
+byte-for-byte from the RZ450e reference project's own confirmed `trc_write_header`/`trc_format_row`
+- new Start Log/Stop Log button in the main window captures every RX/TX frame on both buses into
+one PCAN-Explorer-compatible `.trc` file.
+
 ---
 
 ## Part 12 — Round 2: findings from implementing every item above (2026-08-01)
@@ -545,7 +842,7 @@ pass (marked **FIXED** below, with the test added); everything else is left for 
 like the sections above.
 
 ### 12.1 — SAFETY BUG (found and fixed): the new hard-cut latch could be cleared by Stop/Start Bridge alone
-- [ ] Reviewed
+- [x] Reviewed
 **FIXED.** Item 5.1 above asked for hard cuts to latch, clearing only on a real power-cycle or
 charger replug — implemented, but the first version had a real gap: `notify_session_start()` fired
 on *every* `waiting_for_wake → startup` transition, and pressing **Stop Bridge then Start Bridge**
@@ -562,7 +859,7 @@ including that a still-bad condition re-latches immediately even after a legitim
 
 
 ### 12.2 — Fault History window would have shown "all clear" during an active latched cut
-- [ ] Reviewed
+- [x] Reviewed
 **FIXED.** Each individual hard-tier fault entry (`low_voltage_emergency`, `overvoltage_emergency`,
 `ac_overvoltage_emergency`, `over_temp_emergency`, `cell_data_mismatch_hard`, `staleness_hard`)
 correctly keeps reflecting its own *instantaneous* trigger — useful, "did this specific thing
@@ -576,7 +873,7 @@ this one specifically, not the individual trigger rows, to know if the vehicle i
 
 
 ### 12.3 — `BusConnection` holds its lock across a 150ms sleep + log call (not fixed this pass)
-- [ ] Reviewed
+- [x] Reviewed
 `_start_worker_locked()` (`bridge/can_backend.py`) runs its `time.sleep(0.15)` connection-attempt
 wait and its `log_fn(...)` call while still holding the same lock that `connect()`/`disconnect()`/
 `send()`/the `connected`/`error`/`tx_ok` properties all need. Not a corruption risk (confirmed no
@@ -586,10 +883,15 @@ or delay the TX loop's next `leaf_bus.send()` call by up to 150ms. Worth narrowi
 to just the `_worker` mutation, doing the sleep/log outside it — deliberately not changed this pass
 to avoid touching the just-fixed lock logic twice in one session without a chance to test between.
 **Your notes:**
+it weems to work ok ATM. so i guess we can fix this?  
 
+**Outcome (2026-08-01): FIXED.** Split into `_start_worker_locked()` (mutates `self._worker` only,
+still under the lock) and a new `_finish_worker_start()` (the 150ms connect-wait sleep + log call,
+now runs AFTER releasing the lock) - `connect()`/`_auto_reconnect_loop()` no longer hold the
+connection lock across a sleep. Verified no regression via `tests/test_can_backend.py` (2026-08-03).
 
 ### 12.4 — The reconnect-race fix narrowed the bad window, didn't perfectly close it
-- [ ] Reviewed
+- [x] Reviewed
 Item 3.1's fix (a real lock + interruptible wait) took the "disconnect then fast-reconnect loses the
 auto-reconnect monitor" window from up to 3 seconds down to microseconds — `connect()`'s
 `is_alive()` check on the old monitor thread and that thread's own `_stop_monitor.wait()` returning
@@ -599,9 +901,14 @@ to matter in practice, but flagging it precisely rather than claiming the fix is
 close would use a monotonic "generation counter" on the monitor thread instead of `is_alive()`.
 **Your notes:**
 
+**Outcome: STILL AN ACKNOWLEDGED LIMITATION, unchanged.** No generation-counter rework was done -
+this remains a real but vanishingly narrow window, not practically closeable without adding
+test-only synchronization instrumentation to `can_backend.py` (see `tests/test_can_backend.py`'s
+own docstring, added 2026-08-03, for why the exact race isn't unit-testable either). Same
+conclusion as item 3.2.
 
 ### 12.5 — Output-signal coverage audit: three more things found (from item 4.3's "check everything is mapped" request)
-- [ ] Reviewed
+- [x] Reviewed
 Auditing every `leaf_signals.OUTPUT_SIGNALS` key for whether anything actually drives it, beyond
 `temp_segment_pct` (already fixed):
 - **`voltage_latch`** (a `CHECKS` field, shown as a mapping target in the Signal Mapping tab) is
@@ -626,10 +933,19 @@ Auditing every `leaf_signals.OUTPUT_SIGNALS` key for whether anything actually d
 `dtc` — stays intentionally static with no live driver; already tracked as known/expected in
 `docs/10` item #12, not a new gap.)
 **Your notes:**
+main_relay_on only works during startup. after start up there is no effect. so its fine to just be driven 1 for now
+checkboxes don't actually gate anything... i mean the check box should stop sending that message... needs fixed? 
 
+**Outcome (2026-08-01): FIXED, all three.** `voltage_latch` removed as a mapping target entirely
+(user decision - it could never do anything, so removing was cleaner than wiring in dead weight);
+`main_relay_on` left static per the direct answer above (documented in `03-target-signals-leaf.md`
+as a deliberate decision, not an oversight); the 4 non-gating `GENERATED_SIGNALS` checkboxes
+(`prun`, `code_1dc`, `chg_time_5bc`, `hist_5c0`) all now actually gate their frame content -
+confirmed programmatically (2026-08-03 sweep): all 7 `GENERATED_SIGNALS` keys are gated in
+`_build_frame()`, zero gaps.
 
 ### 12.6 — New `docs/14-validation-test-plan.md`
-- [ ] Reviewed
+- [x] Reviewed
 Gathers every "needs a test," "needs real hardware," or "can't validate yet" item from this pass
 (and the ones already fixed: 6.1/6.2/6.5) into one working checklist — including every threshold
 changed this session (none of which are hardware-confirmed yet, they're just edited numbers) and
@@ -638,3 +954,877 @@ input-plausibility rejection, the cell-data cross-check, config sanity, and — 
 latch, though that one now has direct unit tests as of 12.1's fix).
 **Your notes:**
 
+**Outcome (2026-08-03): DONE, and kept current.** `docs/14-validation-test-plan.md` was created as
+described and has been updated throughout this review pass as items got closed - most recently
+Part 1's "Boundary-value sweeps" and "Tighten loose assertions" sections, both now fully checked
+off (items 6.3/6.4). It remains the live working checklist for anything still needing a real test
+or real-hardware confirmation.
+
+---
+
+## Part 13 — Round 3: fresh full pass, hunting specifically for what Parts 1-12 missed (2026-08-01)
+
+Requested: go through everything again from scratch looking for new failsafe bugs/concerns, with
+particular attention to CAN data handling, and cover every corner. Read `management_engine.py`,
+`realtime_engine.py`, `state.py`, `rz450e_signals.py`, `mapping_engine.py`, `leaf_signals.py`,
+`config_profile.py`, and `fault_log.py` in full again, line by line, specifically looking for gaps
+Parts 1-12 didn't already cover — not re-litigating anything already fixed/decided there. Nothing
+was changed this pass — read-only, same as the original Part 1-12 review.
+
+### 13.1 — The bridge can transmit full power with ZERO RZ450e safety data ever received
+- [x] Reviewed
+Every per-cell-driven protection feature has an explicit "no data yet" branch, and they don't agree
+on what "no data" means to do:
+- `discharge_power_taper`, `charge_target_taper` (regen), and `ac_charge_taper` all explicitly set
+  `instant_factor = 1.0` ("full power") when `worst_low`/`worst_high` is `None`
+  (`management_engine.py:386, 427, 475` — the literal string `'no per-cell voltage data yet - full
+  power'` appears at all three sites).
+- `low_voltage_cutoff` falls through to `status = 'ok'` when `worst_low` is `None` and SoC isn't low
+  either (`:369-371`) — no cutoff, no warning.
+- `over_temperature_derate`'s entire block is skipped (`if f['enabled'] and temp_max is not None:`,
+  `:512`) when `temp_max` is `None` — not even a "no data" status or fault_log entry gets written,
+  unlike the voltage features.
+- The staleness watchdog (`:691-747`) cannot catch this **by design** — it explicitly excludes a
+  key with `age is None` ("never seen this session") from its "worst age" calculation, because for
+  *its own* purpose (catching a signal that WAS live and then stopped) that's correct. But that
+  leaves the "never arrived at all" case with no other net underneath it.
+- `RealtimeEngine._tx_loop` begins transmitting the instant `sequencer.phase` reaches `startup`
+  (i.e. the moment real Leaf-bus traffic is seen) — there is no check anywhere that RZ450e data has
+  ever been received before that happens, and `gui/app.py`'s `_start_bridge()` (`:308-311`) is an
+  unconditional `engine.start_bridge()` with no such guard either.
+- The only mitigation is the `last_known_good` cache (`SharedState.get_input()` falls back to it) —
+  which is empty on a first-ever launch, and (see 13.2) isn't validated even when present.
+**Concrete scenario**: fresh install, or `config/last_known_good.json` deleted/missing, RZ450e
+adapter plugged in but not yet sending (still booting, wrong channel selected, wiring fault) —
+Leaf VCM wakes and the bridge starts transmitting full discharge power, full regen/AC charge power,
+and zero over-temperature protection, indefinitely, until RZ450e data eventually arrives (if it ever
+does) or an unrelated fault happens to fire. This directly contradicts the design principle stated
+throughout `docs/05`/`docs/12` and this file's own Part 1 ("cell voltage is the SOLE authoritative
+trigger" / "we can no longer verify it's safe to keep accepting charge/regen if the data behind
+that decision is stale") — "never arrived" is a strictly worse case than "went stale" and currently
+gets a strictly weaker response (none at all, vs. a 60s/65s watchdog).
+**Your notes:**
+so, if i understand this corectly. for at least the first 60 seconds if the data is not present from the battery
+then the system will use the "good known defualts" and after 60 seconds the failsafes will trigger from stail data? 
+if this is the caes. we could add some safty options that enable "good battery data must be present before charging ramp can start" 
+this way at least in charging, we must varify good data is coming in and with in safe ranges. 
+the "driving" is less critical as 60 seconds is OK for driving. 
+we need to split thses in to the 2 tabs and they must be controled by 2 difrent senarioes. 
+one for driving, and one for charging. ( thses tabs are already in place) 
+ the driving one is less strict. ( 60 seconds, then change hard cut to + 60) 
+ the charging one is verry strict. ( good data ONLY for ramp to start charging. the 60 soft cut + 5 sec hard cut) 
+ am i missing anything else here? 
+
+**Outcome (2026-08-03):** Correction on the premise first - it was NOT "good known defaults for
+60s then failsafe." Data that had **never arrived at all** was previously excluded from the
+watchdog entirely (by design, to avoid false-tripping with no hardware connected) - meaning
+**indefinite** full power with **no** failsafe ever firing for that specific gap, not a 60s grace
+period. **FIXED for driving/general case**: `ManagementEngine` now tracks its own first-`apply()`
+timestamp; a signal that's never arrived ages from that moment exactly like one that went stale,
+hitting the same 60s soft / +5s hard schedule (`tests/test_management_engine.py`).
+
+**FIXED for charging, REWORKED after follow-up clarification** (first version used a separate
+custom 2.0s freshness timer - explicitly rejected in favor of reusing the same watchdog driving
+gets): `require_live_data_to_charge` (default ON, Charge Emulation tab) is now a **one-time startup
+gate**, not an ongoing timer - it checks that all 96 per-cell voltages plus pack temp extremes have
+been seen **live at least once this session** (not from the startup cache/defaults) before the ramp
+is allowed to start at all. Once that's true, ongoing protection during an active charge session is
+the exact same 60s soft / +5s hard watchdog driving gets - no second/duplicate timer. Per your
+"trigger the stop charging flag" answer, the watchdog's soft-cut stage now also sets
+`full_charge_flag = 1` (previously only zeroed `charge_limit_kw`/`charger_limit_kw`), so it stops an
+active charge session the same confirmed real-hardware way every other charge-block path already
+does. See `tests/test_charge_ramp.py`'s data-gate tests and `tests/test_management_engine.py`'s
+`test_staleness_soft_cut_also_sets_full_charge_flag`. The two tabs you referenced (Battery
+Management for driving/discharge's ongoing protection, Charge Emulation for charging's startup
+gate) now carry exactly the asymmetric-at-startup, identical-thereafter behavior you described.
+
+
+### 13.2 — `last_known_good.json` is loaded straight into live safety decisions with zero validation
+- [x] Reviewed
+Live CAN/DID data goes through `rz450e_signals.validate_inputs()`'s `PLAUSIBLE_RANGES` check before
+it's ever written to `SharedState` (`realtime_engine.py`'s `_ingest_validated`). The disk-persisted
+last-known-good cache does not: `config_profile.load_last_known_good()` (`:71-78`) parses the JSON
+file (catching only `JSONDecodeError`/`OSError`) and hands the raw dict straight to
+`SharedState.seed_last_known_good()` (`state.py:174-178`), which just does
+`self.last_known_good.update(cached)` — no range check, no type check. `get_input()` (`:104-110`)
+then returns straight from this dict whenever the live `rz450e` dict doesn't have a fresher value —
+which, combined with 13.1, is exactly the situation this cache exists to cover. A corrupted file, a
+hand edit, a copy-pasted cache from a different/older pack, or a future schema change that shifts
+units would inject an unvalidated number directly into every safety cutoff/taper calculation, with
+no plausibility check standing between the file on disk and the BMS decision logic.
+**Your notes:**
+same asnswer as 13.2
+
+**Outcome (2026-08-03): FIXED.** `config_profile.load_last_known_good()` now runs the cache
+through the exact same `rz450e_signals.validate_inputs()` plausibility check live data gets before
+seeding `SharedState` - an implausible or non-numeric (corrupted) cached value is dropped and
+logged (`gui/app.py` reports the count/keys at startup), never handed to a safety decision. See
+`tests/test_config_profile.py`.
+
+### 13.3 — A hand-edited or corrupted `profile.json` can silently defeat any single safety threshold
+- [x] Reviewed
+`ManagementEngine.from_dict()` (`management_engine.py:780-793`) — used both by the explicit "Load
+profile" button and by the automatic profile load at every app startup — copies every numeric field
+present in the saved config straight into the live threshold dict with **no bounds check at all**.
+Contrast `gui/panels.py`'s `ManagementPanel`, which clamps every field to a documented `(lo, hi)`
+range on every keystroke (item 4.1, already fixed) — that protection only applies to *typing in the
+GUI*, not to *loading a file*. `_check_config_sanity()` (`:60-83`) only checks relative ORDERING
+between specific field pairs (e.g. `emergency_low_v < min_cell_v`) — it has no concept of an
+individually-absurd value that still happens to be self-consistent (e.g. `emergency_low_v: -50.0`
+paired with `min_cell_v: -10.0` passes the ordering check while being physically meaningless and
+functionally disabling that entire protection tier). **Concrete scenario**: a `profile.json` edited
+by hand, corrupted by a partial disk write, or saved by a future code revision with different units/
+scale for a field that keeps the same key name — loads silently, no error, no fault_log entry, no
+GUI warning distinguishing it from a normal load. The app just runs from that point on with
+whichever threshold got corrupted permanently defeated.
+**Your notes:**
+we can fix this honistly clamping input data from this makes sence. else we may have some kind of cruption? 
+
+**Outcome (2026-08-03): FIXED**, and folded together with 13.9 below since they're the same root
+cause. `FEATURE_FIELD_BOUNDS` (the bounds table the GUI already used) moved into
+`bridge/management_engine.py` itself and is now used by BOTH `gui/panels.py` (typing) and
+`ManagementEngine.from_dict()` (loading a profile) - the two paths can't diverge anymore. Same fix
+applied to the Charge Emulation fields via a new `leaf_signals.CHARGE_EMULATION_BOUNDS`. A value
+that can't even be coerced to a number (real corruption) is dropped, keeping the existing safe
+default rather than writing garbage through. See `tests/test_config_profile.py`.
+
+### 13.4 — The hard-cut latch can be cleared by a phantom "replug" that isn't one
+- [x] Reviewed
+Item 5.1/12.1 fixed hard cuts to latch until "the car has been powered down and back on OR the
+charger is unplugged and replugged" — implemented as `ManagementEngine.notify_charge_replug()`,
+called from `RealtimeEngine._apply_charge_ramp()` (`:523-525`):
+```
+if leaf_wants_charge and not self._prev_charge_active:
+    self.management.notify_charge_replug()
+```
+`leaf_wants_charge = self.sequencer.charge_active(now)` is derived **purely from the Leaf-side
+0x1F2 message** (`Charge_StatusTransitionReqest == 1` or `CommandedChargePower` above idle, "fresh"
+within `CHG_CMD_FRESH_S` = 0.5s) — this call happens *before* `rz_authorized` (RZ450e's own
+`charge_permission_input` interlock) is even read on the next line, and is not gated on "Emulate
+charger request" being enabled either. Two concrete, non-contrived ways this fires with no physical
+unplug ever happening: (1) a single dropped/delayed `0x1F2` frame on the Leaf bus makes it go stale
+for >0.5s and then resume — `charge_active()` flips False->True on the very next fresh frame; (2) a
+real VCM's own charge-negotiation retry behavior (the exact "`trans` flapping" pattern already
+documented elsewhere in this file) toggles it the same way. Either one clears an emergency-tier
+latch — over-temp, overvoltage, a stale-data hard cut — with no relation whatsoever to the car
+actually being power-cycled or the charger actually being unplugged, undermining the entire point
+of the fix in 5.1/12.1.
+**Your notes:**
+yea, we need to fix this so it works as intended.
+
+**Outcome (2026-08-03): FIXED.** A rising edge of `charge_active()` now only counts as a genuine
+replug if the request was genuinely ABSENT for at least `leaf_signals.CHG_END_STOP_S` (3.0s - reused,
+not a new invented number) beforehand - a single dropped/delayed 0x1F2 frame or brief VCM retry no
+longer clears the latch; only a gap long enough to represent a real unplug does. A too-brief
+resumption still resumes the ramp normally, it just doesn't touch the latch. See
+`tests/test_charge_ramp.py`'s `test_brief_charge_dropout_does_not_clear_latch` /
+`test_genuine_gap_does_clear_latch`.
+
+### 13.5 — The Toyota checksum this project's own docs said should be used for corruption detection was never wired in
+- [x] Reviewed
+`docs/02-source-signals-rz450e.md` states: *"The RZ450e project chose not to wire this into its own
+downstream logic, but this project should, as an additional staleness/corruption check."*
+`rz450e_signals.toyota_sum_checksum()` (`:49-53`) is defined but **never called anywhere** in the
+ingest path — confirmed by a full-codebase search; the only other references are in `Refrance/`'s
+two read-only reference projects. Every raw-CAN decoder (`decode_020`, `decode_023`, `decode_cell_
+msg`, etc.) accepts frame contents based only on a length floor and, for the two muxed messages, a
+structural base/mux sanity check — nothing validates the byte-7 checksum that 10 of the 12 confirmed
+messages carry. A single bit-flipped byte in a frame that still happens to land inside
+`PLAUSIBLE_RANGES` (deliberately wide — e.g. any cell voltage 0.50-5.00V passes) is accepted as a
+genuine reading with no way to detect the corruption, even though the data needed to catch it is
+sitting right there in byte 7 of the same frame.
+**Your notes:**
+yeah, we must validate the data, especialy if a checksum exzists. and if it dose not, 
+we are supose to be validataing the data is with in a range that makes sence.  
+
+**Outcome (2026-08-03): FIXED.** `rz450e_signals.frame_checksum_ok()` now validates the exact 5 IDs
+confirmed to carry the Toyota additive checksum (`0x020`, `0x023`, `0x358`, `0x3F1`, `0x424`) before
+any of them are decoded - a mismatch (or a too-short frame on one of these IDs) is rejected and
+logged, never handed to a decoder. The other 4 decoded IDs (`0x4A7`, `0x4A9`, `0x4C0`, `0x4AA`) are
+confirmed to NOT carry a checksum (docs/02), so they keep relying on `PLAUSIBLE_RANGES` alone, per
+your second point - that range check was already in place. See `tests/test_rz450e_signals.py`.
+
+### 13.6 — Hysteresis "slow release" has no ceiling on how far it can jump in one delayed tick
+- [x] Reviewed
+`discharge_power_taper` and `charge_target_taper`'s (regen) recovery ramps compute
+`max_step = dt / recovery_ramp_s` using a real measured `dt` with no cap
+(`management_engine.py:395, 435`). If the TX loop's tick is delayed for any reason (GC pause, OS
+scheduling hiccup, lock contention from a GUI keystroke touching the same unlocked config dict per
+item 5.4/Part 12's own noted gap, a debugger breakpoint during development), the next `dt` could be
+large enough that `max_step` alone lets the applied factor jump straight to the current
+`instant_factor` in a single step — silently skipping the gradual recovery the hysteresis exists to
+provide (anti-oscillation / anti-power-hunting, per its own design comment). Bounded by
+`instant_factor` so this can never exceed what live data currently supports (not a raw safety
+violation), but it is a silent defeat of the stated anti-hunting design intent under a delayed tick —
+worth at least a `dt` ceiling (e.g. clamp `dt` to some max like 0.5s before using it) so a long gap
+degrades to "snap to instant value" in a bounded, understood way rather than an unbounded one.
+**Your notes:**
+i would not this as reviewed, i thin this is ok becuse the VCM will fliter out the change. lets leave it for now
+
+**Outcome (2026-08-03):** No action taken, per your call - left as-is.
+
+### 13.7 — `over_temperature_derate` going dark on missing data is invisible, unlike every other feature
+- [x] Reviewed
+Smaller/observability-only companion to 13.1: when `temp_max` is `None`, `over_temperature_derate`'s
+whole block is skipped (`management_engine.py:512`) — no `status['over_temperature_derate']` entry
+is ever set, and none of that feature's four `fault_log.update()` calls run. Every voltage-based
+feature, by contrast, explicitly sets a "no per-cell voltage data yet" status even with zero data
+(13.1). Net effect: a missing/dead temperature sensor is silently invisible in both the Dashboard
+status text and the Fault History window, while the equivalent voltage-side gap at least shows up as
+text (even though 13.1 shows that text is currently paired with the wrong — "full power" —
+behavior too).
+**Your notes:**
+yeah lets fix this.
+
+**Outcome (2026-08-03): FIXED.** When `temp_max` is `None`, `over_temperature_derate` now sets an
+explicit `'no temperature data yet - full power'` status and writes an (inactive) fault_log entry
+for all four of its tracked conditions, matching how the voltage-based features already report "no
+data yet." See `tests/test_management_engine.py`'s `test_missing_temp_data_reports_status_and_
+fault_log_entries`. Note: this is observability-only, matching your review-scope note above - what
+actually gets APPLIED with no temp data (still full power/no derate) is the separate, already-fixed
+13.1 question.
+
+### 13.8 — `capacity_bars_raw`'s default mapping can hit the "all segments off" sentinel from an implausible-but-unvalidated reading
+- [x] Reviewed
+Low severity, noted for completeness. The confirmed real-hardware mapping (`mapping_engine.py:95-
+96`) is `capacity_bars_raw = capacity_pack1_ah * 0.07`, and docs/03 documents raw 0-14 as "full bar
+display" with 15 as a separate "all segments off" sentinel, not a continuation of the scale.
+`capacity_pack1_ah` above ~214.3 Ah (>100% SOH for this pack, physically implausible under normal
+operation) would compute to 15+ and land on the "all off" sentinel instead of a plausible full-scale
+reading. Not reachable from a healthy live sensor, but combined with 13.2/13.3 (an unvalidated
+cache/profile value) it's a real, if minor, path to a misleading dash display.
+**Your notes:**
+this is find, the 201ah number can only go down.
+
+**Outcome (2026-08-03):** No action taken, per your call - agreed low-risk given SOH is monotonically
+non-increasing in practice.
+
+
+### 13.9 NEW from user - out of bounds input data. 
+
+we need to inforce all data input by the user is with in safe values. such as alowing the charger
+ input or voltage to be set above safe values. currently this is not working in ALL cases where there is an input,
+ altho i do beleave it was supose to be implmented, we need to check all cases and places. 
+
+**Outcome (2026-08-03): FIXED, folded into 13.3.** Audited every numeric input surface: GUI typing
+(`ManagementPanel`, `ChargeEmulationPanel`) was already clamped end-to-end (item 4.1, done
+2026-08-01) - the gap was specifically the file-loading paths (`profile.json`'s management
+thresholds and charge_emulation fields), which bypassed the GUI's clamp entirely. Both now share
+the exact same bounds tables the GUI uses (`bridge/management_engine.FEATURE_FIELD_BOUNDS`,
+`bridge/leaf_signals.CHARGE_EMULATION_BOUNDS`), so typing and loading can never enforce different
+limits. See `tests/test_config_profile.py`.
+
+---
+
+## Part 14 — Round 4: fresh line-by-line pass, code AND docs together (2026-08-03)
+
+Requested: re-read every `bridge/*.py` and `gui/*.py` file in full, alongside every `docs/*.md`
+file, specifically hunting for places where code and docs have drifted apart - not re-litigating
+anything already fixed/decided in Parts 1-13. Nothing changed this pass - read-only, same discipline
+as every prior review round.
+
+### 14.1 — Fault History count is stale in docs/08 (cosmetic, but worth fixing)
+- [x] Reviewed
+
+`docs/08-gui-design.md`'s Fault History section says "12 total" tracked conditions. That was
+accurate as of the original Rev 12/13 implementation, but `bridge/fault_log.py`'s
+`FAULT_DEFINITIONS` has grown to **19** entries since (added: `ac_overvoltage_emergency`,
+`input_validation_reject`, `checksum_reject`, `cell_data_mismatch`, `cell_data_mismatch_hard`,
+`config_sanity`, `hard_cut_latch`) - confirmed by counting every `self.fault_log.update(...)` call
+site in `bridge/management_engine.py`, which matches the 19 catalog entries exactly (no orphans
+either direction). `docs/13`'s own line 347 (Part 6) also asserts the count "matches docs/08's '12
+total' claim exactly," which is now a stale claim about a stale claim. Purely a documentation
+fix - the code itself (both files) is internally consistent and the `FaultHistoryWindow` already
+scrolls, so no UI issue.
+**Your notes:**
+yeah update the doc's 
+
+**Outcome (2026-08-03): FIXED.** `docs/08-gui-design.md`'s Fault History section now says "19
+total... see that file for the current catalog" instead of a hardcoded "12," and its adjacent
+layout description was also corrected to the current single-line-per-entry row (it still said the
+old two-line stacked layout from before the 2026-08-01 widening). Docs-only, no code change.
+
+### 14.2 — 0x1C2 heartbeat's documented 60ms startup delay doesn't match the code (immediate, no gate)
+- [x] Reviewed
+
+`docs/07-startup-shutdown-plan.md`'s startup timeline table says `0x1C2` starts at **t=60ms**
+("trigger: VCM traffic appearing"). But `RealtimeEngine._tx_loop()` has this explicit branch for
+`HVBAT_ID_1C2`:
+```python
+if arb_id in (leaf_signals.HVBAT_ID_1C2,):
+    pass  # heartbeat is immediate from bus-wake, no start-offset gate
+```
+— i.e. it actually starts at **t=0**, the instant the sequencer enters `startup`, with no offset
+gate at all (unlike `0x1DB`/`0x1DC` at t=65ms and `0x55B`/`0x5BC` at t=155ms, which both DO have an
+explicit `timing < T_..._START` gate in the same function). A small (60ms) discrepancy, but every
+other number in this timeline has been kept byte/timing-exact to the ported reference behavior, so
+this is either a genuine porting gap (the 60ms gate was never actually implemented for 0x1C2) or the
+doc's 60ms figure was never quite right to begin with - worth a real decision either way rather than
+leaving the two disagreeing silently.
+**Your notes:**
+yeah, we need to keep what the orgnial log shows for start up timing. 
+so just fix the docs if the code is corect. as we do want to keep the byte/timing-exact we saw 
+in the log'safefrom the past ref projects. 
+
+**Outcome (2026-08-03): the code was correct, docs/07 was FIXED.** Traced against the primary
+source: `Refrance/Leaf_BMS_Emulator/battery emulator overview/04-startup-sequence.md` and
+`Reports/HVBAT_PowerUp_Handshake_Report.md` both explicitly say to **"immediately start 0x1C2"**
+the instant real bus traffic is detected, with no separate gate/delay constant, and neither
+report's own named-constants list (`T_1DB_START=65` etc.) includes a `T_1C2_START`. The "+60ms"
+figure in the handshake report's §2 timeline is measured from that specific `.trc` recording's very
+first frame (including OTHER ECUs' one-shot alive frames, which arrive before the VCM's real 10ms
+stream) - an artifact of when VCM traffic happened to first appear in that one capture, not a
+deliberate timing gate the real battery or the emulator enforces. `bridge/realtime_engine.py`'s
+`_tx_loop()` already sends `0x1C2` immediately with no start-offset gate, matching the confirmed
+source behavior - `docs/07`'s table was corrected to show `0x1C2` at t=0 (with every other offset
+still measured from that same instant, unchanged) rather than the previous internally-contradictory
+"t=60ms" entry. No code change.
+
+### 14.3 — The "5th wind-down trigger" fires on ANY hard cut, not just the staleness watchdog as documented
+- [x] Reviewed
+
+`docs/07-startup-shutdown-plan.md`'s "This bridge's specific staleness/shutdown interaction" section
+describes a fifth wind-down trigger, specific to this bridge, as: *"the staleness watchdog's
+hard-cut escalation - if RZ450e data has been stale for 65+ seconds, wind down via
+relay_cut_request regardless of what the four Leaf-side triggers are doing."* The actual code
+(`ShutdownSequencer._should_wind_down`) is broader than that:
+```python
+if hard_cut_this_tick:
+    return True   # 5th trigger, specific to this bridge (docs/06/07)
+```
+`hard_cut_this_tick` is `RealtimeEngine._tx_loop`'s `hard_cut` variable, computed from
+`leaf_state.get('relay_cut_request', 0) not in (0, None)` - true for **any** hard-cut source
+(staleness escalation, but also cell overvoltage/regen/AC-charger emergency, over-temperature
+emergency, and cell-data cross-check hard escalation), not staleness specifically.
+
+This has a real behavioral consequence worth a deliberate decision, not just a doc correction: when
+any hard cut fires, the bridge runs the full staged wind-down (`docs/07`'s power-down timeline,
+~1.2s) and then goes **completely silent** on the Leaf bus in the `stopped` phase (`_tx_loop`
+sends nothing at all while `phase in ('idle', 'waiting_for_wake', 'stopped')`) until the bus goes
+genuinely quiet and it re-arms to `waiting_for_wake`. So an emergency-tier condition (e.g. a cell
+hitting the overvoltage emergency threshold) doesn't just latch `relay_cut_request`/`interlock` and
+hold there indefinitely broadcasting the cut - it makes the bridge stop transmitting *anything* to
+the Leaf bus shortly after, then potentially re-arms and resumes normal transmission (with the hard
+cut still latched, so `relay_cut_request` should reassert on the very next running tick - but there
+is a window where the Leaf bus sees nothing at all rather than a continuously-asserted hard cut).
+
+Two real questions for a decision, not just which one docs/07 should describe:
+1. Is "any hard cut winds the bridge down" the intended behavior, or should this 5th trigger be
+   narrowed back to staleness only (matching what `docs/07` currently says), with other hard cuts
+   just holding `relay_cut_request`/`interlock` asserted indefinitely without ever entering
+   `winding_down`/`stopped`?
+2. If "any hard cut winds down" IS intended, should the wind-down sequence for a hard-cut-triggered
+   shutdown differ from a normal ignition-off wind-down - e.g. skip straight to holding the hard-cut
+   state indefinitely instead of the staged power-down timeline built for a graceful shutdown, so
+   the Leaf bus is never silent during an active emergency?
+**Your notes:**
+no, the bridge should not wind down unless there is a real trigger to do so.
+ a hard cut should not stop the bridge. all fail safe's are triggerd and the bridge still operates
+ IF not comaneded to stop unless one of the known triggers to wind down happens. 
+ if there is more Qustions on this let me know. else fix the code and the doc's to match what we want. 
+
+**Outcome (2026-08-03): FIXED.** Narrowed the 5th wind-down trigger back to the staleness
+watchdog's own hard-cut escalation ONLY, matching `docs/07`'s original (correct) description - a
+voltage/temperature/cross-check emergency now just latches `relay_cut_request`/`interlock` via the
+existing `ManagementEngine._hard_latched` mechanism and the bridge keeps running/transmitting
+indefinitely, exactly as directed ("a hard cut should not stop the bridge... all fail safes are
+triggered and the bridge still operates"). New `ManagementEngine.staleness_hard_cut` (reset False
+at the top of every `apply()`, set True only in the staleness-watchdog block's own hard-escalation
+branch) is what `RealtimeEngine._tx_loop` now passes into `ShutdownSequencer.tick()`/
+`_should_wind_down()` (renamed parameter `hard_cut_this_tick` -> `staleness_hard_cut` for clarity)
+instead of the old any-hard-cut `hard_cut` variable - that variable still exists and is used
+unchanged for the Log panel's "HARD CUT asserted" message and `last_hard_cut` UI tracking, which
+should still reflect ANY hard cut, just no longer for the wind-down decision. New tests
+(`tests/test_management_engine.py`): `test_staleness_hard_cut_flag_not_set_by_a_non_staleness_
+hard_cut` (an emergency low-voltage cut asserts `relay_cut_request` but leaves `staleness_hard_cut`
+False) and `test_staleness_hard_cut_flag_set_by_the_staleness_watchdog_escalation` (confirms the
+reverse). No doc change needed - `docs/07`'s "staleness watchdog's hard-cut escalation... regardless
+of what the four Leaf-side triggers are doing" description was already accurate; only the code
+needed to match it.
+
+### 14.4 — GUI charge-stop status text always blames "RZ450e permission not granted," even when the real cause is the data gate or the staleness watchdog
+- [x] Reviewed
+
+`RealtimeEngine._apply_charge_ramp()`'s own log message already distinguishes all three reasons
+`full_charge_flag` can now be forced during a blocked charge request:
+```python
+if not rz_authorized:
+    reason = 'RZ450e has not granted charge_permission_input'
+elif not data_ready:
+    reason = f'no genuinely live battery data yet, cannot start on cached/default values (missing: {missing_key})'
+else:
+    reason = 'blocked'
+```
+But both live GUI status displays hardcode only the first reason, regardless of which one actually
+applies:
+- `gui/panels.py`'s `ChargeEmulationPanel._schedule_status_refresh()`: `'status: STOPPED - charge
+  requested but RZ450e permission not granted (full_charge_flag set)'`
+- `gui/dashboard.py`'s `DashboardWindow._tick()`: `'STOPPED - Leaf wants to charge but RZ450e
+  permission not granted (full_charge_flag set)'`
+
+Both simply check `bool(tx.get('full_charge_flag'))` and show this same wording whenever it's set
+while `charge_emulate` is on - they have no way to tell whether the real cause was RZ450e's
+interlock, `require_live_data_to_charge` (item 13.1b) not yet satisfied, or the general staleness
+watchdog (item 13.1) escalating mid-charge. A user troubleshooting "why won't it charge" with
+RZ450e's permission actually granted, but the per-cell data not yet live, would see a message
+telling them the interlock is the problem when it isn't - actively misleading, not just incomplete.
+**Your notes:**
+yeah confirm both gates for starting the charger are notated in teh log as well as any other reasion like 
+temp or voltage. and include the stop reasion(s) via voltage / temps / full / error/ ETC. 
+
+**Outcome (2026-08-03): FIXED, plus confirming the start-side log was already correct.** The
+start-of-ramp log line already names all three gates together (`_apply_charge_ramp`'s "0x1F2
+charge request active + RZ450e permission granted + battery data genuinely live - starting..."), so
+no change was needed there. The gap was entirely on the STOP/status side. New `RealtimeEngine.
+charge_status_summary()` is now the single source both GUI surfaces read (`gui/panels.py`'s
+`ChargeEmulationPanel`, `gui/dashboard.py`'s Charge emulation section - both previously duplicated
+their own hardcoded, wrong guess), resolved in priority order from the SAME live data each
+subsystem already produces instead of re-guessing:
+1. `ManagementEngine`'s `staleness_watchdog` status text, if it says "charging stopped" (covers
+   item 13.1's watchdog-forced stop).
+2. `ManagementEngine`'s `ac_charge_taper` status text, if it says the target SoC was reached
+   (covers the AC daily/extended target - a SUCCESS, not a fault; now reported as "CHARGE COMPLETE"
+   instead of the old always-red "STOPPED... permission not granted" wording).
+3. A new `RealtimeEngine._last_charge_gate_reason` (set inside `_apply_charge_ramp` itself, cleared
+   the instant the ramp is active or genuinely idle) covering the ramp's own permission/live-data
+   gate, exactly matching what's logged.
+
+The voltage/temperature part of the request is already covered structurally, not folded into this
+one line: `ac_charge_taper`'s own status label (visible right next to the main status on the Charge
+Emulation tab) already reports the live per-cell voltage taper factor, and `over_temperature_
+derate`'s status (Battery Management tab + Dashboard's "Battery management status" section) already
+reports temperature-driven derating - both were already accurate per-feature status text before
+this fix; the fix specifically targeted the ONE line that was actively wrong (the full_charge_flag
+STOPPED message). Dashboard status coloring updated to match: "CHARGE COMPLETE" now renders green
+(success), not the same red as a genuine STOPPED-on-a-problem message.
+
+### 14.5 — Disabling a battery-management feature mid-cut freezes its Fault History entry as permanently "active"
+- [x] Reviewed
+
+Every feature block in `ManagementEngine.apply()` is wrapped in `if f['enabled']:` before it calls
+`self.fault_log.update(...)` for its own tracked condition(s) - e.g. `over_temperature_derate`'s
+four fault_log entries only get updated while that feature's checkbox is on. If a feature's fault is
+currently active (e.g. `over_temp_emergency` is lit) and the user unchecks that feature's "Enabled"
+box in the Battery Management tab, `fault_log.update()` simply stops being called for those keys
+entirely - the entry freezes at whatever active/inactive state it last had, rather than being told
+the condition is no longer being evaluated. The single master `hard_cut_latch` entry is unaffected
+(it's updated unconditionally every tick from `self._hard_latched`, which itself would correctly
+stop being set once the disabled feature stops contributing to `hard_cut`), so the *overall* "is the
+vehicle actually cut off" signal stays accurate - only the **per-feature** breakdown entries can go
+stale. Minor (observability only, no incorrect safety-relevant output), but worth a decision: should
+disabling a feature explicitly clear/mark its fault_log entries as inactive, or is a frozen
+per-feature entry acceptable since the master latch entry is what actually matters?
+**Your notes:**
+so any new data change or entry should ither A. work in real time. B. the bridge must be stoped and sterted. 
+i know we have a real time enegen going to changes. it makes sence to have all those entrys as live inputs? 
+if no let me know. 
+
+**Outcome (2026-08-03): agreed, option A (live) - FIXED.** This matches the rest of the system's
+own design already (mapping/threshold edits apply on the very next tick, no restart needed, per
+`docs/06` section 0/`docs/08`'s Start/Stop Bridge section) - there was no reason for fault_log
+entries specifically to be the one frozen exception. Every feature block in `ManagementEngine.
+apply()` now has a matching `else:` branch for `not f['enabled']` that immediately calls a new
+`_clear_disabled_feature()` helper, explicitly setting that feature's own tracked fault_log
+entries to inactive with a `'feature disabled'` detail (instead of just letting the `update()` call
+stop happening and the entry go stale) plus a `status[feature] = 'disabled'` entry so the GUI shows
+that plainly instead of the last live reading. Applied to every feature with its own fault_log
+keys: `low_voltage_cutoff`, `charge_target_taper` (regen), `ac_charge_taper`, `over_temperature_
+derate`, `cell_imbalance_monitor`, `overcurrent_monitor`, `cell_data_cross_check`,
+`staleness_watchdog` (`discharge_power_taper` has no fault_log entries of its own, so it only
+gained a `status['discharge_power_taper'] = 'disabled'` line). Also reset each feature's own
+persistence/hysteresis state (`_discharge_factor_applied`, `_regen_factor_applied`,
+`_overcurrent_since`, `_cross_check_since`, `_stale_since`) back to a neutral value on disable, so
+re-enabling later doesn't resume from a stale ramped-down factor or an old persistence-window
+clock. New test (`tests/test_management_engine.py`):
+`test_disabling_a_feature_mid_fault_clears_its_fault_log_entries_live` - drives
+`over_temperature_derate` into an active emergency hard cut, disables the feature, and confirms all
+four of its fault_log entries immediately show inactive on the very next tick, not frozen "active."
+
+---
+
+## Part 15 — Full fault-trigger catalog, for confirming every condition is set up correctly (2026-08-03)
+
+Requested: every fault trigger this bridge has, with its input condition, what resets it, and what
+actually happens when it fires - one row per `bridge/fault_log.py` `FAULT_DEFINITIONS` entry (19
+total, see item 14.1), plus the dynamic output-clamp category. Sourced directly from
+`bridge/management_engine.py`'s `apply()` (current as of Rev 34) - not re-derived from docs, so this
+is a description of what the code actually does right now, for you to check against what you
+*want* it to do. All thresholds shown are the shipped defaults (`default_config()`) - editable in
+the GUI; a hand-edited/loaded value changes the number, not the logic described here.
+
+**Two clearing mechanisms, used consistently throughout:**
+- **Auto-clear (soft/warn tier)**: the fault_log entry's own `active` state is recomputed fresh
+  every tick straight from the live reading - it clears itself the instant the condition is no
+  longer true, no persistence required to clear (only some have a persistence *window before
+  triggering*, noted per-row below).
+- **Latch (hard tier only)**: any hard-tier trigger sets `ManagementEngine._hard_latched = True`,
+  which then holds `relay_cut_request = 3` / `interlock = 0` on **every** subsequent tick regardless
+  of whether that specific reading has recovered, until `notify_session_start()` (a real bus wake -
+  `waiting_for_wake -> startup` following a **natural** re-arm, never a bare Stop/Start Bridge
+  toggle) or `notify_charge_replug()` (`charge_permission_input` genuinely absent for
+  `CHG_END_STOP_S`=3.0s, then a fresh request) is called. Clearing the latch does NOT bypass a
+  still-true condition - it re-asserts on the very next tick if the underlying reading hasn't
+  actually recovered too. **Only the `staleness_hard` trigger is additionally allowed to wind the
+  bridge down** (item 14.3) - every other hard cut just latches and the bridge keeps running/
+  transmitting.
+- **Disabling the owning feature** (item 14.5) clears that feature's own entries to inactive
+  immediately, live, the same tick - not a third mechanism exactly, but worth remembering per row.
+
+**Two general notes that apply across several rows below, so they're not repeated 19 times:**
+- **Escalation pairs behave differently from each other.** For the two soft→hard escalation pairs
+  (staleness, cell-data cross-check), **both** the soft and hard entries stay active simultaneously
+  once escalated - the hard tier doesn't replace the soft one. The two low-voltage tiers, by
+  contrast, are mutually exclusive (emergency is checked first and short-circuits the soft-tier
+  check that same tick).
+- **Three "warn"-tier entries aren't monitor-only** (`charge_cold_block`, `discharge_temp_zero`,
+  `charge_temp_zero`) - they directly zero a power-limit output despite the "warn" label, which
+  reflects dash-error severity (no error / soft cut / RED hard cut), not whether the condition
+  changes what's transmitted. Flagged again on each of those three rows below - worth confirming
+  that's the fault-log *level* you actually want for something with a real power-cutting effect.
+
+### 15.1 — `low_voltage_emergency` (hard)
+- [x] Reviewed
+
+**Triggers when:** **lowest** individual cell voltage (or pack `cell_min` if no per-cell data)
+`<= emergency_low_v` (2.60V). Instant - no persistence window.
+**Resets when:** the reading rises back above 2.60V (entry auto-clears instantly) - but see the
+hard-cut **latch** mechanism above (this condition clearing does not clear `relay_cut_request`
+itself). `low_voltage_cutoff` disabled also clears this entry live.
+**Effect while active:** `relay_cut_request=3`, `interlock=0` (latched). Mutually exclusive with
+`low_voltage_soft` this tick - emergency is checked first.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.2 — `low_voltage_soft` (soft)
+- [x] Reviewed
+
+**Triggers when:** **lowest** individual cell `<= min_cell_v` (3.00V, and NOT already at/below the
+emergency tier), held **continuously** for `soft_cut_persistence_s` (2.0s) - guards against a
+single-tick sag transient.
+**Resets when:** the reading rises back above 3.00V at any point (auto-clears instantly, no
+persistence on clearing) - or the persistence timer resets to zero if the dip was momentary and
+never reached 2.0s continuous. `low_voltage_cutoff` disabled clears live.
+**Effect while active:** `capacity_empty=1` (soft cut - no dash error, auto re-closes once the
+condition and flag both clear). Min SoC % is evaluated alongside and shown in the status text but
+**never** triggers this by itself (backup/agreement check only).
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.3 — `overvoltage_emergency` (hard, regen)
+- [x] Reviewed
+
+**Triggers when:** **highest** individual cell voltage `>= emergency_high_v` (4.20V) -
+`charge_target_taper`, **regen only**, active regardless of charging context (driving or plugged
+in). Instant.
+**Resets when:** the reading drops back below 4.20V (auto-clears instantly) - subject to the
+hard-cut latch. `charge_target_taper` disabled clears live.
+**Effect while active:** `relay_cut_request=3`/`interlock=0` (latched); `charge_limit_kw` forced to
+0 this tick (taper factor snaps to 0.0).
+**Your notes:**
+"worst individual cell voltage" should not this be the highest cell? most charged? 
+or is this jsut a wording thing? describe "worst individual cell voltage `>= emergency_high_v` (4.30V)"
+should be "higest individual cell voltage `>= emergency_high_v` (4.30V)" ???
+also lets set this to 4.2V as our norm base config
+
+**Outcome (2026-08-03): both FIXED.** Wording: correct catch - "worst" was ambiguous (it's the
+code's own variable name, `worst_high = max(cells)`, chosen because "worst" means "closest to a
+problem," which is the *highest* reading for an overvoltage check and the *lowest* reading for an
+undervoltage check - not obvious out of context). Every entry in this catalog (15.1-15.4, 15.9) now
+says "highest"/"lowest" explicitly in prose instead of "worst," while code snippets/variable names
+elsewhere still legitimately say `worst_high`/`worst_low` (that's the actual Python identifier).
+Threshold: `charge_target_taper.emergency_high_v` default changed 4.30V -> 4.20V (`bridge/
+management_engine.py`) - the standard NMC charge ceiling exactly (docs/05's own researched value),
+tightening the margin above the 4.15V zero-power point to 0.05V; still passes the `regen_zero_v <
+emergency_high_v` config-sanity check (15.18). **Note for existing saved profiles**: this is a
+`default_config()` change only - a `config/profile.json` already saved with the old 4.30V value
+will keep using 4.30V until re-saved or edited, same as any other default-vs-saved-value case.
+
+### 15.4 — `ac_overvoltage_emergency` (hard, AC charger)
+- [x] Reviewed
+
+**Triggers when:** **highest** individual cell voltage `>= ac_emergency_v` (4.20V) -
+`ac_charge_taper`, **AC charger only**, config lives in the Charge Emulation tab, gated on its own
+`ac_taper_enabled` checkbox (not `cfg[...]['enabled']`). Instant.
+**Resets when:** the reading drops back below 4.20V (auto-clears) - subject to the latch.
+Unchecking "AC charger overvoltage taper" clears live.
+**Effect while active:** `relay_cut_request=3`/`interlock=0` (latched); `charger_limit_kw` forced
+to 0 this tick.
+**Your notes:**
+same as 15.3 "higest individual cell voltage `>= ac_emergency_v` (4.30V) ??
+also lets set this to 4.2V as our norm base config
+
+**Outcome (2026-08-03): both FIXED, same as 15.3.** `ac_emergency_v` default changed 4.30V ->
+4.20V (`bridge/leaf_signals.py`'s `CHARGE_SLIDERS`), matching `charge_target_taper`'s regen-side
+threshold exactly. Wording corrected the same way across the whole catalog.
+
+### 15.5 — `over_temp_emergency` (hard)
+- [x] Reviewed
+
+**Triggers when:** hottest probe (`temp_max`) `>= emergency_temp_f` (141.8°F/61°C). Instant.
+**Resets when:** `temp_max` drops back below 141.8°F (auto-clears) - subject to the latch.
+`over_temperature_derate` disabled clears live.
+**Effect while active:** `relay_cut_request=3`/`interlock=0` (latched); discharge, charge, AND
+charger limits are ALL forced to 0 this tick (both `d_factor`/`c_factor` snap to 0.0).
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.6 — `charge_cold_block` (warn — but not monitor-only, see below)
+- [x] Reviewed
+
+**Triggers when:** coldest probe (`temp_min`, falls back to `temp_max` if `temp_min` is
+unavailable) `<= charge_low_block_f` (32°F/0°C).
+**Resets when:** the coldest probe rises back above 32°F (auto-clears instantly).
+`over_temperature_derate` disabled clears live.
+**Effect while active:** **not just a label** - `cold_factor` is 0.0 at/below this point, which
+zeroes `charge_limit_kw`/`charger_limit_kw` via `c_factor = min(cold_factor, hot_factor)`, ramping
+back to full by `charge_derate_low_start_f` (50°F/10°C). Tagged "warn" in the catalog but has a
+real output effect, unlike the true monitor-only entries below (15.9-15.11).
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.7 — `discharge_temp_zero` (warn — but not monitor-only, see below)
+- [x] Reviewed
+
+**Triggers when:** `d_factor <= 0.0`, i.e. `temp_max >= discharge_hard_stop_f` (140°F/60°C).
+**Resets when:** `temp_max` drops back below 140°F (auto-clears). `over_temperature_derate`
+disabled clears live.
+**Effect while active:** `discharge_limit_kw` forced to 0 this tick. Also a real output effect
+despite the "warn" tier - the actual hard-cut tier is the separate `over_temp_emergency` (15.5) at
+141.8°F.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.8 — `charge_temp_zero` (warn — but not monitor-only, see below)
+- [x] Reviewed
+
+**Triggers when:** `c_factor <= 0.0` - either the cold-block condition (15.6), or `temp_max >=
+charge_hard_stop_f` (113°F/45°C) on the hot side, whichever binds.
+**Resets when:** `c_factor` rises back above 0 (auto-clears). `over_temperature_derate` disabled
+clears live.
+**Effect while active:** `charge_limit_kw` AND `charger_limit_kw` both forced to 0 this tick.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.9 — `cell_imbalance_warn` (warn, true monitor-only)
+- [x] Reviewed
+
+**Triggers when:** spread between the highest and lowest of all 96 individually-read cells
+`>= warn_delta_v` (100mV). Requires both extremes to have live data.
+**Resets when:** the spread drops back below 100mV (auto-clears). `cell_imbalance_monitor`
+disabled clears live.
+**Effect while active:** monitor only - status text warning, zero output effect. This bridge
+cannot rebalance cells.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.10 — `overcurrent_discharge_warn` (warn, true monitor-only)
+- [x] Reviewed
+
+**Triggers when:** `current > 0` (discharging) and magnitude `>= continuous_discharge_warn_a`
+(150A), held continuously for `persistence_s` (5.0s).
+**Resets when:** magnitude drops back below 150A (auto-clears instantly - the persistence window
+only gates triggering, not clearing). `overcurrent_monitor` disabled clears live.
+**Effect while active:** monitor only - zero output effect, ever.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.11 — `overcurrent_charge_warn` (warn, true monitor-only)
+- [x] Reviewed
+
+**Triggers when:** `current <= 0` (charging/regen) and magnitude `>= continuous_charge_warn_a`
+(30A), held continuously for `persistence_s` (5.0s).
+**Resets when:** same pattern as 15.10, opposite current direction.
+**Effect while active:** monitor only - zero output effect.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.12 — `staleness_soft` (soft)
+- [x] Reviewed
+
+**Triggers when:** the single worst-aged registered input signal (all 96 cells, 16 temp probes,
+every scalar, plus the `alive_3f1`/`alive_358`/`counter_5s` keep-alive counters) reaches
+`soft_cut_s` (60s) - a signal that has **never** arrived at all ages from this engine's own first
+`apply()` call, not excluded forever.
+**Resets when:** the worst-aged signal receives fresh data and drops back under 60s (auto-clears
+instantly). `staleness_watchdog` disabled clears live.
+**Effect while active:** `capacity_empty=1` **AND** explicitly `charge_limit_kw=0.0`,
+`charger_limit_kw=-10.0`, `full_charge_flag=1` - the only soft cut that also force-stops charging
+outright (a depleted-battery soft cut deliberately does NOT block charging; stale *data* itself
+must, since safety can no longer be verified).
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.13 — `staleness_hard` (hard)
+- [x] Reviewed
+
+**Triggers when:** the same worst-age condition as 15.12, sustained an additional
+`hard_escalation_s` (+5s, ~65s total) past the soft-cut point.
+**Resets when:** worst age drops back under 60s (auto-clears) - subject to the hard-cut latch.
+`staleness_watchdog` disabled clears live.
+**Effect while active:** `relay_cut_request=3`/`interlock=0` (latched) plus the same charge-stop as
+the soft tier. **This is the ONLY trigger that also sets `ManagementEngine.staleness_hard_cut`**,
+the sole condition allowed to wind the bridge down (item 14.3) - every other hard cut in this
+catalog just latches and keeps the bridge running.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.14 — `input_validation_reject` (warn, toggleable)
+- [x] Reviewed
+
+**Triggers when:** any RZ450e-decoded value fails `rz450e_signals.validate_inputs()`'s
+plausibility range within the trailing 5.0s window (`recent_rejections()`), AND
+`input_validation.enabled` is on (default on).
+**Resets when:** no rejection occurs in the trailing 5s (a rolling window, not a latch - ages out
+on its own). Disabling `input_validation` clears live.
+**Effect while active:** the rejected value is simply never written to `SharedState` at all - it's
+dropped, and the field keeps aging under its last-good value (or `None`), eventually caught by the
+staleness watchdog (15.12/15.13) if sustained.
+**Your notes:**
+we should add enable disable for our app for testing and so we know its somthing thats happning 
+and can be tested. defualt to on.
+
+**Outcome (2026-08-03): FIXED.** No longer "always-on" - new `input_validation` feature
+(`bridge/management_engine.py`'s `default_config()`, `{'enabled': True}`, no threshold fields) with
+its own checkbox on the Battery Management tab (`gui/panels.py`, empty `FEATURE_FIELDS` list since
+there's nothing to tune, just enable/disable). `RealtimeEngine._ingest_validated()` reads this same
+flag live, every call - when off, every decoded value passes straight through unfiltered instead of
+being plausibility-checked, so a deliberately-bad synthetic value can be pushed through to test
+downstream handling. Disabling clears `input_validation_reject`'s fault_log entry live, same pattern
+as every other feature (item 14.5). New `tests/test_realtime_engine.py` (new file):
+`test_input_validation_toggle_lets_implausible_values_through_when_disabled` confirms an implausible
+value is rejected when enabled and passes through when disabled;
+`test_disabling_input_validation_clears_its_fault_log_entry_live` confirms the fault_log entry.
+
+### 15.15 — `checksum_reject` (warn, toggleable)
+- [x] Reviewed
+
+**Triggers when:** any frame on the 5 confirmed checksum-bearing IDs (`0x020`/`0x023`/`0x358`/
+`0x3F1`/`0x424`) fails its Toyota additive checksum within the trailing 5.0s window, AND
+`checksum_validation.enabled` is on (default on).
+**Resets when:** no failure in the trailing 5s (rolling window). Disabling `checksum_validation`
+clears live.
+**Effect while active:** the frame is rejected before decode entirely - never reaches
+`SharedState`, same downstream effect as a plausibility rejection (15.14).
+**Your notes:**
+we should add enable disable for our app for testing and so we know its somthing thats happning 
+and can be tested. defualt to on.
+
+**Outcome (2026-08-03): FIXED, same pattern as 15.14.** New `checksum_validation` feature
+(`{'enabled': True}`, no threshold fields, own Battery Management checkbox). `RealtimeEngine.
+_ingest_rz_bus()` reads this flag live before calling `rz450e_signals.frame_checksum_ok()` - when
+off, every frame on the 5 checksum-bearing IDs is decoded regardless of checksum validity, so a
+deliberately-corrupted synthetic frame can be pushed through to test downstream handling. Disabling
+clears `checksum_reject`'s fault_log entry live. New tests in `tests/test_realtime_engine.py`:
+`test_checksum_validation_toggle_lets_corrupt_frames_through_when_disabled` (runs
+`_ingest_rz_bus()` in a background thread against a real queued frame with a deliberately-wrong
+checksum byte, confirms it's rejected when enabled and decoded when disabled) and
+`test_disabling_checksum_validation_clears_its_fault_log_entry_live`.
+
+### 15.16 — `cell_data_mismatch` (soft)
+- [x] Reviewed
+
+**Triggers when:** `|worst_low - cell_min_raw|` or `|worst_high - cell_max_raw|` (per-cell array
+vs. the `0x020` pack-summary) `>= max_delta_v` (150mV), held continuously for `soft_cut_s` (60s).
+Requires both the per-cell array AND the pack summary to have data.
+**Resets when:** the delta drops back below 150mV (auto-clears instantly). `cell_data_cross_check`
+disabled clears live.
+**Effect while active:** `capacity_empty=1`. A mismatch this large usually means a decode problem,
+not a real physical condition.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.17 — `cell_data_mismatch_hard` (hard)
+- [x] Reviewed
+
+**Triggers when:** the same mismatch as 15.16, sustained an additional `hard_escalation_s` (+5s,
+~65s total) past the soft-cut point.
+**Resets when:** the delta drops back below threshold (auto-clears) - subject to the hard-cut
+latch. `cell_data_cross_check` disabled clears live.
+**Effect while active:** `relay_cut_request=3`/`interlock=0` (latched). Does **NOT** set
+`staleness_hard_cut` - per item 14.3 this does not wind the bridge down, only latches.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.18 — `config_sanity` (warn, always-on)
+- [x] Reviewed
+
+**Triggers when:** any of 10 cross-field threshold-ordering rules is violated (e.g.
+`emergency_low_v` not `<` `min_cell_v`, `taper_zero_v` not `<` `taper_start_v`, `ac_full_v` not `<`
+`ac_zero_v`) - checked every tick against the live config, regardless of any feature's own enable
+flag.
+**Resets when:** the offending fields are corrected (auto-clears instantly - re-evaluated fresh
+every tick).
+**Effect while active:** warning only - does NOT block, correct, or override the nonsensical
+values; the engine keeps running with whatever's actually configured (`clamp_state()` is the
+separate safety net that keeps CAN output in range regardless). Protects against a hand-edited/
+corrupted `profile.json`, not just GUI typos (which are already bounds-clamped separately).
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.19 — `hard_cut_latch` (hard, derived/meta)
+- [x] Reviewed
+
+**Triggers when:** `ManagementEngine._hard_latched` is `True` - i.e. **any** hard-tier condition
+above (15.1, 15.3, 15.4, 15.5, 15.13, 15.17) fired this tick or a previous tick and hasn't been
+cleared yet. A derived entry, not its own independent sensor check.
+**Resets when:** `notify_session_start()` or `notify_charge_replug()` (see the latch mechanism
+above) - **and** the underlying condition must have also actually recovered, or it re-latches the
+very next tick.
+**Effect while active:** mirrors `relay_cut_request=3`/`interlock=0` while latched. **This is the
+authoritative "is the vehicle actually cut off right now" indicator** - unlike the individual
+per-condition entries above (which each reflect only their own instantaneous trigger, and can show
+"cleared" while the vehicle is still latched off), this one is always accurate. Unaffected by any
+single feature being disabled, since it reflects the aggregate outcome of whichever features
+remain enabled.
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+### 15.20 — `clamp_<key>` (dynamic, one per field, warn)
+- [x] Reviewed
+
+**Triggers when:** any composed Leaf output field falls outside its documented encodable `(lo,
+hi)` range in `leaf_signals.clamp_state()` (`RealtimeEngine._compose_leaf_state()`, docs/06 section
+4) - e.g. a mapping tie or derived formula produces a value the CAN frame's bitmask can't
+represent without wrapping. Not listed in `FAULT_DEFINITIONS` (it's per-field, dynamic) - a row
+only appears once it's actually happened at least once.
+**Resets when:** the field's value returns to within its documented range on a later tick
+(auto-clears). Not tied to any feature's enable flag - this is a separate, always-on final safety
+net.
+**Effect while active:** the value is clamped to the nearest bound (`lo` or `hi`) before it's ever
+packed into a frame - this already happens regardless of whether the fault_log entry exists; the
+entry is purely observability (a value needing to be clamped means something upstream is
+misconfigured, not a hardware fault).
+**Your notes:**
+
+**Outcome:** Confirmed correct as described, no changes requested.
+
+**Closing note on the whole catalog - Your notes:**
+i htink that in the fualt window we should move "monitor only" in to a group, and "soft cut" in it another,
+ and "Hard cut" in to another so its eazy to tell what fualts are going to do what to
+ the system if anything. 
+
+**Outcome (2026-08-03): FIXED.** User decision: "i want to do it all if it was supose to be in
+place and it was missed." `gui/fault_history_window.py` now builds three sections inside the
+scrollable area - "Monitor Only - no cut", "Soft Cut", "Hard Cut" (`_TIER_ORDER`/`_TIER_HEADING`),
+each with a heading in that tier's color, low-to-high severity top-to-bottom matching the
+escalation order used throughout docs/05. `_build_fault_row()` now routes each row into the
+correct tier's frame (`self.tier_frames[level]`) using exactly the `level` value already carried
+by every `FAULT_DEFINITIONS` entry and every dynamically-discovered `clamp_<key>` entry (always
+`'warn'`, per `RealtimeEngine._compose_leaf_state()`) - so this catalog's own per-item tier
+(15.1-15.20) is literally what drives the grouping, no separate mapping table needed. Verified via
+a GUI smoke test (window builds with no exceptions, all rows present).

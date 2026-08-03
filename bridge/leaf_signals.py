@@ -99,10 +99,16 @@ CHECKS = [  # (key, label, default) - soft/hard cut and permission flags
     ('main_relay_on',   'Main relay ON permission (0x1DB)', 1),
     ('interlock',       'Inter-lock connected (0x1DB)',     1),
     ('full_charge_flag','Full charge flag (0x1DB) - SOFT CUT: instant charge stop', 0),
-    ('voltage_latch',   'Toggle voltage latch flag (0x1DB, generated)', 1),
     ('ir_malfunction',  'IR sensor malfunction (0x55B)',    0),
     ('capacity_empty',  'Capacity empty flag (0x55B) - SOFT CUT: instant contactor cutoff', 0),
 ]
+# 'voltage_latch' removed as a mapping target (2026-08-01, item 12.5, user
+# decision): build_1db() never read s['voltage_latch'] at all, so mapping
+# anything to it in the GUI had zero effect - the real toggle-bit gating it
+# was meant to provide already lives in GENERATED_SIGNALS' own
+# 'voltage_latch_toggle' checkbox (see realtime_engine.py's _build_frame),
+# which is the actual live equivalent of the original Leaf_BMS_Emulator's
+# `latch if s['voltage_latch'] else 0` gate - no functionality lost.
 
 ZE1_62_SLIDERS = [
     ('chg2_limit_kw', '0x1ED charger-limit field (kW) [UNVERIFIED upstream]',
@@ -122,6 +128,20 @@ CHARGE_CHECKS = [
     # (2026-08-01 split) - only ever mattered while actually plugged in, so
     # it belongs with the rest of the charger-specific controls.
     ('extended_mode', 'Extended mode active (road trip - charge to extended target)', 0),
+    # Added 2026-08-03 (docs/13 item 13.1, user directive), REWORKED
+    # 2026-08-03 same day after user clarification: driving is allowed to
+    # run on cached/last-known-good values until the general 60s/+5s
+    # staleness watchdog would object (docs/06 section 3) - charging must
+    # NOT start on cached/default values at all, full stop. The only
+    # difference from driving is this startup gate; once genuinely live
+    # data has arrived and the ramp is running, ongoing protection is the
+    # SAME staleness watchdog driving gets, not a separate/stricter timer
+    # (a separate custom threshold was the first version of this fix and
+    # was explicitly rejected - "it's the same safety and data validation
+    # as driving, just with a different startup"). Default ON, matching
+    # this project's "ship enabled" philosophy for anything safety-relevant.
+    ('require_live_data_to_charge',
+     'Require genuinely live (not cached/default) battery data before the charge ramp can start', 1),
 ]
 CHARGE_SLIDERS = [
     ('charge_target_kw', 'Charger ramp target (kW)', 0, 92.2, 0.1, 92.2),
@@ -134,13 +154,24 @@ CHARGE_SLIDERS = [
     # independently tuned, just no longer forced to share one curve.
     ('ac_full_v', 'AC charge full power below (V/cell)', 0, 5.0, 0.01, 4.00),
     ('ac_zero_v', 'AC charge zero power at/above (V/cell)', 0, 5.0, 0.01, 4.15),
-    ('ac_emergency_v', 'AC charge emergency high V (hard cut)', 0, 5.0, 0.01, 4.30),
+    # ac_emergency_v 4.30->4.20V (user edit, 2026-08-03, docs/13 item 15.4) -
+    # matches charge_target_taper's regen-side emergency_high_v, set to the
+    # standard NMC charge ceiling exactly (docs/05's researched 4.20V).
+    ('ac_emergency_v', 'AC charge emergency high V (hard cut)', 0, 5.0, 0.01, 4.20),
     # Moved here from management_engine.py's charge_target_taper
     # (2026-08-01 split) - the AC daily/extended SoC target only ever
     # mattered while actually plugged in (gated on charge_permission_input).
     ('daily_target_pct', 'Daily target % (SoC stop point)', 0, 100, 1, 80.0),
     ('extended_target_pct', 'Extended target % (SoC stop point)', 0, 100, 1, 100.0),
 ]
+# (lo, hi) numeric bounds per charge_emulation field, derived straight from
+# CHARGE_SLIDERS' own (lo, hi) columns (added 2026-08-03, docs/13 items
+# 13.3/13.9) - shared by BOTH gui/panels.py's ChargeEmulationPanel (clamps
+# on every keystroke) and config_profile.py's profile-loading path (clamps
+# on every load), so a hand-edited or corrupted profile.json can't set an
+# AC-charger/regen threshold outside what the GUI itself would ever allow.
+CHARGE_EMULATION_BOUNDS = {k: (lo, hi) for k, _, lo, hi, _, _ in CHARGE_SLIDERS}
+
 # Live values for the three fields above are read from
 # SharedState.charge_emulation (seeded from these same defaults), not from
 # `leaf_state`/DEFAULTS - see bridge/state.py and RealtimeEngine's
@@ -371,11 +402,16 @@ def build_1db_startup(s, prun, t_ms):
     return bytes(b + [crc8(b)])
 
 
-def build_1dc(s, prun, uprate=0):
+def build_1dc(s, prun, uprate=0, code_1dc_override=None):
+    """code_1dc_override (added 2026-08-01, item 12.5): lets the caller
+    substitute a neutral (0,0,0) placeholder for the real CODE_1DC opaque
+    replay table when the GUI's 'code_1dc' Generated Signals checkbox is
+    unchecked - default None preserves the exact original verbatim
+    behavior, so nothing changes for the common case."""
     raw_d = int(round(s['discharge_limit_kw'] / 0.25)) & 0x3FF
     raw_c = int(round(s['charge_limit_kw'] / 0.25)) & 0x3FF
     raw_g = int(round((s['charger_limit_kw'] + 10) / 0.1)) & 0x3FF
-    c4, c5, c6 = CODE_1DC[prun]
+    c4, c5, c6 = code_1dc_override if code_1dc_override is not None else CODE_1DC[prun]
     b = [
         raw_d >> 2,
         ((raw_d & 3) << 6) | ((raw_c >> 4) & 0x3F),
@@ -419,11 +455,14 @@ def build_55b(s, prun, ir_raw=904, alu=0x55, refuse_sleep=0):
     return bytes(b + [crc8(b)])
 
 
-def build_5bc(s, n, gids_raw=None):
+def build_5bc(s, n, gids_raw=None, chg_time_override=None):
+    """chg_time_override (added 2026-08-01, item 12.5): same pattern as
+    build_1dc's code_1dc_override - a neutral (0,0,0) placeholder for the
+    'chg_time_5bc' checkbox, default None = original verbatim behavior."""
     gids = int(s['gids']) & 0x3FF if gids_raw is None else gids_raw
     toggle = 1 - ((n // 5) & 1)
     bars_raw = int(s['capacity_bars_raw']) & 0xF
-    b5, b6, b7 = CHG_TIME_5BC[n % 7]
+    b5, b6, b7 = chg_time_override if chg_time_override is not None else CHG_TIME_5BC[n % 7]
     return bytes([
         gids >> 2,
         (gids & 3) << 6,
@@ -454,10 +493,13 @@ def build_59e(s):
     ])
 
 
-def build_5c0(s, n):
+def build_5c0(s, n, hist_override=None):
+    """hist_override (added 2026-08-01, item 12.5): same pattern as
+    build_1dc's code_1dc_override - a neutral (0,0,0) placeholder for the
+    'hist_5c0' checkbox, default None = original verbatim behavior."""
     mux = (n % 6) + 1
     t = (int(s['batt_temp_c']) + 40) & 0x7F
-    b3, b4, b5 = HIST5C0[mux]
+    b3, b4, b5 = hist_override if hist_override is not None else HIST5C0[mux]
     return bytes([
         mux,
         t << 1,

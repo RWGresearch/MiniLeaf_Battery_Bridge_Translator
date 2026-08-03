@@ -19,6 +19,18 @@ COUNT_COL_W = 4
 
 _LEVEL_COLOR = {'hard': ERR, 'soft': '#ffa94d', 'warn': '#e0c341'}
 
+# Section grouping (2026-08-03, user request: "move 'monitor only' in to a
+# group, and 'soft cut' in to another, and 'Hard cut' in to another so its
+# eazy to tell what faults are going to do what to the system if anything") -
+# low-to-high severity top-to-bottom, matching the escalation order used
+# throughout docs/05 (warn -> soft -> hard).
+_TIER_ORDER = ('warn', 'soft', 'hard')
+_TIER_HEADING = {
+    'warn': 'Monitor Only - no cut',
+    'soft': 'Soft Cut',
+    'hard': 'Hard Cut',
+}
+
 FAULT_HISTORY_HELP = (
     "Fault History (moved to its own window 2026-07-31)\n\n"
     "Records every time a soft cut, hard cut, or monitor warning has actually "
@@ -89,6 +101,21 @@ class FaultHistoryWindow(tk.Toplevel):
         scroll = VScrollFrame(self)
         scroll.pack(fill='both', expand=True, padx=4, pady=(0, 8))
         self.fault_frame = scroll.inner
+
+        # One section per tier (2026-08-03, user request), built up front in
+        # severity order so dynamic clamp_ rows discovered later in _tick()
+        # land in the right section too.
+        self.tier_frames = {}
+        for level in _TIER_ORDER:
+            section = ttk.Frame(self.fault_frame)
+            section.pack(fill='x', pady=(0, 6))
+            heading = ttk.Label(section, text=_TIER_HEADING[level],
+                                 foreground=_LEVEL_COLOR[level], style='Accent.TLabel')
+            heading.pack(anchor='w', padx=2, pady=(2, 2))
+            rows = ttk.Frame(section)
+            rows.pack(fill='x')
+            self.tier_frames[level] = rows
+
         for key, label, level in FAULT_DEFINITIONS:
             self._build_fault_row(key, label, level)
 
@@ -108,7 +135,11 @@ class FaultHistoryWindow(tk.Toplevel):
         # (side='right') is packed before the expanding description label
         # so it reliably claims its space first, matching the standard Tk
         # pack idiom for a fixed-width trailing widget + one expanding one.
-        row = ttk.Frame(self.fault_frame, relief='groove', borderwidth=1)
+        # Grouped by tier (2026-08-03) - falls back to the 'warn' section for
+        # any unrecognized level rather than raising, since this is cosmetic
+        # grouping, not a correctness gate.
+        parent = self.tier_frames.get(level, self.tier_frames['warn'])
+        row = ttk.Frame(parent, relief='groove', borderwidth=1)
         row.pack(fill='x', pady=2, padx=2)
 
         light = tk.Canvas(row, width=LIGHT_D, height=LIGHT_D, bg=BG, highlightthickness=0)

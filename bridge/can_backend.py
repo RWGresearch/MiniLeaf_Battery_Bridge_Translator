@@ -198,12 +198,16 @@ class BusConnection:
             self.listen_only = listen_only
             self._want_connected = True
             self._start_worker_locked()
+            worker = self._worker
             if not self._monitor_thread or not self._monitor_thread.is_alive():
                 self._stop_monitor.clear()
                 self._monitor_thread = threading.Thread(
                     target=self._auto_reconnect_loop, daemon=True,
                     name=f'Reconnect-{self.label}')
                 self._monitor_thread.start()
+        # Connect-wait sleep + outcome log deliberately run OUTSIDE the lock
+        # (fixed 2026-08-01, item 12.3) - see _finish_worker_start().
+        self._finish_worker_start(worker)
 
     def disconnect(self):
         with self._lock:
@@ -216,20 +220,29 @@ class BusConnection:
 
     def _start_worker_locked(self):
         """Must be called with self._lock held (connect() and
-        _auto_reconnect_loop() both hold it around this call)."""
+        _auto_reconnect_loop() both hold it around this call). Only mutates
+        self._worker - deliberately does NOT sleep or log (fixed 2026-08-01,
+        item 12.3: this used to hold self._lock across a 150ms connect-wait
+        sleep and a log_fn call, which could stall any other thread needing
+        the lock - e.g. the GUI thread calling connected/error/send - for up
+        to 150ms during every connect/reconnect attempt). Callers must
+        follow up with _finish_worker_start() AFTER releasing the lock."""
         cls = DemoWorker if (self.demo or not CAN_AVAILABLE) else CanWorker
         self._worker = cls(self.channel, self.rx_queue, self.label,
                             listen_only=self.listen_only)
         self._worker.start()
-        # give the worker thread a moment to attempt the real connection
-        # before logging the outcome (CanWorker.run() connects synchronously
-        # at thread start, so a short wait is enough for the common case).
+
+    def _finish_worker_start(self, worker):
+        """Must be called WITHOUT self._lock held. Gives the worker thread a
+        moment to attempt the real connection before logging the outcome
+        (CanWorker.run() connects synchronously at thread start, so a short
+        wait is enough for the common case)."""
         time.sleep(0.15)
-        if self._worker.connected:
+        if worker.connected:
             self.log_fn(f'{self.label}: connected on {self.channel}'
                         + (' (listen only)' if self.listen_only else ''))
-        elif self._worker.error:
-            self.log_fn(f'{self.label}: connect failed on {self.channel} - {self._worker.error}')
+        elif worker.error:
+            self.log_fn(f'{self.label}: connect failed on {self.channel} - {worker.error}')
 
     def _auto_reconnect_loop(self):
         while True:
@@ -240,13 +253,20 @@ class BusConnection:
             # the root cause of both races this lock+wait rework fixes).
             if self._stop_monitor.wait(RECONNECT_INTERVAL_S):
                 return
+            worker = None
+            attempting = False
             with self._lock:
                 if not self._want_connected:
                     continue
                 if self._worker and not self._worker.connected and self._worker.error:
-                    self.log_fn(f'{self.label}: attempting reconnect on {self.channel}')
+                    attempting = True
                     self._start_worker_locked()
                     self.reconnect_count += 1
+                    worker = self._worker
+            if attempting:
+                self.log_fn(f'{self.label}: attempting reconnect on {self.channel}')
+            if worker is not None:
+                self._finish_worker_start(worker)
 
     def send(self, arb_id, data, extended=False):
         with self._lock:
