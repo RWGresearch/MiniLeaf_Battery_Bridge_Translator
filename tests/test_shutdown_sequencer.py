@@ -113,6 +113,28 @@ def test_stopped_rearms_once_bus_genuinely_quiet():
     phase, _ = seq.tick(False)
     check('re-arms to waiting_for_wake once the bus has been GENUINELY quiet for the cooldown',
           phase == 'waiting_for_wake', f'phase={phase}')
+    check('a NATURAL re-arm (genuine wind-down completed, not a button press) sets '
+          'rearmed_naturally=True - added 2026-08-01, this is what is allowed to clear a '
+          'latched hard cut (see test_management_engine.py)',
+          seq.rearmed_naturally is True)
+
+
+# ── Bug fix, 2026-08-01: a MANUAL re-arm (Stop Bridge then Start Bridge) ────
+# must NOT be mistaken for a genuine car power-cycle - found by an
+# independent review pass: notify_session_start() originally fired on EVERY
+# waiting_for_wake -> startup transition, so simply toggling Stop/Start
+# Bridge while the car's VCM never lost power could silently clear a latched
+# emergency-tier hard cut. rearmed_naturally distinguishes the two cases. ──
+def test_manual_arm_does_not_mark_natural_rearm():
+    seq = ShutdownSequencer()
+    # Simulate having JUST come from a genuine natural re-arm (as the
+    # previous test confirms happens) - then the user manually stops and
+    # restarts the bridge.
+    seq.rearmed_naturally = True
+    seq.arm()
+    check('arm() (Start Bridge) always clears rearmed_naturally, even if the PREVIOUS '
+          'wake was natural - a fresh manual press must not inherit that status',
+          seq.rearmed_naturally is False)
 
 
 # ── charge_authorized: an unauthorized 0x1F2 request must not keep the ─────

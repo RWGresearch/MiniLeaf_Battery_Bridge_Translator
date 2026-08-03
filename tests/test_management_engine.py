@@ -123,7 +123,7 @@ def test_f5_soft_cut_persistence():
           out2.get('capacity_empty', 0) == 1, f"capacity_empty={out2.get('capacity_empty')}")
 
     eng2, rz2 = fresh()
-    base_inputs(rz2, cell_v=2.70)  # below the 2.80V emergency floor
+    base_inputs(rz2, cell_v=2.50)  # below the 2.60V emergency floor (2026-08-01 user edit, was 2.80V)
     out3 = eng2.apply(dict(leaf_signals.DEFAULTS), rz2)
     check('F5: emergency low-voltage hard cut fires INSTANTLY, no persistence delay',
           out3.get('relay_cut_request', 0) == 3, f"relay_cut_request={out3.get('relay_cut_request')}")
@@ -139,9 +139,11 @@ def test_f6_emergency_temp_tier():
           f"discharge_limit_kw={out['discharge_limit_kw']}, relay_cut_request={out.get('relay_cut_request')}")
 
     eng2, rz2 = fresh()
-    base_inputs(rz2, temp_max=150.0, temp_min=70.0)  # above the new 149F emergency tier
+    # 142.0F - just above the 141.8F/61C emergency tier (2026-08-01 user
+    # edit, was 149F/65C) - close to the real boundary, not just "clearly above"
+    base_inputs(rz2, temp_max=142.0, temp_min=70.0)
     out2 = eng2.apply(dict(leaf_signals.DEFAULTS), rz2)
-    check('F6: above the emergency_temp_f (149F), a genuine hard cut fires',
+    check('F6: above the emergency_temp_f (141.8F/61C), a genuine hard cut fires',
           out2.get('relay_cut_request', 0) == 3, f"relay_cut_request={out2.get('relay_cut_request')}")
 
 
@@ -193,7 +195,7 @@ def test_fault_log_records_low_voltage_soft_and_emergency():
 
 def test_fault_log_records_over_temp_emergency():
     eng, rz = fresh()
-    base_inputs(rz, temp_max=150.0, temp_min=70.0)  # above the 149F emergency tier
+    base_inputs(rz, temp_max=142.0, temp_min=70.0)  # above the 141.8F/61C emergency tier
     eng.apply(dict(leaf_signals.DEFAULTS), rz)
     check('an over-temperature emergency hard cut is recorded in the fault log',
           eng.fault_log.entries['over_temp_emergency']['count'] == 1,
@@ -202,7 +204,7 @@ def test_fault_log_records_over_temp_emergency():
 
 def test_fault_log_manual_reset_does_not_change_live_cut_decision():
     eng, rz = fresh()
-    base_inputs(rz, cell_v=2.70)  # below the emergency floor - hard cut fires every tick, instantaneous
+    base_inputs(rz, cell_v=2.50)  # below the 2.60V emergency floor - hard cut fires every tick, instantaneous
     out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
     check('hard cut is asserted while the condition is genuinely true',
           out.get('relay_cut_request', 0) == 3)
@@ -215,6 +217,108 @@ def test_fault_log_manual_reset_does_not_change_live_cut_decision():
           out2.get('relay_cut_request', 0) == 3, f"relay_cut_request={out2.get('relay_cut_request')}")
     check('the fault log immediately re-counts the still-active condition on the next tick',
           eng.fault_log.entries['low_voltage_emergency']['count'] == 1)
+
+
+# ── Added 2026-08-01: AC "charge target reached" contactor-drop path had
+# zero test coverage - a genuine hard safety action (full_charge_flag,
+# instant contactor drop per docs/03) force-set purely from crossing the
+# daily/extended AC SoC target WHILE actually plugged in and charging. ────
+def test_ac_charge_target_reached_sets_full_charge_flag():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=3.70, soc=85.0)  # above the 80% daily target
+    rz.update_input('charge_permission_input', 1.0)  # actually plugged in and charging
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('AC charge target reached (85% >= 80% daily target) while actually charging sets full_charge_flag',
+          out.get('full_charge_flag', 0) == 1, f"full_charge_flag={out.get('full_charge_flag')}")
+    check('charge_limit_kw is forced to 0.0 when the AC target is reached',
+          out.get('charge_limit_kw') == 0.0, f"charge_limit_kw={out.get('charge_limit_kw')}")
+    check('charger_limit_kw is forced to -10.0 (raw idle-stop value) when the AC target is reached',
+          out.get('charger_limit_kw') == -10.0, f"charger_limit_kw={out.get('charger_limit_kw')}")
+
+    # Same SoC but NOT actually charging must NOT set full_charge_flag - this
+    # exact scenario was a real safety bug, fixed 2026-07-31 (main.py rev 7).
+    eng2, rz2 = fresh()
+    base_inputs(rz2, cell_v=3.70, soc=85.0)  # charge_permission_input defaults to 0 via base_inputs
+    out2 = eng2.apply(dict(leaf_signals.DEFAULTS), rz2)
+    check('the same 85% SoC while NOT actually charging must NOT set full_charge_flag (e.g. driving)',
+          out2.get('full_charge_flag', 0) == 0, f"full_charge_flag={out2.get('full_charge_flag')}")
+
+
+# ── Added 2026-08-01: the overvoltage emergency hard-cut tiers (both the
+# regen-side charge_target_taper and the AC-side ac_charge_taper, split
+# 2026-08-01) previously had thin/indirect fault_log coverage - only
+# relay_cut_request was checked, never the fault_log entries themselves. ──
+def test_overvoltage_emergency_fault_log_entries():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=4.35)  # above both the regen and AC emergency thresholds (4.30V default)
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('overvoltage emergency hard cut fires', out.get('relay_cut_request', 0) == 3,
+          f"relay_cut_request={out.get('relay_cut_request')}")
+    check('regen overvoltage_emergency fault_log entry is active',
+          eng.fault_log.entries['overvoltage_emergency']['active'] is True,
+          eng.fault_log.entries.get('overvoltage_emergency'))
+    check('AC-charger ac_overvoltage_emergency fault_log entry is active',
+          eng.fault_log.entries['ac_overvoltage_emergency']['active'] is True,
+          eng.fault_log.entries.get('ac_overvoltage_emergency'))
+
+
+# ── Hard-cut latching (docs/12 finding F8, added 2026-08-01) ──────────────
+def test_hard_cut_latches_and_survives_recovery():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=2.50)  # below the 2.60V emergency floor
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('hard cut fires while the condition is genuinely true', out.get('relay_cut_request', 0) == 3)
+
+    rz2 = SharedState()
+    base_inputs(rz2, cell_v=3.70)  # condition fully recovers
+    out2 = eng.apply(dict(leaf_signals.DEFAULTS), rz2)
+    check('the hard cut STAYS asserted after the triggering condition recovers (latched, '
+          'not auto-cleared) - docs/12 finding F8',
+          out2.get('relay_cut_request', 0) == 3, f"relay_cut_request={out2.get('relay_cut_request')}")
+    check('the hard_cut_latch fault_log entry is active while latched',
+          eng.fault_log.entries['hard_cut_latch']['active'] is True)
+
+
+def test_hard_cut_latch_clears_on_notify_session_start():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=2.50)
+    eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('sanity: latched', eng._hard_latched is True)
+
+    eng.notify_session_start()
+    rz2 = SharedState()
+    base_inputs(rz2, cell_v=3.70)  # condition also recovered
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz2)
+    check('notify_session_start() clears the latch once the underlying condition has also recovered',
+          out.get('relay_cut_request', 0) == 0, f"relay_cut_request={out.get('relay_cut_request')}")
+
+
+def test_hard_cut_latch_clears_on_notify_charge_replug():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=2.50)
+    eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('sanity: latched', eng._hard_latched is True)
+
+    eng.notify_charge_replug()
+    rz2 = SharedState()
+    base_inputs(rz2, cell_v=3.70)
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz2)
+    check('notify_charge_replug() also clears the latch',
+          out.get('relay_cut_request', 0) == 0, f"relay_cut_request={out.get('relay_cut_request')}")
+
+
+def test_hard_cut_re_latches_immediately_if_condition_is_still_bad():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=2.50)
+    eng.apply(dict(leaf_signals.DEFAULTS), rz)
+
+    eng.notify_session_start()
+    rz2 = SharedState()
+    base_inputs(rz2, cell_v=2.50)  # condition is STILL genuinely bad
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz2)
+    check('a session start does NOT bypass a still-active condition - it re-latches immediately, '
+          'same as a fault_log manual reset against a still-true condition',
+          out.get('relay_cut_request', 0) == 3, f"relay_cut_request={out.get('relay_cut_request')}")
 
 
 if __name__ == '__main__':

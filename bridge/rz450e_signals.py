@@ -34,7 +34,16 @@ FAST_RAW_IDS = {ID_PACK_V, ID_CURRENT, ID_TEMP_MINMAX, ID_CELLS_A, ID_CELLS_B,
 DID_SOC = (0x1F, 0x5B)
 DID_CAPACITY = (0x1D, 0x3E)
 DID_PRIMARY_V_I = (0x1F, 0x9A)
-DID_POLL_INTERVAL_S = 5.0   # cycle through the 3 DIDs roughly every 5s each
+# Reworked 2026-08-01 (user directive): the old DID_POLL_INTERVAL_S slept a
+# flat 5.0s after EVERY request regardless of how fast the response actually
+# came back, so any one specific DID was really only re-polled every ~15s
+# (3 DIDs x 5s), not "roughly every 5s each" as the old name implied. Now:
+# wait up to DID_RESPONSE_TIMEOUT_S for a response, then move to the next
+# DID immediately - only a small DID_INTER_REQUEST_GAP_S pacing delay
+# between requests, so a fast response doesn't also cost a needless extra
+# wait, but the bus still isn't flooded with back-to-back requests.
+DID_RESPONSE_TIMEOUT_S = 5.0
+DID_INTER_REQUEST_GAP_S = 0.3
 
 
 def toyota_sum_checksum(arb_id, data):
@@ -295,3 +304,60 @@ def cell_voltage_keys():
 
 def temp_probe_keys():
     return [f'temp_{i:02d}' for i in range(1, 17)]
+
+
+# ── Input plausibility validation (added 2026-08-01, user directive) ──────
+# Deliberately generous physical-plausibility bounds - much wider than any
+# operating/safety threshold in bridge/management_engine.py - meant only to
+# reject obvious decode/bus garbage (a corrupted frame, a dropped byte) that
+# would otherwise silently become the BMS's live input. NOT a substitute for
+# the actual safety thresholds, and not meant to ever reject a real, if
+# extreme, physical reading a healthy sensor could produce.
+PLAUSIBLE_RANGES = {
+    'pack_v': (0.0, 500.0),
+    'cell_min': (0.50, 5.00),
+    'cell_max': (0.50, 5.00),
+    'current': (-210.0, 210.0),
+    'current_b': (-210.0, 210.0),
+    'temp_max': (-60.0, 250.0),
+    'temp_min': (-60.0, 250.0),
+    'soc_pct': (0.0, 100.0),
+    'capacity_pack1_ah': (0.0, 300.0),
+    'capacity_pack2_ah': (0.0, 300.0),
+    'capacity_pack3_ah': (0.0, 300.0),
+    'capacity_pack4_ah': (0.0, 300.0),
+    'primary_pack_v': (0.0, 500.0),
+    'primary_current_a': (-700.0, 700.0),
+}
+for _c in range(1, 97):
+    PLAUSIBLE_RANGES[f'cell_{_c:02d}'] = (0.50, 5.00)
+for _p in range(1, 17):
+    PLAUSIBLE_RANGES[f'temp_{_p:02d}'] = (-60.0, 250.0)
+del _c, _p
+
+
+def validate_inputs(mapping):
+    """Split a freshly-decoded {key: value} dict into (valid, rejected)
+    against PLAUSIBLE_RANGES above. A key with no registered range (e.g.
+    charge_permission_input, a 1-bit flag that can't be out of range by
+    construction) always passes through unchanged. `valid` is safe to hand
+    straight to SharedState.update_inputs(); `rejected` is for the caller to
+    log - a rejected key is simply never written, so it keeps aging under
+    whatever value (or None) it last had, and a signal that stays invalid
+    long enough gets caught by the now-comprehensive staleness watchdog
+    (bridge/management_engine.py) exactly like one that stopped arriving
+    altogether - this is the intended mechanism, not a gap: a single
+    rejected sample is quietly ignored, but sustained invalid data still
+    surfaces as a real fault after the watchdog's window elapses."""
+    valid, rejected = {}, {}
+    for key, value in mapping.items():
+        bounds = PLAUSIBLE_RANGES.get(key)
+        if bounds is None or value is None:
+            valid[key] = value
+            continue
+        lo, hi = bounds
+        if lo <= value <= hi:
+            valid[key] = value
+        else:
+            rejected[key] = value
+    return valid, rejected

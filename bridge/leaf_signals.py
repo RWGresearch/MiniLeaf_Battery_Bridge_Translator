@@ -110,11 +110,36 @@ ZE1_62_SLIDERS = [
 ]
 
 CHARGE_CHECKS = [
-    ('charge_emulate', 'Emulate charger request (0x1DC ramp)', 0),
+    # Default flipped 0->1 (user edit, 2026-08-01): "the charge option
+    # should be set to on as default."
+    ('charge_emulate', 'Emulate charger request (0x1DC ramp)', 1),
+    # AC-charger overvoltage taper enable (added 2026-08-01, split out of
+    # bridge/management_engine.py's charge_target_taper - see its
+    # default_config() comment). Default ON, matching this project's "ship
+    # enabled, not blank" philosophy (docs/05) for anything safety-relevant.
+    ('ac_taper_enabled', 'AC charger overvoltage taper enabled', 1),
+    # Moved here from management_engine.py's charge_target_taper
+    # (2026-08-01 split) - only ever mattered while actually plugged in, so
+    # it belongs with the rest of the charger-specific controls.
+    ('extended_mode', 'Extended mode active (road trip - charge to extended target)', 0),
 ]
 CHARGE_SLIDERS = [
     ('charge_target_kw', 'Charger ramp target (kW)', 0, 92.2, 0.1, 92.2),
     ('chg_uprate_level', 'Uprate level / ramp rate (0-7)', 0, 7, 1, 7),
+    # AC-charger-specific per-cell overvoltage taper (added 2026-08-01,
+    # split from management_engine.py's charge_target_taper - user
+    # directive: AC charging (~19A/0.09C) and regen (up to ~0.5C) are
+    # physically very different, so they get independently-tunable curves).
+    # Defaulted to the same starting values as the regen taper - not yet
+    # independently tuned, just no longer forced to share one curve.
+    ('ac_full_v', 'AC charge full power below (V/cell)', 0, 5.0, 0.01, 4.00),
+    ('ac_zero_v', 'AC charge zero power at/above (V/cell)', 0, 5.0, 0.01, 4.15),
+    ('ac_emergency_v', 'AC charge emergency high V (hard cut)', 0, 5.0, 0.01, 4.30),
+    # Moved here from management_engine.py's charge_target_taper
+    # (2026-08-01 split) - the AC daily/extended SoC target only ever
+    # mattered while actually plugged in (gated on charge_permission_input).
+    ('daily_target_pct', 'Daily target % (SoC stop point)', 0, 100, 1, 80.0),
+    ('extended_target_pct', 'Extended target % (SoC stop point)', 0, 100, 1, 100.0),
 ]
 # Live values for the three fields above are read from
 # SharedState.charge_emulation (seeded from these same defaults), not from

@@ -98,6 +98,20 @@ def default_ties():
                    name='temp_max (°F) -> batt_temp_c (°C)'),
         MappingTie(['capacity_pack1_ah'], 'soh_percent', 'soh_pct',
                    {'nameplate_ah': NAMEPLATE_CAPACITY_AH}),
+        # temp_segment_pct (0x5BC "Dash temperature segment (%)," docs/03) -
+        # added 2026-08-01. UNLIKE soc_correction/capacity_bars_raw above,
+        # this is NOT a real-hardware-confirmed formula - no capture exists
+        # yet correlating this field against the real dash display. Shipped
+        # as a provisional starting point only (so the field has SOME live
+        # driver instead of sitting on its static DEFAULTS value forever):
+        # linear map of temp_max over a 32-140F window (the pack's cold-
+        # block to discharge-hard-stop range, docs/05) to 0-100%. Treat as
+        # unconfirmed - see docs/10-open-questions.md, this project's
+        # confirmed-vs-unverified discipline applies here same as anywhere
+        # else. Remove/edit/replace freely once a real capture exists.
+        MappingTie(['temp_max'], 'linear', 'temp_segment_pct',
+                   {'scale': 100.0 / 108.0, 'offset': -32.0 * 100.0 / 108.0},
+                   name='temp_max -> temp_segment_pct (PROVISIONAL, not hardware-confirmed - see docs/10)'),
     ]
 
 

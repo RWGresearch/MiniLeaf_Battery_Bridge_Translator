@@ -218,10 +218,13 @@ def test_charger_limit_kw_safety_taper_applies_even_without_rz450e_interlock():
 
 
 def test_charger_limit_kw_proactive_taper_applies_without_interlock_too():
+    # charger_limit_kw is governed by ac_charge_taper (state.charge_emulation's
+    # ac_full_v/ac_zero_v, split out 2026-08-01 from the old combined
+    # charge_target_taper) - default window is 4.00-4.15V/cell.
     mgmt = ManagementEngine()
     rz = SharedState()
     for i in range(1, 97):
-        rz.update_input(f'cell_{i:02d}', 4.00)   # inside the 3.90-4.10V proactive taper window (~50%)
+        rz.update_input(f'cell_{i:02d}', 4.075)   # inside the 4.00-4.15V AC-charger taper window (~50%)
     rz.update_input('temp_max', 77.0)
     rz.update_input('current', 0.0)
     rz.update_input('charge_permission_input', 0.0)

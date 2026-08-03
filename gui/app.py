@@ -12,11 +12,12 @@ import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
 
 from bridge import config_profile
-from bridge.can_backend import BusConnection
+from bridge.can_backend import BITRATE, BusConnection
 from bridge.mapping_engine import MappingEngine
 from bridge.management_engine import ManagementEngine
 from bridge.realtime_engine import RealtimeEngine
 from bridge.state import SharedState
+from bridge.trc_log import TrcLogger
 from gui.dashboard import DashboardWindow
 from gui.fault_history_window import FaultHistoryWindow
 from gui.info_popup import help_btn
@@ -34,6 +35,12 @@ BRIDGE_STATUS_STYLE = {
     'winding_down': ('Bridge: winding down', ACC),
     'stopped': ('Bridge: stopped (re-arming)', ERR),
 }
+# Heartbeat staleness threshold (added 2026-08-01, user request) - generous
+# relative to _tx_loop's own ~1-20ms internal sleeps, so normal scheduling
+# jitter never false-triggers this, but a genuinely dead TX thread (an
+# uncaught exception inside _tx_loop) is caught within ~2s instead of
+# `phase` silently freezing at its last value forever with no warning.
+HEARTBEAT_STALE_S = 2.0
 
 
 class App(tk.Tk):
@@ -59,6 +66,7 @@ class App(tk.Tk):
         self.log_lines = collections.deque(maxlen=2000)
         self.dashboard = None
         self.fault_window = None
+        self.trc_logger = TrcLogger()
 
         self.state_model = SharedState()
         profile = config_profile.load_profile()
@@ -130,10 +138,48 @@ class App(tk.Tk):
         # full-width Log panel here.
         logf = ttk.LabelFrame(self, text='Log')
         logf.grid(row=1, column=0, sticky='ew', padx=2, pady=(0, 2))
+
+        # .trc capture controls (added 2026-08-01, user request: "can we add
+        # a data logger. must keep the .trc format.") - Start/Stop Log
+        # mirrors the reference RZ450e decode project's own button pattern;
+        # captures every RX/TX frame on BOTH buses into one PCAN-Explorer-
+        # compatible .trc file (bridge/trc_log.py).
+        trc_row = ttk.Frame(logf)
+        trc_row.pack(fill='x', padx=4, pady=(4, 0))
+        self.trc_log_btn = ttk.Button(trc_row, text='Start Log', command=self._toggle_trc_log)
+        self.trc_log_btn.pack(side='left')
+        self.trc_log_status = ttk.Label(trc_row, text='not logging', foreground=FG_DIM)
+        self.trc_log_status.pack(side='left', padx=(8, 0))
+
         self.logbox = scrolledtext.ScrolledText(
             logf, height=8, state='disabled', wrap='word', font=BASE_FONT,
             bg=FIELD, fg=OK, insertbackground=FG, relief='flat')
         self.logbox.pack(fill='x', expand=True, padx=4, pady=4)
+
+    def _toggle_trc_log(self):
+        if self.trc_logger.active:
+            self.trc_logger.stop()
+            self.rz_bus.trc_logger = None
+            self.leaf_bus.trc_logger = None
+            self.engine.trc_logger = None
+            self.trc_log_btn.configure(text='Start Log')
+            self.trc_log_status.configure(text='not logging', foreground=FG_DIM)
+            self.log('TRC capture stopped.')
+            return
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        path = filedialog.asksaveasfilename(
+            defaultextension='.trc', initialdir=config_profile.CONFIG_DIR,
+            filetypes=[('PCAN Trace', '*.trc'), ('All', '*.*')],
+            initialfile=f'minileaf_{ts}.trc')
+        if not path:
+            return
+        self.trc_logger.start(path, BITRATE)
+        self.rz_bus.trc_logger = self.trc_logger
+        self.leaf_bus.trc_logger = self.trc_logger
+        self.engine.trc_logger = self.trc_logger
+        self.trc_log_btn.configure(text='Stop Log')
+        self.trc_log_status.configure(text=f'logging: {path}', foreground=OK)
+        self.log(f'TRC capture started: {path}')
 
     # ── Left: RZ450e battery (inputs) ───────────────────────────────────
     def _build_left(self):
@@ -220,9 +266,9 @@ class App(tk.Tk):
         tabs.add(t_future, text='Future: Battery Requests')
 
         MappingPanel(t_map, self.state_model, self.mapping).pack(fill='both', expand=True)
-        ManagementPanel(t_mgmt, self.state_model, self.management).pack(fill='both', expand=True)
+        ManagementPanel(t_mgmt, self.state_model, self.management, log_fn=self.log).pack(fill='both', expand=True)
         GeneratedSignalsPanel(t_gen, self.state_model).pack(fill='both', expand=True)
-        ChargeEmulationPanel(t_charge, self.state_model).pack(fill='both', expand=True)
+        ChargeEmulationPanel(t_charge, self.state_model, log_fn=self.log).pack(fill='both', expand=True)
         FuturePlaceholderPanel(t_future).pack(fill='both', expand=True)
 
     # ── Right: Leaf emulator (outputs) ──────────────────────────────────
@@ -274,6 +320,15 @@ class App(tk.Tk):
             return
         phase = self.engine.sequencer.phase
         text, color = BRIDGE_STATUS_STYLE.get(phase, (f'Bridge: {phase}', FG_DIM))
+        # Heartbeat check (added 2026-08-01) - `phase` alone can't reveal a
+        # dead TX thread, since it's only ever advanced from inside
+        # _tx_loop itself; if that thread died, phase just freezes at its
+        # last value with nothing else to notice. Only checked once the
+        # loop has actually started ticking (last_tick_monotonic is None
+        # before the very first iteration).
+        last_tick = self.engine.last_tick_monotonic
+        if last_tick is not None and (time.monotonic() - last_tick) > HEARTBEAT_STALE_S:
+            text, color = 'Bridge: NOT RESPONDING (TX thread stalled)', ERR
         self.bridge_status_lbl.configure(text=text, foreground=color)
         self.after(400, self._refresh_bridge_status)
 
@@ -303,7 +358,18 @@ class App(tk.Tk):
         self.after(5000, self._autosave_loop)
 
     def _on_close(self):
+        if self.trc_logger.active:
+            self.trc_logger.stop()
         self.engine.stop()
+        # Cleanly disconnect both CAN adapters (added 2026-08-01) - the
+        # engine's RX/TX worker threads are daemon threads, so previously
+        # they were just killed by process exit rather than exiting their
+        # loop and running their own clean PCAN-shutdown path
+        # (bridge/can_backend.py's CanWorker.run() -> self._bus.shutdown()),
+        # which could leave the adapter's driver handle busy/locked until
+        # replug or a delay before the next launch.
+        self.rz_bus.disconnect()
+        self.leaf_bus.disconnect()
         config_profile.save_last_known_good(self.state_model)
         config_profile.save_fault_log(self.management)
         config_profile.save_profile(self.state_model, self.mapping, self.management)

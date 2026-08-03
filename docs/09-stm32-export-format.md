@@ -43,7 +43,9 @@ generic scripting, curated fixed structure" philosophy from `04-signal-mapping.m
 not an arbitrary expression tree.
 
 **This is now the actual output of `bridge/config_profile.py`** (milestone 1 is implemented), not
-just an illustrative sketch — real example, one tie + the current battery-management schema:
+just an illustrative sketch. Regenerated 2026-08-01 directly from `default_config()`/
+`SharedState().charge_emulation` (never hand-transcribed - see this doc's own changelog note below)
+- real example, one tie + the full current battery-management schema:
 
 ```jsonc
 {
@@ -55,30 +57,49 @@ just an illustrative sketch — real example, one tie + the current battery-mana
       "name": "current -> pack_current_a (SIGN INVERTED: RZ450e +discharge -> Leaf +charge)" }
   ],
   "management_features": {
-    "low_voltage_cutoff": {"enabled": true, "min_cell_v": 3.0, "min_soc_pct": 10.0, "emergency_low_v": 2.8},
-    "discharge_power_taper": {"enabled": true, "taper_start_v": 3.5, "taper_zero_v": 3.0,
+    "low_voltage_cutoff": {"enabled": true, "min_cell_v": 3.0, "min_soc_pct": 8.0,
+                           "emergency_low_v": 2.6, "soft_cut_persistence_s": 2.0},
+    "discharge_power_taper": {"enabled": true, "taper_start_v": 3.0, "taper_zero_v": 2.6,
                               "recovery_ramp_s": 3.0},
-    "charge_target_taper": {"enabled": true, "regen_full_v": 3.9, "regen_zero_v": 4.1,
-                            "emergency_high_v": 4.3, "daily_target_pct": 80.0,
-                            "extended_target_pct": 100.0, "extended_mode": false},
-    "over_temperature_derate": {"enabled": true, "charge_derate_start_f": 90.0, "charge_hard_stop_f": 113.0,
-                                "charge_low_block_f": 32.0, "discharge_derate_start_f": 131.0,
-                                "discharge_hard_stop_f": 140.0},
-    "staleness_watchdog": {"enabled": true, "soft_cut_s": 60.0, "hard_escalation_s": 5.0}
+    "charge_target_taper": {"enabled": true, "regen_full_v": 4.0, "regen_zero_v": 4.15,
+                            "emergency_high_v": 4.3, "recovery_ramp_s": 3.0},
+    "over_temperature_derate": {"enabled": true, "charge_derate_low_start_f": 50.0,
+                                "charge_low_block_f": 32.0, "charge_derate_start_f": 90.0,
+                                "charge_hard_stop_f": 113.0, "discharge_derate_start_f": 131.0,
+                                "discharge_hard_stop_f": 140.0, "emergency_temp_f": 141.8},
+    "cell_imbalance_monitor": {"enabled": true, "warn_delta_v": 0.1},
+    "overcurrent_monitor": {"enabled": true, "continuous_discharge_warn_a": 150.0,
+                            "continuous_charge_warn_a": 30.0, "persistence_s": 5.0},
+    "staleness_watchdog": {"enabled": true, "soft_cut_s": 60.0, "hard_escalation_s": 5.0},
+    "cell_data_cross_check": {"enabled": true, "max_delta_v": 0.15, "soft_cut_s": 60.0,
+                              "hard_escalation_s": 5.0}
   },
   "generated_signals": {"prun": true, "voltage_latch_toggle": true, "heartbeat_1c2": true,
-                        "code_1dc": true, "chg_time_5bc": true, "hist_5c0": true, "seq_5eb": true}
+                        "code_1dc": true, "chg_time_5bc": true, "hist_5c0": true, "seq_5eb": true},
+  "charge_emulation": {"charge_emulate": 1, "ac_taper_enabled": 1, "extended_mode": 0,
+                       "charge_target_kw": 92.2, "chg_uprate_level": 7,
+                       "ac_full_v": 4.0, "ac_zero_v": 4.15, "ac_emergency_v": 4.3,
+                       "daily_target_pct": 80.0, "extended_target_pct": 100.0}
 }
 ```
 
-Note `charge_target_taper` has **no SoC-gating field** (e.g. no `taper_start_pct`) — per the
-2026-07-31 correction in `05-battery-management-safety.md`, the taper is driven purely by
-continuous per-cell voltage (`regen_full_v`/`regen_zero_v`); `daily_target_pct`/`extended_target_pct`
-are only the separate SoC stop-point, not part of the taper ramp. Firmware must replicate that same
-separation, not re-introduce an SoC-gated taper. Also note `regen_full_v` (3.9V) is deliberately
-well below the pack's actual NMC ceiling (~4.2V) — this is a proactive design choice for a
-slow-responding VCM, not the cell's real safety limit; firmware inheriting this schema should keep
-that gap, not "tighten" it thinking it's overly conservative.
+**`charge_target_taper` vs. `charge_emulation`'s AC fields (split 2026-08-01)** — as of this split,
+`charge_target_taper` governs **only** `charge_limit_kw` (the regen/general-acceptance ceiling,
+active regardless of charging context); the AC-charger-specific taper (`charger_limit_kw`) and the
+daily/extended SoC target now live in `charge_emulation`'s `ac_full_v`/`ac_zero_v`/`ac_emergency_v`/
+`daily_target_pct`/`extended_target_pct`/`extended_mode` fields instead, alongside the pre-existing
+charger-ramp-emulation controls (`charge_target_kw`/`chg_uprate_level`) — regen (up to ~0.5C into
+the pack) and AC charging (~0.09C) are physically different enough to need independently-tunable
+curves. Firmware porting this schema must replicate BOTH as separate per-cell tapers driving their
+own respective Leaf output field, not recombine them into one. Neither has an SoC-gating field (e.g.
+no `taper_start_pct`) — both tapers are driven purely by continuous per-cell voltage;
+`daily_target_pct`/`extended_target_pct` are only the separate AC SoC stop-point, not part of either
+taper ramp. `regen_full_v`/`ac_full_v` are also both deliberately well below the pack's actual NMC
+ceiling (~4.2V) — a proactive design choice for a slow-responding VCM, not the cell's real safety
+limit; firmware inheriting this schema should keep that gap, not "tighten" it thinking it's overly
+conservative. `charge_target_taper` also carries the same fast-attack/slow-release hysteresis as
+`discharge_power_taper` (below) via its own `recovery_ramp_s` - stateful, not a pure function of
+instantaneous voltage.
 
 `discharge_power_taper` has the same proactive shape mirrored for the low end (full power at/above
 `taper_start_v`, zero at/below `taper_zero_v`) — **plus real runtime state**, not just a stateless
@@ -101,6 +122,15 @@ TX periods, watchdog timeouts) and startup/shutdown timing constants — current
 `bridge/leaf_signals.py` rather than represented as profile data, which is fine for the Python app
 but will need to be exposed here before a firmware codegen script can consume them without reading
 Python source.
+
+**Fixed-logic safety nets that are NOT profile data, added 2026-08-01, but still must be
+replicated in firmware** (same category as output clamping, which this doc already didn't cover
+explicitly): `bridge/rz450e_signals.py`'s `PLAUSIBLE_RANGES`/`validate_inputs()` (rejects a decoded
+value outside a generous physical-plausibility range before it ever reaches the BMS logic) and
+`bridge/management_engine.py`'s `_check_config_sanity()` (cross-field threshold-ordering check,
+e.g. an emergency tier typed less extreme than its own soft tier). Both are fixed Python constants/
+logic, not something the GUI edits or the profile exports today - firmware needs the same bounds/
+checks hardcoded, not derived from this schema.
 
 ## What this is NOT
 

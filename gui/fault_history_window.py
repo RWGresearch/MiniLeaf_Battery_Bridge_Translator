@@ -14,22 +14,29 @@ from gui.info_popup import help_btn
 from gui.theme import apply_style, VScrollFrame, BG, FIELD, FG, FG_DIM, ERR
 
 LIGHT_D = 12
-DESC_WRAP = 330
+DESC_WRAP = 300
+COUNT_COL_W = 4
 
 _LEVEL_COLOR = {'hard': ERR, 'soft': '#ffa94d', 'warn': '#e0c341'}
 
 FAULT_HISTORY_HELP = (
     "Fault History (moved to its own window 2026-07-31)\n\n"
     "Records every time a soft cut, hard cut, or monitor warning has actually "
-    "triggered - independent of whether it has since auto-cleared. Cuts still "
-    "auto-clear the instant their triggering reading recovers (kept as the "
-    "default behavior - see docs/06 section 5); this window just makes sure a "
-    "brief fault that trips and self-clears between checks doesn't go unnoticed.\n\n"
+    "triggered - independent of whether it has since auto-cleared. SOFT cuts and "
+    "warnings still auto-clear the instant their triggering reading recovers "
+    "(unchanged - see docs/06 section 5). HARD cuts now LATCH as of 2026-08-01 "
+    "(docs/12 finding F8): relay_cut_request/interlock stay asserted even after "
+    "the triggering reading recovers, until a fresh session start or charger "
+    "replug clears it - each individual hard-tier entry below (low_voltage_"
+    "emergency, overvoltage_emergency, etc.) still reflects its OWN instantaneous "
+    "trigger condition, so it can show 'cleared' even while the cut itself is "
+    "still latched - watch the separate 'hard_cut_latch' entry for whether the "
+    "vehicle is actually still cut off right now.\n\n"
     "The light on the left of each row shows its CURRENT state at a glance - lit "
     "solid in the fault's tier color (red = hard, orange = soft, yellow = warn) = "
     "active right now; a hollow ring (dark center, colored outline) = has happened "
     "before but is currently clear; plain grey = never happened this session.\n\n"
-    "The count below each description shows how many times it's triggered this "
+    "The count next to each light shows how many times it's triggered this "
     "session. 'Reset' clears that one entry's count/history - like clearing a "
     "stored code on a real BMS scan tool, it does NOT force a still-active "
     "condition to go away (that's driven by live sensor data every tick, "
@@ -47,10 +54,13 @@ class FaultHistoryWindow(tk.Toplevel):
         self.title('Fault History')
         # Tall and narrow (user request) - positioned just to the right of
         # whichever window opened it, rather than a hardcoded screen
-        # position that might not suit every monitor layout.
+        # position that might not suit every monitor layout. Widened
+        # 420->460 (2026-08-01, user request: "ever so slightly wider so
+        # everything fits cleanly") to fit the light+count+description+
+        # Reset all on one row - see _build_fault_row().
         x = master.winfo_x() + master.winfo_width() + 10
         y = master.winfo_y()
-        self.geometry(f'420x900+{x}+{y}')
+        self.geometry(f'460x900+{x}+{y}')
         self.management = management_engine
         self.fault_labels = {}   # fault key -> (light, circle, name_lbl, count_lbl, level)
         self._build()
@@ -90,28 +100,30 @@ class FaultHistoryWindow(tk.Toplevel):
         return c
 
     def _build_fault_row(self, key, label, level):
-        # Stacked two-line layout (light + description on top, count +
-        # Reset below) instead of the Dashboard's old single-line-per-row -
-        # gives the description room to wrap in a narrow window without
-        # forcing the count/button off to a cramped corner.
+        # Single-line layout (2026-08-01, user request: "move the counter
+        # in between the light icon and the text, then the reset can be on
+        # the same row also, all one line") - light, count, description,
+        # and Reset all packed into ONE row now, instead of the old stacked
+        # light+description / count+Reset two-line layout. The Reset button
+        # (side='right') is packed before the expanding description label
+        # so it reliably claims its space first, matching the standard Tk
+        # pack idiom for a fixed-width trailing widget + one expanding one.
         row = ttk.Frame(self.fault_frame, relief='groove', borderwidth=1)
-        row.pack(fill='x', pady=3, padx=2)
+        row.pack(fill='x', pady=2, padx=2)
 
-        top = ttk.Frame(row)
-        top.pack(fill='x', padx=4, pady=(4, 2))
-        light = tk.Canvas(top, width=LIGHT_D, height=LIGHT_D, bg=BG, highlightthickness=0)
+        light = tk.Canvas(row, width=LIGHT_D, height=LIGHT_D, bg=BG, highlightthickness=0)
         circle = light.create_oval(1, 1, LIGHT_D - 1, LIGHT_D - 1, fill=FG_DIM, outline=FG_DIM)
-        light.pack(side='left', padx=(0, 6))
-        name_lbl = ttk.Label(top, text=label, wraplength=DESC_WRAP, anchor='w',
-                              justify='left', foreground=FG)
-        name_lbl.pack(side='left', fill='x', expand=True)
+        light.pack(side='left', padx=(4, 6), pady=4)
 
-        bottom = ttk.Frame(row)
-        bottom.pack(fill='x', padx=(4 + LIGHT_D + 6, 4), pady=(0, 4))
-        count_lbl = ttk.Label(bottom, text='--', anchor='w', foreground=FG_DIM)
-        count_lbl.pack(side='left')
-        ttk.Button(bottom, text='Reset', style='Small.TButton', width=6,
-                   command=lambda k=key: self._reset(k)).pack(side='right')
+        count_lbl = ttk.Label(row, text='--', width=COUNT_COL_W, anchor='w', foreground=FG_DIM)
+        count_lbl.pack(side='left', padx=(0, 6), pady=4)
+
+        ttk.Button(row, text='Reset', style='Small.TButton', width=6,
+                   command=lambda k=key: self._reset(k)).pack(side='right', padx=(6, 4), pady=4)
+
+        name_lbl = ttk.Label(row, text=label, wraplength=DESC_WRAP, anchor='w',
+                              justify='left', foreground=FG)
+        name_lbl.pack(side='left', fill='x', expand=True, pady=4)
 
         self.fault_labels[key] = (light, circle, name_lbl, count_lbl, level)
 
@@ -136,7 +148,11 @@ class FaultHistoryWindow(tk.Toplevel):
             color = _LEVEL_COLOR.get(level, FG_DIM)
             if entry.get('active'):
                 light.itemconfig(circle, fill=color, outline=color)
-                count_lbl.configure(text=f'{count}x - ACTIVE', foreground=color)
+                # Shortened from "Nx - ACTIVE" (2026-08-01, one-line layout
+                # - the narrow inline count column no longer has room for
+                # the suffix; the lit light + colored count text already
+                # convey "active" together, matching the legend above).
+                count_lbl.configure(text=f'{count}x', foreground=color)
             elif count > 0:
                 light.itemconfig(circle, fill=FIELD, outline=color)
                 count_lbl.configure(text=f'{count}x', foreground=FG_DIM)

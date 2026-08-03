@@ -68,8 +68,9 @@ down/sleep instead of staying awake indefinitely just because the Leaf keeps ask
 replug is what produces a fresh `0x1F2` request in the first place. Like the rest of this bridge,
 this is computed fresh every tick (not a sticky latch) — see the open re-arm question below.
 
-The per-cell overvoltage taper (`05-battery-management-safety.md`'s `charge_target_taper`) still
-gets the final say over the ramped value every tick — it can reduce it further; it is never
+The per-cell overvoltage taper (`05-battery-management-safety.md`'s `ac_charge_taper` — split from
+`charge_target_taper` 2026-08-01, since `charge_target_taper` now governs only `charge_limit_kw`)
+still gets the final say over the ramped value every tick — it can reduce it further; it is never
 bypassed by this feature.
 
 ## Two cutoff tiers (drives the battery-management design in `05-battery-management-safety.md`)
@@ -79,18 +80,28 @@ bypassed by this feature.
   + start are pressed again with the flag cleared.
 - **`full_charge_flag`** (`0x1DB`) — instant charge stop + contactor drop. Unlike `capacity_empty`,
   clearing it does **not** by itself resume charging — the real car needs a physical replug. Set
-  from RZ450e-side inputs in two places now: `charge_target_taper`'s AC-target/SoC check
-  (`05-battery-management-safety.md`), and (added 2026-07-31) the charge-ramp emulation's
+  from RZ450e-side inputs in two places now: `ac_charge_taper`'s AC-target/SoC check
+  (`05-battery-management-safety.md` — moved here 2026-08-01, was `charge_target_taper`'s, see the
+  regen/AC-charger split note above), and (added 2026-07-31) the charge-ramp emulation's
   "Leaf wants to charge but RZ450e permission not granted" mismatch, above. Both are recomputed
-  fresh every tick rather than a true sticky latch — a genuine "needs a physical replug to clear"
-  re-arm rule is still an open question (see `10-open-questions.md`).
+  fresh every tick rather than a true sticky latch (this flag stays a SOFT cut, unaffected by the
+  hard-cut latching below) - a genuine "needs a physical replug to clear" re-arm rule is still an
+  open question (see `10-open-questions.md`).
 
 **Hard cut** — RED "service EV system, no power" dash message:
 - **`relay_cut_request`** (`0x1DB`) — nonzero triggers main relay cut + RED message. Self-resets
-  ~3 minutes after the car is powered off, not on next key-on.
-- **`interlock_connected`** (`0x1DB`, clearing it) — RED message appears **instantly**.
+  ~3 minutes after the car is powered off, not on next key-on. **This bridge's own hard cuts now
+  LATCH as of 2026-08-01** (docs/12 finding F8) - once asserted, `relay_cut_request` stays asserted
+  every tick even after the triggering reading recovers, until a fresh session start or charger
+  replug clears the latch (`05-battery-management-safety.md`) - a deliberate change from the
+  self-clearing-every-tick behavior every other bridge-driven flag on this page still has.
+- **`interlock_connected`** (`0x1DB`, clearing it) — RED message appears **instantly**. Also part
+  of the same latch as `relay_cut_request` above - both assert/clear together.
 - **`main_relay_on`** (`0x1DB`, clearing it) — also prevents contactor closure, but with a delay
-  before the RED message appears (different timing from interlock, otherwise similar effect).
+  before the RED message appears (different timing from interlock, otherwise similar effect). Not
+  currently driven by this bridge at all (always sends `1`) - see `docs/13-review-checklist-2026-
+  08-01.md`'s coverage-audit findings for whether this should also be wired into the hard-cut path
+  as a third layer of redundancy.
 
 Per user instruction (`05-battery-management-safety.md`): default to soft cut for routine
 protection, reserve hard cut for genuine emergencies and the staleness-watchdog fault.

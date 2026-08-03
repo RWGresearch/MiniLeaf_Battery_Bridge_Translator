@@ -37,7 +37,8 @@ LEVELS = ('warn', 'soft', 'hard')
 FAULT_DEFINITIONS = [
     ('low_voltage_emergency', 'Low-voltage EMERGENCY hard cut (per-cell)', 'hard'),
     ('low_voltage_soft', 'Low-voltage soft cut (capacity_empty)', 'soft'),
-    ('overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut (per-cell)', 'hard'),
+    ('overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut - regen (per-cell)', 'hard'),
+    ('ac_overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut - AC charger (per-cell)', 'hard'),
     ('over_temp_emergency', 'Over-temperature EMERGENCY hard cut (hottest probe)', 'hard'),
     ('charge_cold_block', 'Charge/regen blocked - coldest probe at/below freezing', 'warn'),
     ('discharge_temp_zero', 'Discharge power at zero - over-temperature', 'warn'),
@@ -47,6 +48,11 @@ FAULT_DEFINITIONS = [
     ('overcurrent_charge_warn', 'Overcurrent warning - charge/regen', 'warn'),
     ('staleness_soft', 'Staleness watchdog - soft cut (stale data)', 'soft'),
     ('staleness_hard', 'Staleness watchdog - hard cut escalation', 'hard'),
+    ('input_validation_reject', 'Input plausibility check rejected a value', 'warn'),
+    ('cell_data_mismatch', 'Cell data cross-check mismatch (per-cell vs 0x020 pack summary)', 'soft'),
+    ('cell_data_mismatch_hard', 'Cell data cross-check mismatch - hard cut escalation', 'hard'),
+    ('config_sanity', 'Battery-management config has an inverted/nonsensical threshold ordering', 'warn'),
+    ('hard_cut_latch', 'Hard cut LATCHED (relay_cut_request/interlock still asserted)', 'hard'),
 ]
 
 

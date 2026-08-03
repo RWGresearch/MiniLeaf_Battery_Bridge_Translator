@@ -129,12 +129,24 @@ One block per protection feature from `05-battery-management-safety.md`:
 - Threshold field(s), pre-filled with the researched defaults.
 - A live status label (soft/hard/ramp-factor text), refreshed continuously — same
   visual-confirmation principle as the mapping tab.
-- The charge-target-taper feature also exposes an "extended mode" checkbox (daily vs. road-trip
-  SoC target) — see `05`'s corrected per-cell-driven taper design.
+- **`charge_target_taper` is REGEN-ONLY as of 2026-08-01** (split from the old combined regen+AC-
+  charger taper — user directive: regen can push ~0.5C into the pack, AC charging only ~0.09C,
+  physically too different to share one curve). Drives only `charge_limit_kw`, and now has its own
+  "Recovery ramp (s)" field for fast-attack/slow-release hysteresis, same pattern as the discharge
+  taper below. The AC-charger-specific taper (`charger_limit_kw`), plus the daily/extended AC SoC
+  target and its "extended mode" checkbox, moved to the **Charge Emulation tab** — see below.
 - The discharge-power-taper feature (added 2026-07-31) exposes its own full-power/zero-power
   cell-voltage fields plus a "Recovery ramp (s)" field for its fast-attack/slow-release hysteresis
   — the status text shows both the instantaneous and the currently-applied (rate-limited) factor
   so the hysteresis itself is visually confirmable, not just the underlying curve.
+- **Hard cuts LATCH as of 2026-08-01** (docs/12 finding F8) — once `relay_cut_request`/`interlock`
+  assert, they stay asserted every tick even after the triggering reading recovers, until a fresh
+  session start or charger replug clears the latch (`ManagementEngine.notify_session_start()`/
+  `notify_charge_replug()`, called from `bridge/realtime_engine.py`). Soft cuts are unaffected and
+  keep auto-clearing. The Fault History window's `hard_cut_latch` entry (see that section below)
+  is the authoritative "is the vehicle still cut off right now" indicator — the individual hard-
+  tier fault entries each still reflect their own instantaneous trigger, which can show "cleared"
+  while the latch itself is still held.
 - **Cell voltage is the sole authoritative trigger for every cutoff (2026-07-31 fix)** —
   `low_voltage_cutoff`'s "Min SoC %" field is now explicitly labeled "backup check only, never acts
   alone" in the GUI, and its status text shows whether SoC agrees or disagrees with the
@@ -166,7 +178,8 @@ The charger-request ramp feature (`06-realtime-engine-and-watchdog.md` section 6
 signals-leaf.md`), ported from `Refrance/Leaf_BMS_Emulator` after the user asked whether it had
 been — it hadn't yet at the time. One block, same visual pattern as a `ManagementPanel` feature:
 
-- **"Emulate charger request" checkbox** (default off, opt-in) — its label states the dual-trigger
+- **"Emulate charger request" checkbox** (default **ON** as of 2026-08-01, was off/opt-in — user
+  directive: "the charge option should be set to on as default") — its label states the dual-trigger
   requirement directly ("requires both a real Leaf charge request AND RZ450e charge permission"),
   since that's the single most important thing to understand about this feature.
 - **"Charger ramp target (kW)"** (0-92.2) and **"Uprate level / ramp rate (0-7)"** — plain `Entry`
@@ -180,6 +193,16 @@ been — it hadn't yet at the time. One block, same visual pattern as a `Managem
 - **"?" help** — explains the dual-trigger requirement, the ramp math (0.0kW start, rate per uprate
   level), the stop-flag behavior on a permission mismatch, and that the per-cell overvoltage taper
   still gets the final say over the ramped value regardless.
+- **New 2026-08-01 — "AC charger overvoltage taper" section**, split out of Battery Management's
+  `charge_target_taper` (user directive: AC charging and regen are physically different enough to
+  need independently-tunable curves). Own enable checkbox (`ac_taper_enabled`, default on), its own
+  full-power/zero-power/emergency-high per-cell voltage fields (`ac_full_v`/`ac_zero_v`/
+  `ac_emergency_v`, same taper shape as the regen feature but drives `charger_limit_kw` instead of
+  `charge_limit_kw`), and its own live status label. Also moved here: "Daily target %"/"Extended
+  target %" (the AC SoC stop point) and the "Extended mode active" checkbox — both only ever
+  mattered while actually plugged in and charging (gated on `charge_permission_input`), so they
+  belong with the rest of the charger-specific controls rather than on the always-active Battery
+  Management tab.
 
 See the Dashboard section below for the *other* place this feature's live state is surfaced — a
 dedicated right-column section, since the two triggers driving it (the Leaf's own `0x1F2` request

@@ -1,4 +1,4 @@
-# REVISION: 30
+# REVISION: 32
 """MiniLeaf Battery Bridge Translator - entry point.
 
 Bridges a Lexus RZ450e HV battery to a Nissan Leaf's CAN bus: a configurable
@@ -13,8 +13,8 @@ GUI is plain tkinter/ttk (stdlib, no extra GUI dependency) - see gui/theme.py.
 """
 from gui.app import App
 
-REVISION = 30
-REV_DATE = '2026-07-31'
+REVISION = 32
+REV_DATE = '2026-08-01'
 
 # Rev 1: initial milestone-1 app - adapters, signal registries, mapping
 # engine, battery-management engine with researched defaults, real-time
@@ -864,6 +864,219 @@ REV_DATE = '2026-07-31'
 #   references), docs/11 (new verification row for the GUI additions). All 6
 #   test files (107 checks, unchanged - this was a GUI/docs-only follow-up,
 #   no bridge/ behavior changed) pass; full App() launch confirmed clean.
+#
+# Rev 31: implemented the user's full item-by-item response pass over
+#   docs/13-review-checklist-2026-08-01.md (the safety/redundancy review from
+#   the prior two sessions) - every "Your notes:" line in that doc turned
+#   into a concrete change below. Two numeric ambiguities were resolved via
+#   direct question before starting: over-temp emergency hard-cut -> 61C
+#   exactly (141.8F, was 149F/65C); low-voltage SoC backup -> single
+#   threshold lowered to 8% (was 10%), no second tier.
+#   (A) Staleness watchdog (bridge/management_engine.py, bridge/state.py) now
+#       covers EVERY registered input signal (all 96 cells, all 16 temp
+#       probes, every scalar - rz450e_signals.INPUT_SIGNAL_KEYS), not a
+#       hand-picked subset of 5 - closes docs/13 item 1.1 and docs/10 open
+#       question #2. New SharedState.ages_of() batches the freshness check
+#       into one lock acquisition instead of 100+ separate age_of() calls
+#       per tick. On soft cut, staleness now ALSO forces an explicit charge-
+#       stop (charge_limit_kw=0.0, charger_limit_kw=-10.0), scoped to this
+#       feature only - stale safety data must not just soft-cut, it must
+#       stop charging outright (user directive).
+#   (B) New rz450e_signals.PLAUSIBLE_RANGES/validate_inputs() (docs/13 item
+#       1.3): every decoded input is checked against a generous physical-
+#       plausibility range before reaching SharedState - a rejected value is
+#       simply not written (so it ages under its last-good value and the now
+#       comprehensive watchdog (A) catches sustained-invalid data after 60s,
+#       exactly the mechanism requested). New SharedState.note_rejected_
+#       input()/recent_rejections() and a fault_log entry (input_validation_
+#       reject) surface it. Wired into both the raw-CAN ingest loop and the
+#       DID poll loop via a new shared RealtimeEngine._ingest_validated()
+#       helper.
+#   (C) New cell_data_cross_check feature (management_engine.py) - the "0x020
+#       pack summary is a sanity cross-check against the per-cell array"
+#       behavior docs/02 and docs/04 already documented but that was never
+#       actually implemented (docs/13 item 1.2): compares worst_low/
+#       worst_high against cell_min/cell_max, same soft->hard escalation
+#       structure as the staleness watchdog (60s/+5s, independently
+#       tunable), logs a new fault_log entry (cell_data_mismatch) describing
+#       the actual delta.
+#   (D) bridge/can_backend.py: BusConnection gained a real lock protecting
+#       _worker/_want_connected/_monitor_thread across connect()/
+#       disconnect()/_auto_reconnect_loop() - fixes two real races found in
+#       the review (docs/13 items 3.1/3.2): a fast disconnect-then-reconnect
+#       could silently kill the auto-reconnect monitor for the rest of the
+#       session, and a concurrent reconnect could silently undo an explicit
+#       Disconnect click. _auto_reconnect_loop's flat 3s sleep replaced with
+#       an interruptible Event.wait() so disconnect() takes effect
+#       immediately instead of up to 3s late. New tx_ok/send_errors/
+#       reconnect_count health counters, surfaced as a TX-OK status light +
+#       reconnect/error counts on ConnectionsPanel (docs/13 item 2.1).
+#       gui/app.py's _on_close() now cleanly disconnects both buses instead
+#       of relying on daemon-thread teardown (docs/13 item 3.3).
+#   (E) RealtimeEngine.last_tick_monotonic heartbeat (docs/13 item 2.2) - a
+#       dead _tx_loop thread previously froze the phase label with no
+#       warning; gui/app.py now shows "Bridge: NOT RESPONDING" if the
+#       heartbeat goes stale, and gui/dashboard.py's output bars use real
+#       freshness instead of a hardcoded fresh=True.
+#   (F) DID poll cadence reworked (realtime_engine.py's _did_poll_loop,
+#       docs/13 item 2.3): waits up to 5.0s for each DID's response then
+#       moves on immediately (small 0.3s pacing gap) instead of always
+#       sleeping a flat 5.0s regardless of response time - the old behavior
+#       meant any one specific DID was really only re-polled every ~15s.
+#   (G) ManagementPanel threshold fields now clamp to registered (lo, hi)
+#       bounds with visual "invalid"/"clamped" feedback instead of silently
+#       swallowing bad input (docs/13 item 4.1), mirroring
+#       ChargeEmulationPanel's existing pattern. New management_engine.py
+#       _check_config_sanity() cross-field ordering check (e.g. an emergency
+#       tier typed less extreme than its own soft tier) protects a hand-
+#       edited profile.json too, logs a config_sanity fault_log warning.
+#   (H) LARGEST change: split the old combined charge_target_taper (which
+#       scaled both charge_limit_kw AND charger_limit_kw off one curve) into
+#       two independently-tunable features (docs/13 item 4.2, user
+#       directive: regen can push ~0.5C into the pack, AC charging only
+#       ~0.09C - physically too different to share one curve). charge_
+#       target_taper (Battery Management tab) now drives ONLY charge_
+#       limit_kw, values updated to 4.00/4.15/4.30V, and gained the same
+#       fast-attack/slow-release hysteresis discharge_power_taper already
+#       had (new recovery_ramp_s field). New ac_charge_taper config lives in
+#       state.charge_emulation (leaf_signals.py's CHARGE_SLIDERS/
+#       CHARGE_CHECKS gained ac_full_v/ac_zero_v/ac_emergency_v/ac_taper_
+#       enabled/daily_target_pct/extended_target_pct/extended_mode) and
+#       drives ONLY charger_limit_kw + full_charge_flag/AC-target-reached,
+#       exposed on a new "AC charger overvoltage taper" section of the
+#       Charge Emulation tab. charge_emulate now defaults ON (was off, user
+#       directive). Every feature checkbox toggle (Battery Management AND
+#       Charge Emulation) now logs to the Log panel (docs/13 item 4.2's
+#       other ask).
+#   (I) Hard-cut latching (docs/12 finding F8, docs/13 item 5.1, user
+#       directive: "it should only reset after the car has been powered down
+#       and back on OR if the charger is unplugged and replugged"). New
+#       ManagementEngine._hard_latched: once a hard cut fires, relay_cut_
+#       request/interlock stay asserted every tick even after the triggering
+#       reading recovers, until notify_session_start() (RealtimeEngine calls
+#       it on a fresh waiting_for_wake->startup transition, the closest
+#       analog this bridge has to a power cycle) or notify_charge_replug()
+#       (called on a fresh 0x1F2 request following none) clears it. Scoped
+#       to hard cuts only - soft cuts keep auto-clearing, matching docs/12
+#       §8's own researched soft/hard distinction. No manual GUI unlatch.
+#   (J) gui/panels.py: mouse-wheel scrolling no longer silently changes a
+#       readonly Combobox's selection (new _no_wheel() helper, applied to
+#       every mapping/vehicle/channel dropdown - docs/13 item 4.3, user
+#       report of accidental changes while scrolling). New provisional
+#       (explicitly NOT hardware-confirmed, unlike soc_correction/
+#       capacity_bars_raw) default tie for temp_segment_pct, which
+#       previously had no live driver at all - new docs/10 open question
+#       #13. Full output-signal coverage audit done (every leaf_signals.
+#       OUTPUT_SIGNALS key checked for a live driver) - findings appended to
+#       the bottom of docs/13 rather than silently fixed, per the user's
+#       request to review them one at a time.
+#   (K) docs/09's STM32 export example JSON regenerated directly from
+#       default_config()/charge_emulation (was stale, missing several
+#       fields) plus a new section on the charge_target_taper/ac_charge_
+#       taper split. docs/05 and docs/10 now state the "missing interlock
+#       signal fails safe to not-permitted" behavior as an explicit,
+#       deliberate policy (was previously correct in code but only as an
+#       emergent side effect) and clarify it's a different concern from the
+#       already-completed charge-ramp dual-trigger requirement (docs/13 item
+#       Part 10 #4 - the user's notes suggested these were being conflated).
+#   (L) Partial shared-state locking cleanup (docs/13 item 5.4) - new locked
+#       SharedState.snapshot_management_status()/set_management_status()/
+#       snapshot_vehicle()/set_vehicle_item(), applied to every touch point.
+#       generated_enabled/charge_emulation and ManagementEngine.config/
+#       status deliberately NOT retrofitted this pass - the user's own note
+#       flagged that how this should work on the future STM32 port (a
+#       standalone system, not a live Python object graph) is still an open
+#       architecture question; documented as a scope decision, not silently
+#       dropped.
+#   (M) New tests: AC charge-target-reached contactor-drop path (previously
+#       zero coverage), both overvoltage-emergency fault_log entries (regen
+#       and the new AC tier), manual_reset against an already-auto-cleared
+#       soft entry (tests/test_management_engine.py, tests/test_fault_log.
+#       py). New docs/14-validation-test-plan.md gathers every remaining
+#       "needs a test"/"needs real hardware" item from docs/13 and this
+#       session (boundary-value sweeps, every newly-changed threshold
+#       pending real-hardware confirmation, the new features' test gaps)
+#       into one working checklist instead of scattered across review notes.
+#   (N) New bridge/trc_log.py - PCAN-Explorer-compatible .trc capture, ported
+#       (not re-derived) from Refrance/RZ450e_battery_can_decode_Project's
+#       own confirmed trc_write_header/trc_format_row. New Start Log/Stop
+#       Log button on the main window (user request: "can we add a data
+#       logger. must keep the .trc format.") captures every RX/TX frame on
+#       both buses (rz450e -> bus 1, leaf -> bus 2) into one file - RX logged
+#       from the ingest loops, TX logged from BusConnection.send()'s single
+#       choke point (covers the Leaf TX loop and RZ450e DID requests alike).
+#       Verified directly: a captured session's rows round-trip through
+#       read_trc_rows() correctly.
+#   All 6 test files (119 checks, up from 107) pass; full App() launch
+#   confirmed clean after every package.
+#
+#   POST-IMPLEMENTATION REVIEW (same session): ran 4 parallel fresh review
+#   passes specifically hunting for anything missed or newly introduced by
+#   (A)-(N) above - the regen/AC-charger split, interactions between the new
+#   safety checks, the new locking code, and a fresh-eyes sweep of
+#   everything else. Found and fixed one real, high-severity bug plus
+#   several smaller correctness/documentation gaps:
+#   - **SAFETY BUG FOUND AND FIXED**: the new hard-cut latch (I) could be
+#     spuriously cleared just by pressing Stop Bridge then Start Bridge,
+#     with no relation to an actual car power-cycle - `notify_session_start()`
+#     originally fired on EVERY `waiting_for_wake -> startup` transition,
+#     but a manual Stop/Start Bridge toggle produces that exact same
+#     transition without the car's VCM ever having lost power (very likely,
+#     since the user never touched the ignition). This directly defeated
+#     the latch's whole purpose. Fixed: new `ShutdownSequencer.
+#     rearmed_naturally` flag distinguishes a NATURAL re-arm (the sequencer
+#     itself completed a real wind-down - `'stopped' -> 'waiting_for_wake'`)
+#     from a MANUAL one (`arm()`, i.e. Start Bridge) - only a natural re-arm
+#     is close enough to "the car being powered down and back on" to clear
+#     the latch. 4 new tests confirm this directly (tests/
+#     test_shutdown_sequencer.py, tests/test_management_engine.py).
+#   - **Fault History window would have shown "all clear" during an active
+#     latched cut** - every hard-tier fault_log entry (low_voltage_
+#     emergency, overvoltage_emergency, etc.) correctly still reflects its
+#     OWN instantaneous trigger (by design - useful "did this specific
+#     thing recur" info), but none of them reflected that the CUT ITSELF
+#     stays latched after its trigger recovers. Fixed: new dedicated
+#     `hard_cut_latch` fault_log entry, always live, showing whether the
+#     vehicle is actually still cut off right now. `gui/fault_history_
+#     window.py`'s help text corrected (previously claimed all cuts still
+#     auto-clear, no longer true for hard cuts).
+#   - Stale comments/docstrings pointing at the OLD combined charge_target_
+#     taper for behavior that now lives in the new ac_charge_taper, found
+#     across bridge/management_engine.py, bridge/realtime_engine.py,
+#     docs/03, and docs/08 (which also still described "Emulate charger
+#     request" as off-by-default and never mentioned the new AC-charger
+#     taper section at all) - all corrected.
+#   - Two lower-severity items deliberately NOT fixed this pass, documented
+#     instead (appended to docs/13-review-checklist-2026-08-01.md for the
+#     next iteration): `BusConnection._start_worker_locked()` holds its lock
+#     across a 150ms sleep + log call (latency, not corruption - could
+#     stall the GUI thread or delay a TX send by up to 150ms during a
+#     reconnect); and the reconnect-race fix from this session narrowed its
+#     TOCTOU window from ~3s to microseconds but didn't perfectly eliminate
+#     it.
+#   All 6 test files (129 checks, up from 107 pre-session / 119 before this
+#   fix) pass; full App() launch confirmed clean. Findings appended to the
+#   bottom of docs/13-review-checklist-2026-08-01.md per the user's explicit
+#   iterate-until-nothing-is-missed loop - round 2 starts whenever the user
+#   works through those.
+#
+# Rev 32: Fault History window layout follow-up (gui/fault_history_window.py,
+#   user request: "make it ever so slightly wider so everything fits on the
+#   screen cleanly by moving the counter in between the light icon and the
+#   text. then the reset can be on the same row also. all one line"). Each
+#   row was light+description stacked above count+Reset - now light, count,
+#   description, and Reset are all packed into ONE row (`_build_fault_row`).
+#   Window widened 420->460 to fit the combined row; DESC_WRAP narrowed
+#   330->300 to give the count/Reset their own space in the now-shared row.
+#   Active-state count text shortened from "Nx - ACTIVE" to just "Nx" (the
+#   narrow inline count column, width=4 chars, has no room for the suffix -
+#   the lit light + colored count together already convey "active," matching
+#   the legend above). FAULT_HISTORY_HELP's "count below each description"
+#   line corrected to "count next to each light." Verified via a live
+#   App() smoke test: every row measures 433px of content within the 460px
+#   window (light at x=5, count at x=23, Reset at x=380-428, description
+#   filling x=57-374) with no overflow, and row height (29px) comfortably
+#   exceeds the label's actual text height (17px) - no clipping.
 
 if __name__ == '__main__':
     app = App()

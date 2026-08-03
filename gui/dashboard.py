@@ -350,11 +350,21 @@ class DashboardWindow(tk.Toplevel):
         if not self.winfo_exists():
             return
         tx = self.state_model.snapshot_leaf_tx()
+        # Output freshness (added 2026-08-01) - previously hardcoded
+        # fresh=True unconditionally, so a dead TX thread would leave the
+        # output bars looking perfectly normal forever. Mirrors gui/app.py's
+        # own heartbeat check (RealtimeEngine.last_tick_monotonic).
+        engine = getattr(self.master, 'engine', None)
+        last_tick = getattr(engine, 'last_tick_monotonic', None) if engine else None
+        tx_fresh = last_tick is not None and (time.monotonic() - last_tick) <= STALE_S
         for r in self.rows:
             out_v = tx.get(r['key'])
-            r['out_bar'].set(out_v, fresh=True)
-            r['out_lbl'].configure(text='no data' if out_v is None else f"{out_v:.3f}",
-                                    foreground=FG_DIM if out_v is None else FG)
+            r['out_bar'].set(out_v, fresh=tx_fresh)
+            if out_v is None:
+                r['out_lbl'].configure(text='no data', foreground=FG_DIM)
+            else:
+                r['out_lbl'].configure(text=f"{out_v:.3f}" + ('' if tx_fresh else ' (stale)'),
+                                        foreground=FG if tx_fresh else ERR)
             if r['in_key']:
                 in_v = self.state_model.get_input(r['in_key'])
                 age = self.state_model.age_of(r['in_key'])
@@ -419,7 +429,7 @@ class DashboardWindow(tk.Toplevel):
             status_fg = FG_DIM
         self.charge_labels['status'].configure(text=status_text, foreground=status_fg)
 
-        status = dict(self.state_model.management_status)
+        status = self.state_model.snapshot_management_status()
         for feature, text in status.items():
             if feature not in self.mgmt_labels:
                 row = ttk.Frame(self.mgmt_frame)

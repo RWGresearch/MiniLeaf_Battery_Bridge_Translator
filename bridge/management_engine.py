@@ -24,6 +24,65 @@ def _ramp_factor(value, floor, ceiling):
     return _clamp((value - floor) / (ceiling - floor), 0.0, 1.0)
 
 
+# Cross-field ordering sanity (docs/05, added 2026-08-01, user directive):
+# protects a hand-edited profile.json too, not just live GUI typing -
+# gui/panels.py's ManagementPanel separately clamps each field to its own
+# (lo, hi) numeric bounds, but can't catch a relationship BETWEEN two
+# fields (e.g. an emergency threshold typed less extreme than its own soft
+# tier). (feature, field_a, field_b, description) - checked as
+# cfg[feature][field_a] < cfg[feature][field_b].
+_CONFIG_SANITY_CHECKS = [
+    ('low_voltage_cutoff', 'emergency_low_v', 'min_cell_v',
+     'the emergency tier should be more extreme (lower) than the soft-cut tier'),
+    ('discharge_power_taper', 'taper_zero_v', 'taper_start_v',
+     'zero-power point should be below the full-power point'),
+    ('charge_target_taper', 'regen_full_v', 'regen_zero_v',
+     'full-power point should be below the zero-power point'),
+    ('charge_target_taper', 'regen_zero_v', 'emergency_high_v',
+     'the emergency tier should be more extreme (higher) than the zero-power point'),
+    ('over_temperature_derate', 'charge_low_block_f', 'charge_derate_low_start_f',
+     'the cold block point should be below the cold-derate-start point'),
+    ('over_temperature_derate', 'charge_derate_start_f', 'charge_hard_stop_f',
+     'the derate-start point should be below the hard-stop point'),
+    ('over_temperature_derate', 'discharge_derate_start_f', 'discharge_hard_stop_f',
+     'the derate-start point should be below the hard-stop point'),
+    ('over_temperature_derate', 'discharge_hard_stop_f', 'emergency_temp_f',
+     'the emergency tier should be more extreme (hotter) than the soft hard-stop point'),
+]
+
+
+_CHARGE_EMULATION_SANITY_CHECKS = [
+    ('ac_full_v', 'ac_zero_v', 'full-power point should be below the zero-power point'),
+    ('ac_zero_v', 'ac_emergency_v', 'the emergency tier should be more extreme (higher) than the zero-power point'),
+]
+
+
+def _check_config_sanity(cfg, charge_emulation=None):
+    """Returns a list of human-readable violation descriptions - does not
+    change or block anything itself; the engine keeps running with whatever
+    values are actually present (clamp_state() still protects the CAN bus
+    output either way). Surfaced as a fault_log warning, not a crash or a
+    silent misbehavior. `charge_emulation` (state.charge_emulation, added
+    2026-08-01) is checked too since the AC-charger taper's thresholds live
+    there, not in `cfg`, after the regen/AC-charger split."""
+    violations = []
+    for feature, field_a, field_b, desc in _CONFIG_SANITY_CHECKS:
+        fcfg = cfg.get(feature)
+        if not fcfg or field_a not in fcfg or field_b not in fcfg:
+            continue
+        a, b = fcfg[field_a], fcfg[field_b]
+        if not (a < b):
+            violations.append(f'{feature}.{field_a}={a:g} should be < {feature}.{field_b}={b:g} ({desc})')
+    if charge_emulation:
+        for field_a, field_b, desc in _CHARGE_EMULATION_SANITY_CHECKS:
+            if field_a in charge_emulation and field_b in charge_emulation:
+                a, b = charge_emulation[field_a], charge_emulation[field_b]
+                if not (a < b):
+                    violations.append(
+                        f'charge_emulation.{field_a}={a:g} should be < charge_emulation.{field_b}={b:g} ({desc})')
+    return violations
+
+
 def default_config():
     """Researched NMC/lithium-ion defaults, cross-checked against this
     pack's confirmed real-world range (docs/05). Shipped ENABLED, not
@@ -31,8 +90,14 @@ def default_config():
     editable and gets refined against real hardware over time."""
     return {
         'low_voltage_cutoff': {
-            'enabled': True, 'min_cell_v': 3.00, 'min_soc_pct': 10.0,
-            'emergency_low_v': 2.80,
+            # emergency_low_v 2.80->2.60V and min_soc_pct 10.0->8.0% (user
+            # edit, 2026-08-01, docs/13-review-checklist item Part 7): lower
+            # emergency threshold so it's less likely to trigger until the
+            # cell has truly reached a genuinely extreme low, and a lower
+            # SoC backup floor for consistency/redundancy alongside it (SoC
+            # remains a backup check only - never an independent trigger).
+            'enabled': True, 'min_cell_v': 3.00, 'min_soc_pct': 8.0,
+            'emergency_low_v': 2.60,
             # Persistence window (docs/12 finding F5, 2026-07-31): the soft
             # cut only latches once the min-cell condition has held
             # continuously for this many seconds - guards against a single-
@@ -56,7 +121,11 @@ def default_config():
             # min_cell_v soft-cut floor by default, so the ramp reaches zero
             # right as the soft cut engages - a smooth transition instead of
             # full-power-then-sudden-stop).
-            'taper_start_v': 3.50, 'taper_zero_v': 3.00,
+            # taper_start_v 3.50->3.00V and taper_zero_v 3.00->2.60V (user
+            # edit, 2026-08-01): re-anchored to the same 2.60V now used by
+            # low_voltage_cutoff's emergency tier, so the taper still
+            # reaches zero right around where the cutoff tiers sit.
+            'taper_start_v': 3.00, 'taper_zero_v': 2.60,
             # Hysteresis (user-specified): fast to respond to a dip (snap
             # down immediately - cell protection can't wait), slow to
             # recover back to full power once voltage comes back up (avoids
@@ -67,15 +136,31 @@ def default_config():
         },
         'charge_target_taper': {
             'enabled': True,
-            # Proactive regen/charge-acceptance curve (user-specified
-            # 2026-07-31): the VCM is slow to respond to a charge_limit_kw
-            # change, so the taper must start well before the danger zone,
-            # not right at its edge. Full power at/below regen_full_v, zero
-            # at/above regen_zero_v, linear between.
-            'regen_full_v': 3.90, 'regen_zero_v': 4.10,
+            # REGEN ONLY as of 2026-08-01 (user directive: "regen and AC
+            # charging is not the same... I can regen WAY more power than I
+            # can AC charge, so the parameters need to be split"). Drives
+            # ONLY charge_limit_kw ("Charge/regen power limit," docs/03) -
+            # the Leaf's shared ceiling for regenerative braking while
+            # driving AND general charge acceptance. The AC-charger-specific
+            # taper (charger_limit_kw) and the daily/extended AC SoC target
+            # both moved to state.charge_emulation / the Charge Emulation
+            # GUI tab - see this file's own `ac_charge_taper` block further
+            # down (NOT a RealtimeEngine method - it lives directly in
+            # ManagementEngine.apply(), same as this block) and
+            # leaf_signals.py's CHARGE_SLIDERS/CHARGE_CHECKS - since they
+            # only ever mattered while actually plugged in anyway.
+            #
+            # Proactive curve (user-specified, values updated 2026-08-01):
+            # the VCM is slow to respond to a charge_limit_kw change, so the
+            # taper must start well before the danger zone, not right at its
+            # edge. Full power at/below regen_full_v, zero at/above
+            # regen_zero_v, linear between.
+            'regen_full_v': 4.00, 'regen_zero_v': 4.15,
             'emergency_high_v': 4.30,
-            'daily_target_pct': 80.0, 'extended_target_pct': 100.0,
-            'extended_mode': False,
+            # Hysteresis (added 2026-08-01, user request: "regen we should
+            # add some hysteresis? same as discharge?") - same fast-attack/
+            # slow-release pattern as discharge_power_taper's recovery_ramp_s.
+            'recovery_ramp_s': 3.0,
         },
         'over_temperature_derate': {
             'enabled': True,
@@ -104,10 +189,12 @@ def default_config():
             # evaluated against the hottest probe - mirrors the two-tier
             # soft/emergency structure the voltage features already have.
             # Self-heating onset for a cell with any plated lithium can begin
-            # as low as ~60C (140F); 149F/65C leaves only a few degrees of
-            # margin above the 140F soft stop, deliberately thin because
-            # there's very little real margin above it in the chemistry.
-            'emergency_temp_f': 149.0,
+            # as low as ~60C (140F). Tightened 2026-08-01 (user edit) from
+            # 149F/65C to 141.8F/61C exactly - only ~1.8F/1C of margin above
+            # the 140F/60C soft stop, deliberately thinner than the original
+            # researched default because there's very little real margin
+            # above it in the chemistry to begin with.
+            'emergency_temp_f': 141.8,
         },
         'cell_imbalance_monitor': {
             # Monitor/warn-tier only (docs/12 finding F4, 2026-07-31) - never
@@ -119,7 +206,9 @@ def default_config():
             # cell early: a cell resting 30-50mV below its neighbors is the
             # classic early signature of elevated self-discharge / an
             # internal defect.
-            'enabled': True, 'warn_delta_v': 0.05,
+            # warn_delta_v 0.05->0.10V (user edit, 2026-08-01) - widened
+            # from the original researched 50mV starting point to 100mV.
+            'enabled': True, 'warn_delta_v': 0.10,
         },
         'overcurrent_monitor': {
             # Monitor/warn-tier only (docs/12 finding F2, 2026-07-31) - never
@@ -142,20 +231,71 @@ def default_config():
         'staleness_watchdog': {
             'enabled': True, 'soft_cut_s': 60.0, 'hard_escalation_s': 5.0,
         },
+        'cell_data_cross_check': {
+            # Live redundancy check between the per-cell array
+            # (authoritative) and the 0x020 pack-level cell_min/cell_max
+            # summary (added 2026-08-01, user directive). docs/02 and
+            # docs/04 both describe the pack summary as a "sanity cross-
+            # check" against the per-cell messages, but no comparison
+            # actually existed in code before this - cell_min/cell_max were
+            # only ever used as a complete fallback when the per-cell array
+            # was empty. Same soft-then-hard escalation STRUCTURE as the
+            # staleness watchdog ("just like the watchdog," per the user),
+            # independently tunable from it - same 60s/5s starting point.
+            'enabled': True, 'max_delta_v': 0.15, 'soft_cut_s': 60.0, 'hard_escalation_s': 5.0,
+        },
     }
 
 
 class ManagementEngine:
+    # NOTE (added 2026-08-01): `.config`/`.status` are read/written from both
+    # the GUI thread (gui/panels.py's ManagementPanel/ChargeEmulationPanel,
+    # on every keystroke) and the TX thread (apply(), every tick) with no
+    # lock of its own - same class of gap as bridge/state.py's
+    # `generated_enabled`/`charge_emulation` (see that file's comment).
+    # Individual dict item reads/writes remain safe under CPython's GIL;
+    # deliberately not retrofitted with a lock this pass, pending the same
+    # STM32-architecture discussion - see docs/13-review-checklist-2026-08-01.md.
     def __init__(self, config=None):
         self.config = config or default_config()
         self.status = {}
         self._stale_since = None
         self._discharge_factor_applied = 1.0
+        self._regen_factor_applied = 1.0
         self._last_apply_time = None
         self._low_v_condition_since = None
         self._overcurrent_since = None
         self._overcurrent_direction = None
+        self._cross_check_since = None
+        # Hard-cut latch (docs/12 finding F8, fixed 2026-08-01 per user
+        # directive: "it should only reset AFTER the car has been powered
+        # down and back on OR if the charger is unplugged and replugged").
+        # Previously every hard cut self-cleared the instant the triggering
+        # reading recovered - a brief emergency-level spike (voltage or
+        # temperature) would assert relay_cut_request/interlock for exactly
+        # one tick and clear itself the next, silently. Scoped to HARD cuts
+        # only, matching docs/12 §8's own researched distinction (emergency-
+        # tier faults latch; derate-tier/soft responses release
+        # automatically) - soft cuts (capacity_empty) keep auto-clearing.
+        # Cleared only via notify_session_start()/notify_charge_replug(),
+        # called by RealtimeEngine on the two real-world conditions above -
+        # no manual GUI "unlatch" control.
+        self._hard_latched = False
         self.fault_log = FaultLog()
+
+    def notify_session_start(self):
+        """Called by RealtimeEngine when the bridge begins a fresh session
+        (ShutdownSequencer transitions waiting_for_wake -> startup) - the
+        closest analog this bridge has to "the car being powered down and
+        back on." Clears a latched hard cut."""
+        self._hard_latched = False
+
+    def notify_charge_replug(self):
+        """Called by RealtimeEngine when a fresh charge request follows a
+        period with none active - a genuine unplug/replug. Clears a latched
+        hard cut (the other real-world condition, alongside a fresh session
+        start, that's allowed to)."""
+        self._hard_latched = False
 
     def apply(self, leaf_state, rz_state):
         """leaf_state: dict of Leaf output values already produced by
@@ -169,10 +309,12 @@ class ManagementEngine:
         dt = (now - self._last_apply_time) if self._last_apply_time is not None else 0.0
         self._last_apply_time = now
 
+        cell_min_raw = rz_state.get_input('cell_min')
+        cell_max_raw = rz_state.get_input('cell_max')
         cells = [rz_state.get_input(k) for k in rz450e_signals.cell_voltage_keys()]
         cells = [c for c in cells if c is not None]
-        worst_low = min(cells) if cells else rz_state.get_input('cell_min')
-        worst_high = max(cells) if cells else rz_state.get_input('cell_max')
+        worst_low = min(cells) if cells else cell_min_raw
+        worst_high = max(cells) if cells else cell_max_raw
         soc = rz_state.get_input('soc_pct')
         temp_max = rz_state.get_input('temp_max')
 
@@ -264,7 +406,55 @@ class ManagementEngine:
 
         f = cfg['charge_target_taper']
         if f['enabled']:
-            target = f['extended_target_pct'] if f.get('extended_mode') else f['daily_target_pct']
+            # REGEN ONLY (split 2026-08-01, see default_config()'s comment
+            # for the full rationale) - drives ONLY charge_limit_kw, the
+            # Leaf's shared "Charge/regen power limit" (docs/03), active
+            # regardless of SoC or charging context (regen happens while
+            # driving, not just plugged in). worst_high is the max of all 96
+            # individually read cell voltages, not a pack-level summary.
+            if worst_high is not None and worst_high >= f['emergency_high_v']:
+                hard_cut = True
+                self._regen_factor_applied = 0.0
+                cell_factor = 0.0
+                cell_status = f'EMERGENCY hard cut ({worst_high:.3f}V >= {f["emergency_high_v"]}V)'
+            else:
+                if worst_high is not None:
+                    instant_factor = 1.0 - _ramp_factor(worst_high, f['regen_full_v'], f['regen_zero_v'])
+                    cell_status = (
+                        f'proactive regen taper factor={instant_factor:.2f} (worst cell '
+                        f'{worst_high:.3f}V - full <= {f["regen_full_v"]}V, zero >= {f["regen_zero_v"]}V)')
+                else:
+                    instant_factor = 1.0
+                    cell_status = 'no per-cell voltage data yet - full power'
+                # Hysteresis (added 2026-08-01, user request: "regen we
+                # should add some hysteresis? same as discharge?") - same
+                # fast-attack/slow-release pattern as discharge_power_taper.
+                if instant_factor < self._regen_factor_applied:
+                    self._regen_factor_applied = instant_factor
+                elif instant_factor > self._regen_factor_applied:
+                    max_step = dt / max(f['recovery_ramp_s'], 1e-6)
+                    self._regen_factor_applied = min(instant_factor, self._regen_factor_applied + max_step)
+                cell_factor = self._regen_factor_applied
+
+            out['charge_limit_kw'] = out.get('charge_limit_kw', 0.0) * cell_factor
+            status['charge_target_taper'] = cell_status + f' | applied factor={cell_factor:.2f}'
+
+            self.fault_log.update('overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut - regen (per-cell)',
+                                  'hard', worst_high is not None and worst_high >= f['emergency_high_v'], cell_status)
+
+        # AC-charger taper (split out 2026-08-01 from the old combined
+        # charge_target_taper - see default_config()'s comment). Config
+        # lives in state.charge_emulation / the Charge Emulation GUI tab,
+        # not `cfg`, since it's specifically about the charger, not a
+        # general battery-management threshold - `rz_state` here IS the
+        # SharedState instance (RealtimeEngine passes self.state), so
+        # .charge_emulation is directly available. Drives ONLY
+        # charger_limit_kw ("Max power for charger," docs/03) and owns the
+        # daily/extended AC SoC target + full_charge_flag, both still gated
+        # on charge_permission_input (only ever mattered while plugged in).
+        ac_cfg = rz_state.charge_emulation
+        if ac_cfg.get('ac_taper_enabled', True):
+            target = ac_cfg['extended_target_pct'] if ac_cfg.get('extended_mode') else ac_cfg['daily_target_pct']
             # RZ450e's confirmed charging interlock (0x358) - the user's own
             # design intent for this signal ("if not active, a charge request
             # must not proceed", docs/02). None/missing is treated as NOT
@@ -272,74 +462,51 @@ class ManagementEngine:
             # actually confirm the context for).
             charging_active = bool(rz_state.get_input('charge_permission_input'))
 
-            # Per-cell taper on charge_limit_kw ("Charge/regen power limit",
-            # docs/03) is driven ONLY by individual cell voltage, continuously,
-            # regardless of SoC or charging context - charge_limit_kw is the
-            # Leaf's shared charge-acceptance ceiling, used by the VCM for
-            # regenerative braking while DRIVING just as much as for AC
-            # charging, so this always applies.
-            #
-            # PROACTIVE curve (user-specified 2026-07-31): the VCM is slow to
-            # respond to a charge_limit_kw change, so regen must start being
-            # backed off well before any cell is actually in danger, not at a
-            # narrow margin right on the ceiling - full power at/below
-            # regen_full_v (default 3.90V), zero at/above regen_zero_v
-            # (default 4.10V), linear between. worst_high is the max of all
-            # 96 individually read cell voltages, not a pack-level summary.
-            if worst_high is not None and worst_high >= f['emergency_high_v']:
+            if worst_high is not None and worst_high >= ac_cfg['ac_emergency_v']:
                 hard_cut = True
-                cell_factor = 0.0
-                cell_status = f'EMERGENCY hard cut ({worst_high:.3f}V >= {f["emergency_high_v"]}V)'
+                ac_factor = 0.0
+                ac_status = f'EMERGENCY hard cut ({worst_high:.3f}V >= {ac_cfg["ac_emergency_v"]}V)'
             elif worst_high is not None:
-                cell_factor = 1.0 - _ramp_factor(worst_high, f['regen_full_v'], f['regen_zero_v'])
-                cell_status = (
-                    f'proactive regen/charge taper factor={cell_factor:.2f} (worst cell '
-                    f'{worst_high:.3f}V - full <= {f["regen_full_v"]}V, zero >= {f["regen_zero_v"]}V)')
+                ac_factor = 1.0 - _ramp_factor(worst_high, ac_cfg['ac_full_v'], ac_cfg['ac_zero_v'])
+                ac_status = (
+                    f'AC charger taper factor={ac_factor:.2f} (worst cell {worst_high:.3f}V - '
+                    f'full <= {ac_cfg["ac_full_v"]}V, zero >= {ac_cfg["ac_zero_v"]}V)')
             else:
-                cell_factor = 1.0
-                cell_status = 'no per-cell voltage data yet - full power'
-            out['charge_limit_kw'] = out.get('charge_limit_kw', 0.0) * cell_factor
+                ac_factor = 1.0
+                ac_status = 'no per-cell voltage data yet - full power'
 
-            self.fault_log.update('overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut (per-cell)',
-                                  'hard', worst_high is not None and worst_high >= f['emergency_high_v'], cell_status)
+            # Applies UNCONDITIONALLY, same reasoning as the regen taper
+            # above (fixed 2026-07-31 alongside docs/06's charger-request
+            # ramp feature, preserved through the 2026-08-01 split): the
+            # charge-ramp emulation (RealtimeEngine._apply_charge_ramp) can
+            # raise charger_limit_kw whenever the Leaf-side 0x1F2 request is
+            # active, a different signal from the RZ450e-side interlock that
+            # can plausibly be out of sync with it - this per-cell safety
+            # taper must be authoritative regardless of which upstream logic
+            # set the value.
+            out['charger_limit_kw'] = out.get('charger_limit_kw', 0.0) * ac_factor
 
-            # charger_limit_kw's per-cell overvoltage taper applies
-            # UNCONDITIONALLY, same as charge_limit_kw above (fixed
-            # 2026-07-31 alongside docs/06's charger-request ramp feature):
-            # this used to only scale charger_limit_kw while `charging_active`
-            # (the RZ450e-side 0x358 interlock) was true, which was fine as
-            # long as nothing else ever raised charger_limit_kw outside that
-            # context - but the new charge-ramp emulation
-            # (RealtimeEngine._apply_charge_ramp) can now set it to a high
-            # value whenever the LEAF-side 0x1F2 charge request is active,
-            # which is a DIFFERENT signal from this RZ450e-side interlock and
-            # can plausibly be out of sync with it (e.g. on a bench setup).
-            # The per-cell safety taper must be authoritative over
-            # charger_limit_kw regardless of which upstream logic set it,
-            # exactly like charge_limit_kw already is - never conditionally
-            # skippable.
-            out['charger_limit_kw'] = out.get('charger_limit_kw', 0.0) * cell_factor
+            self.fault_log.update(
+                'ac_overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut - AC charger (per-cell)',
+                'hard', worst_high is not None and worst_high >= ac_cfg['ac_emergency_v'], ac_status)
 
             # full_charge_flag (instant charge-stop + HARD CONTACTOR DROP per
-            # docs/03) still only makes sense while actually plugged in and
-            # charging - SAFETY FIX (2026-07-31): this used to fire purely
-            # from SoC >= target with no charging-context check at all, which
-            # meant simply DRIVING above the target SoC (e.g. having charged
-            # to 85% overnight, then driving) would assert full_charge_flag
-            # and drop the real Leaf's main HV contactors mid-drive. Gated on
-            # the charging interlock so it can only fire during an actual
-            # charge session.
+            # docs/03) only makes sense while actually plugged in and
+            # charging - SAFETY FIX (2026-07-31, preserved through the
+            # 2026-08-01 split): gated on the charging interlock so it can
+            # only fire during an actual charge session, never from simply
+            # driving above the target SoC.
             if charging_active:
                 if soc is not None and soc >= target:
                     out['full_charge_flag'] = 1
                     out['charge_limit_kw'] = 0.0
                     out['charger_limit_kw'] = -10.0
-                    cell_status += f' | AC charge target {target:.0f}% reached - full_charge_flag set'
-                status['charge_target_taper'] = cell_status
+                    ac_status += f' | AC charge target {target:.0f}% reached - full_charge_flag set'
+                status['ac_charge_taper'] = ac_status
             else:
-                status['charge_target_taper'] = (
-                    cell_status + ' | not actively charging per RZ450e interlock (regen/charger-ramp '
-                    'ceiling still active; AC target/full_charge_flag gated off)')
+                status['ac_charge_taper'] = (
+                    ac_status + ' | not actively charging per RZ450e interlock (charger ceiling still '
+                    'active; AC target/full_charge_flag gated off)')
 
         f = cfg['over_temperature_derate']
         if f['enabled'] and temp_max is not None:
@@ -459,18 +626,91 @@ class ManagementEngine:
             self.fault_log.update('overcurrent_charge_warn', 'Overcurrent warning - charge/regen', 'warn',
                                   charge_warn_active, status['overcurrent_monitor'])
 
+        sanity_violations = _check_config_sanity(cfg, rz_state.charge_emulation)
+        status['config_sanity'] = 'ok' if not sanity_violations else '; '.join(sanity_violations)
+        self.fault_log.update(
+            'config_sanity', 'Battery-management config has an inverted/nonsensical threshold ordering',
+            'warn', bool(sanity_violations), status['config_sanity'])
+
+        # Input plausibility rejections (docs/05, added 2026-08-01) - always
+        # on, no enable flag, same "always-on safety net" philosophy as
+        # output clamping (docs/06 section 4). rz450e_signals.validate_
+        # inputs() already keeps a rejected value out of SharedState
+        # entirely (bridge/realtime_engine.py's _ingest_validated); this
+        # just surfaces it as a live fault_log entry rather than a silent
+        # drop, per the user's request to log the reason to the fault page.
+        recent_rejections = rz_state.recent_rejections()
+        if recent_rejections:
+            status['input_validation'] = 'REJECTED (implausible): ' + '; '.join(
+                f'{k}={v!r}' for k, v in recent_rejections.items())
+        else:
+            status['input_validation'] = 'ok'
+        self.fault_log.update('input_validation_reject', 'Input plausibility check rejected a value', 'warn',
+                              bool(recent_rejections), status['input_validation'])
+
+        f = cfg['cell_data_cross_check']
+        if f['enabled']:
+            cross_soft_active = False
+            cross_hard_active = False
+            if cells and cell_min_raw is not None and cell_max_raw is not None:
+                delta = max(abs(worst_low - cell_min_raw), abs(worst_high - cell_max_raw))
+                if delta >= f['max_delta_v']:
+                    if self._cross_check_since is None:
+                        self._cross_check_since = now
+                    held = now - self._cross_check_since
+                    if held >= f['soft_cut_s']:
+                        soft_cut = True
+                        cross_soft_active = True
+                        if held - f['soft_cut_s'] >= f['hard_escalation_s']:
+                            hard_cut = True
+                            cross_hard_active = True
+                            status['cell_data_cross_check'] = (
+                                f'MISMATCH {delta * 1000:.0f}mV vs 0x020 pack summary for {held:.0f}s - '
+                                f'escalated to HARD cut')
+                        else:
+                            status['cell_data_cross_check'] = (
+                                f'MISMATCH {delta * 1000:.0f}mV vs 0x020 pack summary for {held:.0f}s - soft cut')
+                    else:
+                        status['cell_data_cross_check'] = (
+                            f'mismatch {delta * 1000:.0f}mV present {held:.1f}s/{f["soft_cut_s"]:.0f}s before '
+                            f'soft cut latches')
+                else:
+                    self._cross_check_since = None
+                    status['cell_data_cross_check'] = f'ok (delta {delta * 1000:.0f}mV)'
+            else:
+                self._cross_check_since = None
+                status['cell_data_cross_check'] = 'no data to cross-check yet'
+
+            self.fault_log.update(
+                'cell_data_mismatch', 'Cell data cross-check mismatch (per-cell vs 0x020 pack summary)',
+                'soft', cross_soft_active, status['cell_data_cross_check'])
+            self.fault_log.update(
+                'cell_data_mismatch_hard', 'Cell data cross-check mismatch - hard cut escalation',
+                'hard', cross_hard_active, status['cell_data_cross_check'])
+
         f = cfg['staleness_watchdog']
         if f['enabled']:
-            ages = []
-            for key in ('pack_v', 'current', 'cell_min', 'cell_max', 'soc_pct'):
-                a = rz_state.age_of(key)
-                if a is not None:
-                    ages.append(a)
+            # Covers EVERY registered input signal (docs/06 section 3, user
+            # directive 2026-08-01) - all 96 per-cell voltages, all 16 temp
+            # probes, and every fast/slow scalar - not just a hand-picked
+            # subset. A key that has never been seen this session (age None)
+            # is excluded, same "never seen != stale" principle as before
+            # (docs/06 section 0) - only a key that WAS live and then stopped
+            # updating counts as stale. Batched into one lock acquisition
+            # (SharedState.ages_of) rather than 100+ separate age_of() calls
+            # per tick.
+            ages_by_key = rz_state.ages_of(rz450e_signals.INPUT_SIGNAL_KEYS)
+            worst_age = 0.0
+            worst_key = None
+            for key, a in ages_by_key.items():
+                if a is not None and a > worst_age:
+                    worst_age = a
+                    worst_key = key
             for ck in ('alive_3f1', 'alive_358', 'counter_5s'):
                 a = rz_state.counter_stale_age(ck)
-                if a is not None:
-                    ages.append(a)
-            worst_age = max(ages) if ages else 0.0
+                if a is not None and a > worst_age:
+                    worst_age = a
+                    worst_key = f'counter:{ck}'
             stale_soft_active = False
             stale_hard_active = False
             if worst_age >= f['soft_cut_s']:
@@ -478,15 +718,28 @@ class ManagementEngine:
                     self._stale_since = time.monotonic()
                 soft_cut = True
                 stale_soft_active = True
+                # Stale safety-relevant input data must not just soft-cut -
+                # it must also stop charging outright (user directive
+                # 2026-08-01): we can no longer verify it's safe to keep
+                # accepting charge/regen if the data behind that decision is
+                # stale, so force an explicit charge-stop here rather than
+                # relying on capacity_empty alone. Scoped to THIS feature
+                # only (not every soft cut - e.g. a low-voltage soft cut
+                # should NOT block charging, which is exactly what a
+                # depleted pack needs).
+                out['charge_limit_kw'] = 0.0
+                out['charger_limit_kw'] = -10.0
                 if time.monotonic() - self._stale_since >= f['hard_escalation_s']:
                     hard_cut = True
                     stale_hard_active = True
-                    status['staleness_watchdog'] = f'STALE {worst_age:.0f}s - escalated to HARD cut'
+                    status['staleness_watchdog'] = (
+                        f'STALE {worst_age:.0f}s ({worst_key}) - escalated to HARD cut, charging stopped')
                 else:
-                    status['staleness_watchdog'] = f'STALE {worst_age:.0f}s - soft cut'
+                    status['staleness_watchdog'] = (
+                        f'STALE {worst_age:.0f}s ({worst_key}) - soft cut, charging stopped')
             else:
                 self._stale_since = None
-                status['staleness_watchdog'] = f'ok (worst age {worst_age:.1f}s)'
+                status['staleness_watchdog'] = f'ok (worst age {worst_age:.1f}s, {worst_key or "n/a"})'
 
             self.fault_log.update('staleness_soft', 'Staleness watchdog - soft cut (stale data)', 'soft',
                                   stale_soft_active, status['staleness_watchdog'])
@@ -495,9 +748,28 @@ class ManagementEngine:
 
         if soft_cut:
             out['capacity_empty'] = 1
+        # Latching (added 2026-08-01, see __init__'s comment): a hard cut
+        # THIS tick sets the latch; the latch, once set, keeps asserting the
+        # cut on every subsequent tick regardless of whether `hard_cut`
+        # itself goes back to False, until notify_session_start()/
+        # notify_charge_replug() clears it.
         if hard_cut:
+            self._hard_latched = True
+        if self._hard_latched:
             out['relay_cut_request'] = 3
             out['interlock'] = 0
+            status['hard_cut_latch'] = 'LATCHED - clears on a fresh session start or charger replug'
+        # Fault log entry for the LATCH itself (bug fix, 2026-08-01, found by
+        # an independent review pass): every individual hard-tier fault_log
+        # entry above (low_voltage_emergency, overvoltage_emergency, etc.)
+        # is intentionally still keyed on its own INSTANTANEOUS condition -
+        # that's genuinely useful ("did this specific trigger recur?") - but
+        # none of them reflect that the CUT ITSELF is still latched once its
+        # own trigger has recovered. Without this entry, the Fault History
+        # window would show every entry "cleared" while the vehicle is
+        # still hard-cut - actively misleading, not just incomplete.
+        self.fault_log.update('hard_cut_latch', 'Hard cut LATCHED (relay_cut_request/interlock still asserted)',
+                              'hard', self._hard_latched, status.get('hard_cut_latch', 'not latched'))
 
         self.status = status
         return out

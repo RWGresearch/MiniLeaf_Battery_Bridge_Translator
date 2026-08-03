@@ -94,6 +94,33 @@ def test_from_dict_handles_empty():
     check('from_dict({}) also returns an empty log', fl2.entries == {})
 
 
+# ── Added 2026-08-01: manual_reset against a SOFT/WARN-tier entry whose
+# condition has already auto-cleared - the scenario this module's own
+# docstring/comments emphasize as the primary design motivation ("a brief
+# fault could trip and self-clear entirely between GUI status polls, with no
+# record it ever happened"), but which every prior test exercised only
+# against an always-instantaneously-true HARD condition instead. ─────────────
+def test_manual_reset_on_already_auto_cleared_soft_entry():
+    fl = FaultLog()
+    fl.update('low_voltage_soft', 'Low-voltage soft cut', 'soft', True, 'active')
+    check('soft entry triggers once while active', fl.entries['low_voltage_soft']['count'] == 1)
+
+    fl.update('low_voltage_soft', 'Low-voltage soft cut', 'soft', False, 'cleared')
+    check('condition auto-clears on its own (no manual action yet): active False, count still 1',
+          fl.entries['low_voltage_soft']['active'] is False and fl.entries['low_voltage_soft']['count'] == 1,
+          fl.entries['low_voltage_soft'])
+
+    fl.manual_reset('low_voltage_soft')
+    check('manual reset zeroes the count for an entry that was ALREADY cleared before the reset',
+          fl.entries['low_voltage_soft']['count'] == 0)
+    check('manual reset does not resurrect an already-inactive entry as active',
+          fl.entries['low_voltage_soft']['active'] is False)
+
+    fl.update('low_voltage_soft', 'Low-voltage soft cut', 'soft', False, 'still cleared')
+    check('a condition that stays inactive after the reset does not re-trigger on the next tick',
+          fl.entries['low_voltage_soft']['count'] == 0)
+
+
 if __name__ == '__main__':
     for fn in [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]:
         fn()

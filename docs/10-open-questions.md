@@ -28,18 +28,27 @@
    now voltage-driven rather than SoC-driven, this is really a question of whether the *voltage*
    defaults (3.50V/3.00V) map to a GIDS range comfortably above 49/5, not a SoC-floor question
    anymore.
-4. **Whether the `charge_permission_input` interlock (`0x358`) needs a "no interlock present"
-   default behavior** — i.e. what should happen if this bridge is ever run without that specific
-   RZ450e signal wired up (e.g. an earlier hardware revision). Not expected to come up in the
-   current bench setup, but worth a documented default (likely: interlock defaults to "not
-   permitted" / fail-safe, not "permitted") before milestone 1 ships. **Partially answered in
-   practice as of 2026-07-31**: every place that reads this signal (`charge_target_taper`'s
-   `charging_active`, and the new charger-request ramp's `rz_authorized`/`charge_authorized`, `06-
-   realtime-engine-and-watchdog.md` section 6) already does `bool(rz_state.get_input(...))`, and
-   `SharedState.get_input()` returns `None` for a signal that's never arrived - so the fail-safe
-   "not permitted" default already holds for every code path touched so far. Not yet a documented,
-   deliberate project-wide policy, just an emergent consequence of the existing helper's behavior -
-   still worth writing down explicitly before milestone 1 ships.
+4. **RESOLVED 2026-08-01 — Whether the `charge_permission_input` interlock (`0x358`) needs a "no
+   interlock present" default behavior.** This question is specifically about ONE signal
+   (`charge_permission_input`) being physically absent/unwired entirely (e.g. an earlier hardware
+   revision with no wire run to that pin) - **not** the same thing as the charger-ramp emulation's
+   "dual-trigger" requirement (`06-realtime-engine-and-watchdog.md` section 6), which is a different,
+   already-completed feature about needing BOTH a real Leaf `0x1F2` request AND this signal being
+   actively granted before the ramp runs. Dual-trigger assumes the signal is present and asks
+   "is it granted right now?"; this question asks "what if the signal was never wired up at all?" -
+   two separate concerns, easy to conflate since they involve the same signal.
+   **Now a deliberate, written policy** (previously only an emergent side effect, per the note
+   below): if `charge_permission_input` has never arrived this session,
+   `SharedState.get_input('charge_permission_input')` returns `None`, and every place that reads it
+   (`bool(rz_state.get_input(...))` in `charge_target_taper`, `ac_charge_taper`, and the charger-
+   ramp's `rz_authorized`/`charge_authorized`) treats that as `False` - **fails safe to "not
+   permitted,"** never "permitted." This was already true in code as of 2026-07-31 (an emergent
+   consequence of `get_input()`'s behavior, not a deliberate check anyone wrote), and remains true
+   after the 2026-08-01 regen/AC-charger taper split - every new code path introduced in that split
+   (`ac_charge_taper`'s `charging_active`) uses the exact same pattern. Confirmed correct and
+   promoted to an explicit project policy rather than an incidental side effect: **a missing/unwired
+   `charge_permission_input` signal must always be treated as "charging not authorized," by design,
+   not by accident.**
 5. **Single combined RZ450e adapter — needs hardware confirmation, not just a software assumption.**
    Collapsing bus1/bus2 onto one PCAN connection (per the user's 2026-07-31 correction) assumes
    both logical buses are visible on the same physical CAN wire pair from the adapter's vantage
@@ -88,6 +97,14 @@
    sized against AC-charger-scale current (~19A), not DC-fast-charge-scale current (~430A). If DC
    fast charging is ever brought into this bridge's scope, every charge-side feature needs
    re-evaluating against that much higher current, not assumed to already cover it.
+13. **`temp_segment_pct` (0x5BC "Dash temperature segment (%)") has no real-hardware-confirmed
+    formula.** Added 2026-08-01 as part of a full audit of every Leaf output signal for whether it
+    has a live driver at all (`docs/13-review-checklist-2026-08-01.md`) - this field previously
+    sat on its static `DEFAULTS` value forever, with no mapping tie targeting it. Shipped a
+    provisional linear tie (`bridge/mapping_engine.py`'s `default_ties()`: `temp_max` scaled over a
+    32-140°F window to 0-100%) so it has *some* live driver, but unlike `soc_correction`/
+    `capacity_bars_raw` this has not been checked against a real dash display. Needs the same
+    real-hardware confirmation pass those two got before being trusted.
 
 ## Inherited from `Refrance/RZ450e_battery_can_decode_Project/`
 

@@ -12,6 +12,17 @@ off power, and when to let the Leaf's own VCM logic just do its thing.
 
 ## Design philosophy
 
+- **A missing/unwired interlock signal always fails safe to "not permitted," never "permitted."**
+  Deliberate, written policy as of 2026-08-01 (previously true in code but only as an emergent side
+  effect - see `10-open-questions.md` item 4 for the full history): `charge_permission_input`
+  (`0x358`) is read everywhere as `bool(rz_state.get_input(...))`, and `SharedState.get_input()`
+  returns `None` for a signal that's never arrived this session - `bool(None)` is `False`, so no
+  charge-permission-gated behavior (`charge_target_taper`, `ac_charge_taper`, the charger-ramp
+  emulation) can ever fire from a hardware revision that simply never wired this signal up. This is
+  a separate concern from the charger-ramp's own "dual-trigger" requirement (needing this signal
+  granted AND a real Leaf request) - that one assumes the signal exists and asks whether it's
+  currently active; this one covers the signal not existing at all.
+
 - **Curated, named features — not a generic rule engine.** Each protection feature below has its
   own specific config fields (enable flag, source signal(s), threshold(s)). This matches the
   mapping engine's "fixed preset list" design (`04-signal-mapping.md`) and keeps every feature

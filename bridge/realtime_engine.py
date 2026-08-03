@@ -50,11 +50,34 @@ class ShutdownSequencer:
         self._chg_end_since = None
         self._chg_stall_since = None
         self._manual_shutdown_requested = False
+        # Bug fix, 2026-08-01: distinguishes a NATURAL re-arm (the sequencer
+        # itself detected a genuine wind-down - ignition-off, staleness, or
+        # manual "Simulate power-down" - completed, and the bus went quiet
+        # and woke up again) from a MANUAL re-arm (the user simply pressed
+        # Stop Bridge then Start Bridge, restarting this bridge's software
+        # with no requirement the car ever actually lost power). Only a
+        # natural re-arm is close enough to "the car being powered down and
+        # back on" to be allowed to clear a latched hard cut
+        # (ManagementEngine.notify_session_start(), called from
+        # RealtimeEngine on a waiting_for_wake -> startup transition) -
+        # found by an independent review pass: the bridge originally called
+        # notify_session_start() on EVERY such transition, so simply
+        # toggling Stop/Start Bridge while the car's VCM was still powered
+        # on (never touching the ignition) silently cleared an emergency-
+        # tier latch with zero relation to the car being power-cycled.
+        self.rearmed_naturally = False
 
     def arm(self):
-        """Start Bridge pressed: begin waiting for real Leaf bus traffic."""
+        """Start Bridge pressed: begin waiting for real Leaf bus traffic.
+        Marks the upcoming wake as a MANUAL re-arm (bug fix, 2026-08-01 -
+        see `rearmed_naturally` below) - pressing Stop Bridge then Start
+        Bridge restarts this bridge's own software, not the car; the car's
+        VCM may never have actually lost power, so this must not be treated
+        as the "car powered down and back on" condition that's allowed to
+        clear a latched hard cut."""
         with self.lock:
             self.phase = 'waiting_for_wake'
+            self.rearmed_naturally = False
             self.ignition_last_seen = {}
             self.chg_last_frame_t = None
             self.chg_trans = None
@@ -238,6 +261,7 @@ class ShutdownSequencer:
                 quiet_for = 0.0 if self.last_leaf_rx_t is None else now - self.last_leaf_rx_t
                 if quiet_for >= leaf_signals.PWRDOWN_DEFAULT_COOLDOWN_S:
                     self.phase = 'waiting_for_wake'
+                    self.rearmed_naturally = True   # see __init__'s comment - this IS a genuine wind-down/re-wake
                     self.ignition_last_seen = {}
                     self.chg_seen_active = False
                 return self.phase, 0.0
@@ -275,7 +299,23 @@ class RealtimeEngine:
         self._chg_ramp_raw = None
         self._chg_ramp_last_t = None
         self._chg_uprate_current = 0
+        # Charge-replug edge detector (added 2026-08-01) - see
+        # _apply_charge_ramp()'s notify_charge_replug() call below.
+        self._prev_charge_active = False
+        # Heartbeat (added 2026-08-01, user request) - updated every _tx_loop
+        # iteration. sequencer.phase alone can't reveal a dead TX thread: if
+        # _tx_loop crashes, phase just freezes at its last value and the GUI
+        # would otherwise show "Bridge: running" forever with no warning.
+        # The GUI compares this against wall-clock time to detect a stalled
+        # loop instead of trusting phase alone.
+        self.last_tick_monotonic = None
         self.log_fn = lambda msg: None   # replaced by the GUI with the log panel's put()
+        # .trc capture (added 2026-08-01) - optional bridge.trc_log.TrcLogger,
+        # set by the GUI's Start Log button. RX frames are logged here
+        # (_ingest_rz_bus/_ingest_leaf_bus); TX frames are logged from
+        # bridge/can_backend.py's BusConnection.send() instead, since that's
+        # the single choke point for everything each bus actually transmits.
+        self.trc_logger = None
 
     def start(self):
         """Starts the always-on monitoring threads: RZ450e ingest (raw CAN +
@@ -337,6 +377,8 @@ class RealtimeEngine:
             if kind != 'rx':
                 continue
             arb_id, data = msg.arbitration_id, bytes(msg.data)
+            if self.trc_logger:
+                self.trc_logger.log_frame('rz450e', False, arb_id, len(data), data)
             if self.did_client.feed(arb_id, data):
                 continue
             if arb_id == rz450e_signals.ID_TICK_424:
@@ -357,7 +399,25 @@ class RealtimeEngine:
                 continue
             vals = rz450e_signals.decode_frame(arb_id, data)
             if vals:
-                self.state.update_inputs(vals)
+                self._ingest_validated(f'CAN 0x{arb_id:03X}', vals)
+
+    def _ingest_validated(self, source_label, vals):
+        """Plausibility-check a freshly-decoded {key: value} dict
+        (rz450e_signals.validate_inputs(), docs/05, added 2026-08-01) before
+        it ever reaches SharedState - shared by both the raw-CAN ingest loop
+        (source_label = 'CAN 0x...') and the DID poll loop below
+        (source_label = 'DID ...'), so validation applies uniformly to every
+        source, fast or slow. A rejection is logged and recorded via
+        note_rejected_input() so ManagementEngine.apply() can surface a
+        fault_log entry for it on the normal tick cycle."""
+        valid, rejected = rz450e_signals.validate_inputs(vals)
+        if valid:
+            self.state.update_inputs(valid)
+        if rejected:
+            for key, value in rejected.items():
+                self.state.note_rejected_input(key, value)
+            self.log_fn(f'REJECTED implausible input ({source_label}): ' +
+                        '; '.join(f'{k}={v!r}' for k, v in rejected.items()))
 
     def _ingest_leaf_bus(self):
         """Watches for real VCM traffic (ignition/charge-request IDs) for the
@@ -372,9 +432,20 @@ class RealtimeEngine:
                 continue
             if kind != 'rx':
                 continue
-            self.sequencer.note_leaf_rx(msg.arbitration_id, bytes(msg.data))
+            arb_id, data = msg.arbitration_id, bytes(msg.data)
+            if self.trc_logger:
+                self.trc_logger.log_frame('leaf', False, arb_id, len(data), data)
+            self.sequencer.note_leaf_rx(arb_id, data)
 
     def _did_poll_loop(self):
+        """Reworked 2026-08-01 (user directive): wait up to
+        DID_RESPONSE_TIMEOUT_S (5.0s) for each DID's response, then move to
+        the next one immediately once it arrives - rather than always
+        sleeping a flat 5.0s after every single request regardless of how
+        fast it actually answered (the old behavior meant any one specific
+        DID was really only re-polled every ~15s, not "every 5s" as it
+        looked). Only a small DID_INTER_REQUEST_GAP_S pacing delay between
+        requests, so the bus still isn't hit with back-to-back polls."""
         cycle = [
             (rz450e_signals.DID_SOC, rz450e_signals.decode_soc),
             (rz450e_signals.DID_CAPACITY, rz450e_signals.decode_capacity),
@@ -384,12 +455,12 @@ class RealtimeEngine:
         while self._running:
             did, decoder = cycle[idx % len(cycle)]
             idx += 1
-            resp = self.did_client.request(did)
+            resp = self.did_client.request(did, timeout=rz450e_signals.DID_RESPONSE_TIMEOUT_S)
             if resp:
                 vals = decoder(resp)
                 if vals:
-                    self.state.update_inputs(vals)
-            time.sleep(rz450e_signals.DID_POLL_INTERVAL_S)
+                    self._ingest_validated(f'DID 0x{did[0]:02X}{did[1]:02X}', vals)
+            time.sleep(rz450e_signals.DID_INTER_REQUEST_GAP_S)
 
     # ── TX side ──────────────────────────────────────────────────────────
     def _prun_tick_loop(self):
@@ -419,9 +490,10 @@ class RealtimeEngine:
         already in `leaf_state` - instead of just sending a static number,
         matching what a real onboard charger's own power-negotiation curve
         looks like on the bus. Runs BEFORE the management engine's own
-        per-cell overvoltage taper (`charge_target_taper`), so that safety
-        feature still gets the final say and can reduce the ramped value
-        further - it's never bypassed.
+        per-cell overvoltage taper (`ac_charge_taper`, split from
+        `charge_target_taper` 2026-08-01 - see management_engine.py), so
+        that safety feature still gets the final say and can reduce the
+        ramped value further - it's never bypassed.
 
         Requires BOTH the Leaf-side 0x1F2 request AND the RZ450e-side
         `charge_permission_input` interlock (user directive, 2026-07-31) -
@@ -442,6 +514,15 @@ class RealtimeEngine:
         chg_cfg = self.state.charge_emulation
         emulate_on = bool(chg_cfg.get('charge_emulate'))
         leaf_wants_charge = self.sequencer.charge_active(now)
+        # Charger replug detection (added 2026-08-01, docs/12 finding F8) -
+        # a fresh 0x1F2 request following a period with none active is what
+        # a genuine unplug/replug looks like on the bus (same reasoning
+        # already used elsewhere for full_charge_flag's own re-arm). Clears
+        # a latched hard cut - independent of whether "Emulate charger
+        # request" is even enabled, since a real replug happens regardless.
+        if leaf_wants_charge and not self._prev_charge_active:
+            self.management.notify_charge_replug()
+        self._prev_charge_active = leaf_wants_charge
         rz_authorized = bool(self.state.get_input('charge_permission_input'))
         active = emulate_on and leaf_wants_charge and rz_authorized
 
@@ -579,6 +660,7 @@ class RealtimeEngine:
         last_hard_cut = False
         while self._running:
             now = time.monotonic()
+            self.last_tick_monotonic = now
 
             # Bridge not started (idle) or armed but no real Leaf traffic
             # seen yet (waiting_for_wake): nothing to compose, nothing to
@@ -594,7 +676,7 @@ class RealtimeEngine:
 
             leaf_state = self._compose_leaf_state()
             self.state.set_leaf_tx_many(leaf_state)
-            self.state.management_status = dict(self.management.status)
+            self.state.set_management_status(self.management.status)
 
             hard_cut = leaf_state.get('relay_cut_request', 0) not in (0, None)
             soft_cut = bool(leaf_state.get('capacity_empty')) or bool(leaf_state.get('full_charge_flag'))
@@ -608,6 +690,20 @@ class RealtimeEngine:
             charge_authorized = bool(self.state.get_input('charge_permission_input'))
             phase, timing = self.sequencer.tick(hard_cut, charge_authorized)
             if phase != last_phase:
+                if phase == 'startup' and last_phase == 'waiting_for_wake' and self.sequencer.rearmed_naturally:
+                    # A waiting_for_wake -> startup transition following a
+                    # NATURAL re-arm (the sequencer itself completed a real
+                    # wind-down, not just a Stop/Start Bridge button press -
+                    # see ShutdownSequencer.rearmed_naturally) is the closest
+                    # analog this bridge has to "the car being powered down
+                    # and back on" (docs/12 finding F8, added 2026-08-01) -
+                    # clears a latched hard cut. Bug fixed 2026-08-01 (found
+                    # by an independent review pass): this originally fired
+                    # on EVERY such transition, including a bare Stop/Start
+                    # Bridge toggle with the car's VCM never having lost
+                    # power at all - silently clearing an emergency-tier
+                    # latch with no relation to an actual power cycle.
+                    self.management.notify_session_start()
                 self.log_fn(f'Sequencer phase: {last_phase} -> {phase}')
                 last_phase = phase
 
@@ -615,8 +711,8 @@ class RealtimeEngine:
                 time.sleep(0.02)
                 continue
 
-            active_ids = leaf_signals.hvbat_ids_for(
-                self.state.vehicle['battery_gen'], self.state.vehicle['battery_kwh'])
+            vehicle = self.state.snapshot_vehicle()
+            active_ids = leaf_signals.hvbat_ids_for(vehicle['battery_gen'], vehicle['battery_kwh'])
 
             for arb_id, period_ms in leaf_signals.TX_PERIOD_MS.items():
                 if arb_id not in active_ids:

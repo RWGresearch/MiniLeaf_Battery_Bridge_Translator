@@ -12,6 +12,20 @@ from gui.theme import VScrollFrame, BASE_FONT, FG, FIELD, FG_DIM, ERR, OK
 
 REFRESH_MS = 400
 
+
+def _no_wheel(combo):
+    """Prevent mouse-wheel scrolling from silently changing a readonly
+    Combobox's selection (added 2026-08-01, user report: "when I'm
+    scrolling with the wheel I have accidentally changed the inputs/
+    outputs... this data should only be valid if selected with a mouse
+    pointer and click"). An instance-level binding fires before both the
+    Combobox's own class binding (which changes the value on wheel scroll)
+    and VScrollFrame's page-scroll bind_all handler (gui/theme.py) - so
+    returning "break" here stops both; only an explicit click can change
+    the selection now."""
+    for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+        combo.bind(seq, lambda e: 'break')
+
 # ── Contextual help text, ported style from leaf_hvbat_emulator.py's HELP
 # dict / _help_btn pattern - every panel gets a '?' explaining what it does
 # and citing the doc it's grounded in, not just the mapping tab's live
@@ -120,6 +134,23 @@ CHARGE_EMULATION_HELP = (
     "Signal Mapping tab (or the DEFAULTS placeholder) already produces, as before "
     "this feature existed."
 )
+AC_CHARGE_TAPER_HELP = (
+    "AC charger overvoltage taper (docs/05, added 2026-08-01)\n\n"
+    "Split out of Battery Management's per-cell charge/regen taper (user "
+    "directive: AC charging via the Leaf's onboard charger, ~19A/0.09C, is "
+    "physically very different from regenerative braking, up to ~0.5C into "
+    "the pack - so each gets its own independently-tunable curve instead of "
+    "sharing one). Drives ONLY charger_limit_kw ('Max power for charger,' "
+    "docs/03) - full power at/below 'Full power below', ramping to zero at/"
+    "above 'Zero power at/above', with 'Emergency high V' as a second, more "
+    "extreme per-cell threshold that escalates to a HARD CUT.\n\n"
+    "'Daily target %' / 'Extended target %' and full_charge_flag are a "
+    "separate concern, gated on RZ450e's charge_permission_input (charging "
+    "interlock) being active - only fires during an actual plugged-in charge "
+    "session, never from simply driving above the target SoC. Toggle "
+    "'Extended mode' for a road-trip charge to the extended target instead "
+    "of the daily one."
+)
 MANAGEMENT_FEATURE_HELP = {
     'low_voltage_cutoff': (
         "Low-voltage cutoff, cell-voltage authoritative (docs/05, corrected 2026-07-31)\n\n"
@@ -168,35 +199,32 @@ MANAGEMENT_FEATURE_HELP = {
         "voltage bounces near the threshold under intermittent acceleration."
     ),
     'charge_target_taper': (
-        "Per-cell charge/regen power limit + AC charge target stop "
-        "(docs/05, corrected 2026-07-31)\n\n"
+        "Per-cell REGEN power limit (docs/05, split 2026-08-01)\n\n"
         "charge_limit_kw is the Leaf's shared 'Charge/regen power limit' - the "
         "VCM uses it to cap BOTH regenerative braking while driving AND general "
         "charge acceptance, not just AC charging. This taper is driven ONLY by "
         "individual cell voltage, continuously, at ANY SoC and regardless of "
-        "whether you're actually plugged in.\n\n"
+        "whether you're actually plugged in - it's what protects the pack "
+        "during regen specifically, which can push up to ~0.5C into the pack, "
+        "far more than the Leaf's ~0.09C AC charger ever could.\n\n"
         "PROACTIVE by design: the VCM is slow to respond to a charge_limit_kw "
         "change, so this can't wait until a cell is nearly at its limit - it "
         "has to start backing off well ahead of time. Full power at/below "
-        "'Full regen/charge below', ramping linearly down to zero at/above "
-        "'Zero regen/charge at/above' - e.g. the default 3.90V/4.10V window "
-        "means full regen is available until 3.90V and it's fully backed off "
-        "by 4.10V, well under typical NMC ceilings, specifically to give the "
-        "slow VCM time to actually act on the reduced limit before any cell "
-        "gets close to real danger.\n\n"
-        "'Daily target %' / 'Extended target %' and full_charge_flag are a "
-        "SEPARATE concern, gated on RZ450e's charge_permission_input (charging "
-        "interlock) being active - this only fires during an actual plugged-in "
-        "charge session. SAFETY FIX (2026-07-31): this used to fire from SoC "
-        "alone with no charging-context check, which meant simply driving above "
-        "the target SoC would set full_charge_flag and drop the real Leaf's main "
-        "HV contactors mid-drive. It's gated now, so driving above the target "
-        "only keeps the regen/charge-acceptance taper active - it never asserts "
-        "the charge-stop flag while not actually charging.\n\n"
+        "'Full regen below', ramping linearly down to zero at/above 'Zero regen "
+        "at/above'.\n\n"
+        "HYSTERESIS (added 2026-08-01, same pattern as the discharge power "
+        "taper): fast to respond to a rise toward the ceiling, slow to relax "
+        "back to full power once voltage recovers ('Recovery ramp (s)') - "
+        "avoids power hunting if voltage bounces near the threshold.\n\n"
         "'Emergency high V' is a second, more extreme per-cell threshold "
-        "(above the zero-regen point) that escalates to a HARD CUT, active "
-        "regardless of charging context too - if a cell keeps climbing after "
-        "regen/charge is already at zero, something else is charging it."
+        "(above the zero-regen point) that escalates to a HARD CUT - if a cell "
+        "keeps climbing after regen is already at zero, something else is "
+        "charging it.\n\n"
+        "The AC-charger-specific taper (charger_limit_kw), plus the daily/"
+        "extended SoC target and full_charge_flag, are now on the 'Charge "
+        "Emulation' tab instead - AC charging (~19A/0.09C) is physically very "
+        "different from regen, so it gets its own independently-tunable curve "
+        "rather than sharing this one."
     ),
     'over_temperature_derate': (
         "Over-temperature derate (docs/05, restructured 2026-07-31 per docs/12 "
@@ -273,14 +301,37 @@ MANAGEMENT_FEATURE_HELP = {
         "confidence."
     ),
     'staleness_watchdog': (
-        "Staleness watchdog (docs/06)\n\n"
-        "Tracks freshness of the RZ450e's own keep-alive/rolling counters "
-        "(0x358/0x3F1 alive counters, 0x424 5s tick) and the fast raw-CAN signals "
-        "themselves. If required data has been stale for 'Soft cut after' "
-        "seconds, triggers a SOFT CUT (capacity_empty); if it's still stale "
-        "'Hard cut escalation' seconds after that, escalates to a HARD CUT "
-        "(relay_cut_request) - giving a transient CAN hiccup a brief window to "
-        "self-clear before committing to the RED-error hard cut."
+        "Staleness watchdog (docs/06, expanded 2026-08-01)\n\n"
+        "Tracks freshness of EVERY registered RZ450e input signal - all 96 "
+        "per-cell voltages, all 16 temp probes, and every other fast/slow "
+        "scalar - plus the RZ450e's own keep-alive/rolling counters (0x358/"
+        "0x3F1 alive counters, 0x424 5s tick). If any signal that was live "
+        "stops updating for 'Soft cut after' seconds, triggers a SOFT CUT "
+        "(capacity_empty) AND explicitly stops charging (charge_limit_kw and "
+        "charger_limit_kw forced to their stop values) - we can no longer "
+        "verify it's safe to keep accepting charge/regen if the data behind "
+        "that decision has gone stale. If still stale 'Hard cut escalation' "
+        "seconds after that, escalates to a HARD CUT (relay_cut_request) - "
+        "giving a transient CAN hiccup a brief window to self-clear before "
+        "committing to the RED-error hard cut. A signal that has NEVER been "
+        "seen this session doesn't count as stale (nothing to check yet) - "
+        "only one that WAS live and then stopped updating does."
+    ),
+    'cell_data_cross_check': (
+        "Cell data cross-check (docs/02, docs/04, added 2026-08-01)\n\n"
+        "Live redundancy check between the 96 individually-read cell "
+        "voltages (authoritative) and the 0x020 pack-level cell_min/"
+        "cell_max summary - docs/02 and docs/04 both describe the pack "
+        "summary as a 'sanity cross-check' against the per-cell messages, "
+        "and this feature is what actually performs it.\n\n"
+        "If the worst individual cell reading disagrees with the pack "
+        "summary by 'Max delta' or more, continuously for 'Soft cut after' "
+        "seconds, triggers a SOFT CUT - same soft-then-hard escalation "
+        "STRUCTURE as the staleness watchdog, independently tunable from "
+        "it. A mismatch this large usually means a decode problem or a "
+        "genuinely unreliable reading, not a real physical condition, so "
+        "this is a data-integrity check, not a voltage-level protection "
+        "feature (that's low_voltage_cutoff/charge_target_taper's job)."
     ),
 }
 
@@ -311,6 +362,7 @@ class ConnectionsPanel(ttk.Frame):
         self.channel_var = tk.StringVar(value=self.channels[0] if self.channels else '')
         self.channel_menu = ttk.Combobox(row, values=self.channels, textvariable=self.channel_var,
                                           width=20, state='readonly')
+        _no_wheel(self.channel_menu)
         self.channel_menu.pack(side='left', padx=(0, 4))
         ttk.Button(row, text='Rescan', width=8, style='Small.TButton', command=self._rescan).pack(side='left', padx=2)
 
@@ -323,7 +375,22 @@ class ConnectionsPanel(ttk.Frame):
         self.connect_btn.pack(side='left')
 
         self.status_label = ttk.Label(self, text='Disconnected', foreground=ERR)
-        self.status_label.pack(anchor='w', padx=8, pady=(2, 8))
+        self.status_label.pack(anchor='w', padx=8, pady=(2, 4))
+
+        # Connection-health lights (added 2026-08-01, user request: "add a
+        # dedicated CAN monitor... so we know the real state... add a
+        # counter so we can see how many resets we have had"). TX OK is
+        # tracked separately from Connected/RX, since a TX-only failure
+        # (adapter won't send, bus-off) doesn't always flip `connected`
+        # false too - see bridge/can_backend.py.
+        health = ttk.Frame(self)
+        health.pack(fill='x', padx=8, pady=(0, 8))
+        self.tx_light = tk.Canvas(health, width=11, height=11, bg=FIELD, highlightthickness=0)
+        self.tx_light_oval = self.tx_light.create_oval(1, 1, 10, 10, fill=FG_DIM, outline=FG_DIM)
+        self.tx_light.pack(side='left', padx=(0, 4))
+        self.health_label = ttk.Label(health, text='TX: -- | reconnects: 0 | TX errors: 0', foreground=FG_DIM)
+        self.health_label.pack(side='left')
+
         self._refresh()
 
     def _rescan(self):
@@ -339,13 +406,27 @@ class ConnectionsPanel(ttk.Frame):
     def _refresh(self):
         if not self.winfo_exists():
             return
-        if self.bus.connected:
+        connected = self.bus.connected
+        if connected:
             self.status_label.configure(text=f'Connected: {self.bus.channel}', foreground=OK)
             self.connect_btn.configure(text='Disconnect')
         else:
             err = f' ({self.bus.error})' if self.bus.error else ''
             self.status_label.configure(text=f'Disconnected{err}', foreground=ERR)
             self.connect_btn.configure(text='Connect')
+
+        if connected:
+            tx_ok = self.bus.tx_ok
+            color = OK if tx_ok else ERR
+            self.tx_light.itemconfig(self.tx_light_oval, fill=color, outline=color)
+            tx_text = 'OK' if tx_ok else 'FAILING'
+        else:
+            self.tx_light.itemconfig(self.tx_light_oval, fill=FG_DIM, outline=FG_DIM)
+            tx_text = '--'
+        self.health_label.configure(
+            text=f'TX: {tx_text} | reconnects: {self.bus.reconnect_count} | TX errors: {self.bus.send_errors}',
+            foreground=ERR if connected and not self.bus.tx_ok else FG_DIM)
+
         self.after(REFRESH_MS, self._refresh)
 
 
@@ -411,7 +492,7 @@ def leaf_tx_monitor_text(state_model):
     for key, label, _default in leaf_signals.CHECKS:
         lines.append(f'  {label:<40} {tx.get(key)!r}')
     lines.append('-- Management status --')
-    for feature, status in state_model.management_status.items():
+    for feature, status in state_model.snapshot_management_status().items():
         lines.append(f'  {feature:<30} {status}')
     return '\n'.join(lines)
 
@@ -426,21 +507,25 @@ class VehiclePanel(ttk.Frame):
         help_btn(head, 'Vehicle / battery generation', VEHICLE_HELP).pack(side='left', padx=(6, 0))
         row = ttk.Frame(self)
         row.pack(fill='x', padx=8, pady=(0, 8))
-        self.car_gen = tk.StringVar(value=state_model.vehicle['car_gen'])
-        self.batt_gen = tk.StringVar(value=state_model.vehicle['battery_gen'])
-        self.batt_kwh = tk.StringVar(value=str(state_model.vehicle['battery_kwh']))
+        vehicle = state_model.snapshot_vehicle()
+        self.car_gen = tk.StringVar(value=vehicle['car_gen'])
+        self.batt_gen = tk.StringVar(value=vehicle['battery_gen'])
+        self.batt_kwh = tk.StringVar(value=str(vehicle['battery_kwh']))
         ttk.Label(row, text='Car:').pack(side='left')
         car_combo = ttk.Combobox(row, values=['AZE0', 'ZE1'], textvariable=self.car_gen, width=6, state='readonly')
         car_combo.pack(side='left', padx=4)
-        car_combo.bind('<<ComboboxSelected>>', lambda e: state_model.vehicle.__setitem__('car_gen', self.car_gen.get()))
+        car_combo.bind('<<ComboboxSelected>>', lambda e: state_model.set_vehicle_item('car_gen', self.car_gen.get()))
+        _no_wheel(car_combo)
         ttk.Label(row, text='Battery:').pack(side='left')
         batt_combo = ttk.Combobox(row, values=['AZE0', 'ZE1'], textvariable=self.batt_gen, width=6, state='readonly')
         batt_combo.pack(side='left', padx=4)
-        batt_combo.bind('<<ComboboxSelected>>', lambda e: state_model.vehicle.__setitem__('battery_gen', self.batt_gen.get()))
+        batt_combo.bind('<<ComboboxSelected>>', lambda e: state_model.set_vehicle_item('battery_gen', self.batt_gen.get()))
+        _no_wheel(batt_combo)
         ttk.Label(row, text='kWh:').pack(side='left')
         kwh_combo = ttk.Combobox(row, values=['30', '40', '62'], textvariable=self.batt_kwh, width=4, state='readonly')
         kwh_combo.pack(side='left', padx=4)
-        kwh_combo.bind('<<ComboboxSelected>>', lambda e: state_model.vehicle.__setitem__('battery_kwh', int(self.batt_kwh.get())))
+        kwh_combo.bind('<<ComboboxSelected>>', lambda e: state_model.set_vehicle_item('battery_kwh', int(self.batt_kwh.get())))
+        _no_wheel(kwh_combo)
 
 
 class MappingPanel(ttk.Frame):
@@ -505,6 +590,7 @@ class MappingPanel(ttk.Frame):
             combo = ttk.Combobox(line1, values=self.input_options, textvariable=v, width=32, state='readonly')
             combo.pack(side='left', padx=2)
             combo.bind('<<ComboboxSelected>>', lambda e, i=idx: self._update_tie(i))
+            _no_wheel(combo)
             vars_in.append(v)
         card._invars = vars_in
 
@@ -515,6 +601,7 @@ class MappingPanel(ttk.Frame):
         combine_combo = ttk.Combobox(line2, values=list(COMBINE_TYPES), textvariable=combine_var, width=12, state='readonly')
         combine_combo.pack(side='left', padx=2)
         combine_combo.bind('<<ComboboxSelected>>', lambda e, i=idx: self._update_tie(i))
+        _no_wheel(combine_combo)
         card._combine_var = combine_var
 
         scale_var = tk.StringVar(value=str(tie.params.get('scale', 1.0)))
@@ -530,6 +617,7 @@ class MappingPanel(ttk.Frame):
         out_combo = ttk.Combobox(line2, values=self.output_options, textvariable=out_var, width=32, state='readonly')
         out_combo.pack(side='left', padx=2)
         out_combo.bind('<<ComboboxSelected>>', lambda e, i=idx: self._update_tie(i))
+        _no_wheel(out_combo)
         card._out_var = out_var
 
         ttk.Button(line2, text='?', width=3, style='Small.TButton',
@@ -580,11 +668,16 @@ class ManagementPanel(ttk.Frame):
         'discharge_power_taper': [('taper_start_v', 'Full power at/above (V/cell)'),
                                    ('taper_zero_v', 'Zero power at/below (V/cell)'),
                                    ('recovery_ramp_s', 'Recovery ramp (s, slow release)')],
-        'charge_target_taper': [('regen_full_v', 'Full regen/charge below (V/cell)'),
-                                 ('regen_zero_v', 'Zero regen/charge at/above (V/cell)'),
+        # REGEN ONLY as of 2026-08-01 (split from the old combined regen+AC
+        # taper - user directive: regen and AC charging are physically very
+        # different, ~0.5C vs ~0.09C). The AC-charger-specific taper and the
+        # daily/extended AC target moved to the Charge Emulation tab
+        # (ChargeEmulationPanel below), since they only ever mattered while
+        # actually plugged in.
+        'charge_target_taper': [('regen_full_v', 'Full regen below (V/cell)'),
+                                 ('regen_zero_v', 'Zero regen at/above (V/cell)'),
                                  ('emergency_high_v', 'Emergency high V (hard, per-cell)'),
-                                 ('daily_target_pct', 'Daily target % (SoC stop point)'),
-                                 ('extended_target_pct', 'Extended target % (SoC stop point)')],
+                                 ('recovery_ramp_s', 'Recovery ramp (s, slow release)')],
         'over_temperature_derate': [('charge_derate_low_start_f', 'Charge cold-derate start °F (coldest probe)'),
                                      ('charge_low_block_f', 'Charge low block °F (coldest probe)'),
                                      ('charge_derate_start_f', 'Charge derate start °F (hottest probe)'),
@@ -597,21 +690,63 @@ class ManagementPanel(ttk.Frame):
                                  ('continuous_charge_warn_a', 'Charge/regen warn (A)'),
                                  ('persistence_s', 'Persistence before warning (s)')],
         'staleness_watchdog': [('soft_cut_s', 'Soft cut after (s)'), ('hard_escalation_s', 'Hard cut escalation (+s)')],
+        'cell_data_cross_check': [('max_delta_v', 'Max delta vs 0x020 pack summary (V)'),
+                                   ('soft_cut_s', 'Soft cut after (s)'), ('hard_escalation_s', 'Hard cut escalation (+s)')],
     }
     LABELS = {
         'low_voltage_cutoff': 'Low-voltage cutoff, cell-voltage authoritative (soft -> capacity_empty)',
         'discharge_power_taper': 'Discharge power taper, per-cell + hysteresis (soft ramp)',
-        'charge_target_taper': 'Per-cell charge/regen power limit + AC charge target stop (soft ramp then stop)',
+        'charge_target_taper': 'Per-cell REGEN power limit, hysteresis (soft ramp) - AC charger taper is on the Charge Emulation tab',
         'over_temperature_derate': 'Over-temperature derate (soft ramp, both cold and hot side)',
         'cell_imbalance_monitor': 'Cell imbalance monitor (warn only, no cutoff action)',
         'overcurrent_monitor': 'Overcurrent monitor (warn only, no cutoff action)',
         'staleness_watchdog': 'Staleness watchdog (soft -> hard escalation)',
+        'cell_data_cross_check': 'Cell data cross-check, per-cell vs 0x020 pack summary (soft -> hard escalation)',
     }
 
-    def __init__(self, master, state_model, management_engine):
+    # Registered (lo, hi) numeric bounds per (feature, field) - added
+    # 2026-08-01, user directive ("we need clamps on all data thats input
+    # by the user"). Deliberately generous (same "sanity range, not an
+    # operating threshold" philosophy as rz450e_signals.PLAUSIBLE_RANGES) -
+    # this exists to catch a mistyped value (an extra digit, a misplaced
+    # decimal), not to second-guess a deliberately extreme but valid
+    # threshold choice. A field with no entry here is left unclamped
+    # (numeric parse failure is still caught, just no range enforced).
+    FEATURE_FIELD_BOUNDS = {
+        ('low_voltage_cutoff', 'min_cell_v'): (0.0, 5.0),
+        ('low_voltage_cutoff', 'emergency_low_v'): (0.0, 5.0),
+        ('low_voltage_cutoff', 'soft_cut_persistence_s'): (0.0, 60.0),
+        ('low_voltage_cutoff', 'min_soc_pct'): (0.0, 100.0),
+        ('discharge_power_taper', 'taper_start_v'): (0.0, 5.0),
+        ('discharge_power_taper', 'taper_zero_v'): (0.0, 5.0),
+        ('discharge_power_taper', 'recovery_ramp_s'): (0.01, 60.0),
+        ('charge_target_taper', 'regen_full_v'): (0.0, 5.0),
+        ('charge_target_taper', 'regen_zero_v'): (0.0, 5.0),
+        ('charge_target_taper', 'emergency_high_v'): (0.0, 5.0),
+        ('charge_target_taper', 'recovery_ramp_s'): (0.01, 60.0),
+        ('over_temperature_derate', 'charge_derate_low_start_f'): (-60.0, 250.0),
+        ('over_temperature_derate', 'charge_low_block_f'): (-60.0, 250.0),
+        ('over_temperature_derate', 'charge_derate_start_f'): (-60.0, 250.0),
+        ('over_temperature_derate', 'charge_hard_stop_f'): (-60.0, 250.0),
+        ('over_temperature_derate', 'discharge_derate_start_f'): (-60.0, 250.0),
+        ('over_temperature_derate', 'discharge_hard_stop_f'): (-60.0, 250.0),
+        ('over_temperature_derate', 'emergency_temp_f'): (-60.0, 250.0),
+        ('cell_imbalance_monitor', 'warn_delta_v'): (0.0, 2.0),
+        ('overcurrent_monitor', 'continuous_discharge_warn_a'): (0.0, 210.0),
+        ('overcurrent_monitor', 'continuous_charge_warn_a'): (0.0, 210.0),
+        ('overcurrent_monitor', 'persistence_s'): (0.0, 120.0),
+        ('staleness_watchdog', 'soft_cut_s'): (1.0, 600.0),
+        ('staleness_watchdog', 'hard_escalation_s'): (0.0, 600.0),
+        ('cell_data_cross_check', 'max_delta_v'): (0.0, 2.0),
+        ('cell_data_cross_check', 'soft_cut_s'): (1.0, 600.0),
+        ('cell_data_cross_check', 'hard_escalation_s'): (0.0, 600.0),
+    }
+
+    def __init__(self, master, state_model, management_engine, log_fn=None):
         super().__init__(master)
         self.state_model = state_model
         self.management = management_engine
+        self.log_fn = log_fn or (lambda msg: None)
         self.status_labels = {}
         self.scroll = VScrollFrame(self, label_text='Battery Management (see the "?" on each feature for details)')
         self.scroll.pack(fill='both', expand=True)
@@ -626,8 +761,18 @@ class ManagementPanel(ttk.Frame):
         top = ttk.Frame(box)
         top.pack(fill='x', padx=6, pady=(6, 2))
         enabled_var = tk.BooleanVar(value=cfg['enabled'])
-        ttk.Checkbutton(top, text=self.LABELS[feature], variable=enabled_var,
-                        command=lambda: cfg.__setitem__('enabled', enabled_var.get())).pack(side='left')
+
+        def _on_toggle(feature=feature, cfg=cfg, enabled_var=enabled_var):
+            # Log every feature enable/disable (added 2026-08-01, user
+            # request: "add this to the log, just so its notated") - a
+            # single checkbox fully disables that feature's protection with
+            # nothing else standing behind it (by design, see docs/13), so
+            # it's worth a permanent record of when/that it happened.
+            cfg['enabled'] = enabled_var.get()
+            self.log_fn(f'Battery Management: "{self.LABELS.get(feature, feature)}" '
+                        f'{"ENABLED" if cfg["enabled"] else "DISABLED"}')
+
+        ttk.Checkbutton(top, text=self.LABELS[feature], variable=enabled_var, command=_on_toggle).pack(side='left')
         help_btn(top, self.LABELS[feature], MANAGEMENT_FEATURE_HELP[feature]).pack(side='left', padx=(6, 0))
         status = ttk.Label(box, text='status: --', foreground=FG_DIM)
         status.pack(anchor='w', padx=28)
@@ -641,20 +786,37 @@ class ManagementPanel(ttk.Frame):
             ttk.Label(row, text=label, width=32, anchor='w').pack(side='left')
             var = tk.StringVar(value=str(cfg[key]))
             ttk.Entry(row, textvariable=var, width=12).pack(side='left')
-            var.trace_add('write', lambda *_a, c=cfg, k=key, v=var: self._set_float(c, k, v))
-
-        if feature == 'charge_target_taper':
-            ext_var = tk.BooleanVar(value=cfg.get('extended_mode', False))
-            ttk.Checkbutton(grid, text='Extended mode active (road trip - charge to extended target)',
-                            variable=ext_var,
-                            command=lambda: cfg.__setitem__('extended_mode', ext_var.get())).pack(anchor='w', pady=(4, 0))
+            flag_lbl = ttk.Label(row, text='', foreground=ERR, width=9)
+            flag_lbl.pack(side='left', padx=(4, 0))
+            bounds = self.FEATURE_FIELD_BOUNDS.get((feature, key))
+            var.trace_add('write', lambda *_a, c=cfg, k=key, v=var, b=bounds, fl=flag_lbl:
+                           self._set_float(c, k, v, b, fl))
 
     @staticmethod
-    def _set_float(cfg, key, var):
+    def _set_float(cfg, key, var, bounds, flag_lbl):
+        """Clamps to `bounds` if registered (added 2026-08-01, user
+        directive - mirrors ChargeEmulationPanel's existing clamp pattern,
+        now applied consistently across every threshold field instead of
+        only the charge tab). Unlike the old silent-swallow-on-ValueError
+        behavior, an unparseable or out-of-bounds edit is now visually
+        flagged (`flag_lbl`) rather than failing invisibly - the user asked
+        for exactly this ("if its wrongly computed we should set an error
+        state")."""
         try:
-            cfg[key] = float(var.get())
+            raw = float(var.get())
         except ValueError:
-            pass
+            flag_lbl.configure(text='invalid')
+            return
+        value = raw
+        clamped = False
+        if bounds is not None:
+            lo, hi = bounds
+            if value < lo:
+                value, clamped = lo, True
+            elif value > hi:
+                value, clamped = hi, True
+        cfg[key] = value
+        flag_lbl.configure(text='clamped' if clamped else '')
 
     def _schedule_status_refresh(self):
         if not self.winfo_exists():
@@ -694,9 +856,10 @@ class ChargeEmulationPanel(ttk.Frame):
     feature's state (ramping / stopped / idle) isn't otherwise visible
     anywhere else in the GUI."""
 
-    def __init__(self, master, state_model):
+    def __init__(self, master, state_model, log_fn=None):
         super().__init__(master)
         self.state_model = state_model
+        self.log_fn = log_fn or (lambda msg: None)
         cfg = state_model.charge_emulation
 
         head = ttk.Frame(self)
@@ -733,6 +896,55 @@ class ChargeEmulationPanel(ttk.Frame):
 
         self.status_label = ttk.Label(box, text='status: --', foreground=FG_DIM)
         self.status_label.pack(anchor='w', padx=6, pady=(0, 6))
+
+        # AC-charger overvoltage taper + AC SoC target (moved here 2026-08-01
+        # from Battery Management's charge_target_taper - user directive:
+        # "anything charger related should be there... regen and AC charging
+        # is not the same"). Independently-tunable curve from the regen
+        # taper still on the Battery Management tab (charge_limit_kw).
+        ttk.Separator(self, orient='horizontal').pack(fill='x', padx=6, pady=(4, 4))
+        ac_box = ttk.Frame(self, relief='groove', borderwidth=1)
+        ac_box.pack(fill='x', pady=(0, 6), padx=6)
+
+        ac_top = ttk.Frame(ac_box)
+        ac_top.pack(fill='x', padx=6, pady=(6, 2))
+        ac_enabled_var = tk.BooleanVar(value=cfg.get('ac_taper_enabled', True))
+
+        def _on_ac_toggle(cfg=cfg, ac_enabled_var=ac_enabled_var):
+            cfg['ac_taper_enabled'] = ac_enabled_var.get()
+            self.log_fn(f'Charge Emulation: "AC charger overvoltage taper" '
+                        f'{"ENABLED" if cfg["ac_taper_enabled"] else "DISABLED"}')
+
+        ttk.Checkbutton(ac_top, text='AC charger overvoltage taper (charger_limit_kw, per-cell)',
+                        variable=ac_enabled_var, command=_on_ac_toggle).pack(side='left')
+        help_btn(ac_top, 'AC charger overvoltage taper', AC_CHARGE_TAPER_HELP).pack(side='left', padx=(6, 0))
+        self.ac_status_label = ttk.Label(ac_box, text='status: --', foreground=FG_DIM)
+        self.ac_status_label.pack(anchor='w', padx=28)
+
+        ac_grid = ttk.Frame(ac_box)
+        ac_grid.pack(fill='x', padx=28, pady=(2, 6))
+        for key, label, lo, hi in (
+                ('ac_full_v', 'Full power below (V/cell)', 0.0, 5.0),
+                ('ac_zero_v', 'Zero power at/above (V/cell)', 0.0, 5.0),
+                ('ac_emergency_v', 'Emergency high V (hard, per-cell)', 0.0, 5.0),
+                ('daily_target_pct', 'Daily target % (SoC stop point)', 0.0, 100.0),
+                ('extended_target_pct', 'Extended target % (SoC stop point)', 0.0, 100.0)):
+            row = ttk.Frame(ac_grid)
+            row.pack(fill='x', pady=1)
+            ttk.Label(row, text=label, width=32, anchor='w').pack(side='left')
+            var = tk.StringVar(value=str(cfg.get(key, 0.0)))
+            ttk.Entry(row, textvariable=var, width=12).pack(side='left')
+            var.trace_add('write', lambda *_a, k=key, v=var, lo=lo, hi=hi: self._set_float(cfg, k, v, lo, hi))
+
+        ext_var = tk.BooleanVar(value=cfg.get('extended_mode', False))
+
+        def _on_ext_toggle(cfg=cfg, ext_var=ext_var):
+            cfg['extended_mode'] = ext_var.get()
+            self.log_fn(f'Charge Emulation: "Extended mode" {"ENABLED" if cfg["extended_mode"] else "DISABLED"}')
+
+        ttk.Checkbutton(ac_grid, text='Extended mode active (road trip - charge to extended target)',
+                        variable=ext_var, command=_on_ext_toggle).pack(anchor='w', pady=(4, 0))
+
         self._schedule_status_refresh()
 
     @staticmethod
@@ -752,6 +964,8 @@ class ChargeEmulationPanel(ttk.Frame):
     def _schedule_status_refresh(self):
         if not self.winfo_exists():
             return
+        ac_status = self.state_model.snapshot_management_status().get('ac_charge_taper', '--')
+        self.ac_status_label.configure(text=f'status: {ac_status}')
         tx = self.state_model.snapshot_leaf_tx()
         cfg = self.state_model.charge_emulation
         if not cfg.get('charge_emulate'):
