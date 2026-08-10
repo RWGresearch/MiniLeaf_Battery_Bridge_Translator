@@ -89,13 +89,14 @@ against this specific pack per `11-manual-verification-checklist.md`.)
 | Feature | Source signal(s) | Config | Cut tier | Drives |
 |---|---|---|---|---|
 | Low-voltage cutoff, cell-voltage authoritative | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, authoritative) + pack `cell_min` (`0x020`, sanity check) + SoC (DID `0x1F5B`, backup check only, never acts alone) | min-cell-voltage cutoff, soft-cut persistence window, min SoC % (backup), emergency low voltage | Soft (persistence-qualified) → Hard | `capacity_empty` then `relay_cut_request` |
-| Discharge power taper | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, primary) | full-power voltage, zero-power voltage, recovery-ramp time (fast-attack/slow-release hysteresis) | Soft (ramp) | `discharge power limit` |
-| Charge/regen power limit (`charge_target_taper`, 2026-08-01 split — regen only) | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, primary) + pack `cell_max` (`0x020`, sanity check) | full-power voltage, zero-power voltage (proactive taper), emergency voltage | Soft (ramp) → Hard | `charge_limit_kw` ONLY — active regardless of charging context (driving or plugged in) |
-| AC charge target + taper (`ac_charge_taper`, 2026-08-01 split — lives in `charge_emulation`, AC-charger only) | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, primary) + SoC (DID `0x1F5B`) + `charge_permission_input` (`0x358`, gates the target/flag entirely) | full-power voltage, zero-power voltage, emergency voltage, daily target %, extended target % | Soft (ramp then stop) → Hard | `charger_limit_kw` — and, only while `charge_permission_input` is active: `full_charge_flag` at target SoC |
+| Discharge power taper | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, primary) | full-power voltage, zero-power voltage, recovery-ramp time (fast-attack/slow-release hysteresis), min/max discharge power request (`discharge_min_kw`/`discharge_max_kw`, added 2026-08-08) | Soft (ramp, floored/ceilinged at the configured min/max) | `discharge power limit` |
+| Charge/regen power limit (`charge_target_taper`, 2026-08-01 split — regen only) | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, primary) + pack `cell_max` (`0x020`, sanity check) | full-power voltage, zero-power voltage (proactive taper), emergency voltage, min/max regen power request (`regen_min_kw`/`regen_max_kw`, added 2026-08-08) | Soft (ramp, floored/ceilinged at the configured min/max) → Hard (emergency tier bypasses the floor - always literal zero) | `charge_limit_kw` ONLY — active regardless of charging context (driving or plugged in) |
+| AC charge target + taper (`ac_charge_taper`, 2026-08-01 split, reworked 2026-08-06, charging-only gating tightened 2026-08-07 — lives in `charge_emulation`, AC-charger only) | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, primary) + SoC (DID `0x1F5B`) + `charge_permission_input` (`0x358`, gates the WHOLE feature — while inactive, `charger_limit_kw` is left untouched, not just the target/flag) | full-power voltage, minimum-power voltage, stop-charging cutoff voltage, emergency voltage, min/max AC kW request, daily target %, extended target % | Soft (ramp to a min-kW floor, dynamically-selected 0-7 convergence rate — not a fixed hysteresis time) → deliberate stop (cutoff voltage or target SoC) → Hard, all only while `charge_permission_input` is active | `charger_limit_kw` (floored at `ac_min_kw`, not zero) and `full_charge_flag` at the stop-charging cutoff voltage OR target SoC |
 | Over-temperature derate | RZ450e `temp_max` (hottest probe) + `temp_min` (coldest probe, cold-side charge decisions only) (fast, `0x4AA`/`0x4A7`) | cold-derate-start/low-block temps (coldest probe), charge derate-start/hard-stop temps (hottest probe), discharge derate-start/hard-stop temps (hottest probe), emergency temp (hottest probe) | Soft (ramp, both hot and cold side) → Hard | `discharge power limit`, `charge power limit` then `relay_cut_request` |
 | Cell imbalance monitor (added 2026-07-31) | All 96 RZ450e per-cell voltages (`0x4A9`/`0x4C0`) | warn-spread threshold | **Monitor only — never cuts or derates** | status text only |
 | Overcurrent monitor (added 2026-07-31) | RZ450e `current` (fast, `0x023`) | continuous discharge/charge warn thresholds, persistence window | **Monitor only — never cuts or derates** | status text only |
 | Cell data cross-check (added 2026-08-03) | Per-cell voltages (`0x4A9`/`0x4C0`) vs. pack `cell_min`/`cell_max` summary (`0x020`) | max allowed disagreement, soft-cut delay, hard escalation delay | Soft → Hard | `capacity_empty` then `relay_cut_request` — catches the per-cell broadcast and the pack summary silently disagreeing (e.g. a decode fault on one source), which neither source alone would detect |
+| Temperature data cross-check (added 2026-08-04) | Pack temp extremes (`0x4A7` `temp_max`/`temp_min`) vs. all 16 individual temp probes (`0x4AA` `temp_01`-`temp_16`) | max allowed disagreement, soft-cut delay, hard escalation delay | Soft → Hard | `capacity_empty` then `relay_cut_request` — same pattern as the cell data cross-check above, applied to temperature: catches a decode/mux fault that individually passes `PLAUSIBLE_RANGES` but is physically inconsistent with the 16 probes it's presumably derived from, which matters specifically because `temp_min` drives the cold-side plating-prevention logic below |
 | Staleness watchdog | `0x358`/`0x3F1` alive counters, `0x424` tick, Toyota checksums | per-group timeout (soft, then hard after a short escalation window) | **Soft → Hard** | `capacity_empty` (+ `full_charge_flag`, added 2026-08-03) then `relay_cut_request` — see `06-realtime-engine-and-watchdog.md` |
 | Charge-start data gate (`require_live_data_to_charge`, added 2026-08-03) | Every per-cell voltage + `temp_max`/`temp_min`, checked against the current bridge session's start time | on/off only (default on) | N/A — one-time startup gate, not an ongoing cut | Blocks the charger ramp from starting at all until genuinely live data has arrived this session; see "Charge-start data gate" section below |
 | Input plausibility validation (`input_validation`, given a real toggle 2026-08-03) | Every decoded RZ450e value, checked against `PLAUSIBLE_RANGES` | on/off only (default on) | N/A — an ingest-side data-integrity gate, not a cutoff | A rejected value is simply never written to live state at all — it keeps aging under its last-good value, eventually caught by the staleness watchdog if sustained. See `02-source-signals-rz450e.md`. Was always-on with no config until 2026-08-03; kept as an editable feature so a deliberately-corrupted test value can be pushed through to confirm downstream handling. |
@@ -111,10 +112,16 @@ against this specific pack per `11-manual-verification-checklist.md`.)
 | Discharge taper: full power at/above | 3.00 V | user edit, 2026-08-01 — re-anchored to `low_voltage_cutoff`'s soft-cut floor (was 3.50V) |
 | Discharge taper: zero power at/below | 2.60 V | user edit, 2026-08-01 — matches the emergency low-voltage tier (was 3.00V), so discharge power reaches zero right around where the cutoff tiers sit |
 | Discharge taper: recovery ramp | 3.0 s | user-specified — deliberately slow (vs. the instant fast-attack on a dip) to avoid the power limit hunting/oscillating if cell voltage bounces near the threshold under intermittent acceleration |
+| Discharge min/max power request (`discharge_min_kw`/`discharge_max_kw`, added 2026-08-08) | 0.0 kW / 110.0 kW (code default; user's own saved profile currently runs 5.0/40.0 kW) | `discharge_max_kw` is researched: `docs/12-nmc-bms-design-research.md` §6 puts real Leaf drive power at "80-110 kW peak ≈ 1.1-1.6C discharge peak — well within NMC capability" — 110.0 sits at the top of that range. `discharge_min_kw`=0.0 preserves the pre-existing true-zero floor behavior exactly (no behavior change on rollout). **Real-hardware finding (2026-08-09, real ZE1 40kWh Leaf)**: the vehicle's dash reacts to `discharge_limit_kw` on its own — around a 40kW setting the turtle (reduced-power) icon comes on, and below roughly 3kW the car starts turning off power systems entirely. This is the Leaf's own reaction to the transmitted value, not a bug in the taper; not yet swept for the exact real thresholds, documented starting point only (docs/11). See `docs/15` B8 / `docs/16` A2. |
 | Regen full power at/below (proactive taper start, `charge_target_taper`) | 4.00 V | as of the 2026-08-01 regen/AC split; deliberately well below the ~4.20V NMC ceiling, since the VCM is slow to respond to a `charge_limit_kw` change and the taper must act well ahead of the danger zone, not at its edge |
 | Regen zero power at/above (proactive taper end, `charge_target_taper`) | 4.15 V | as of the 2026-08-01 regen/AC split; still under the standard 4.20V NMC ceiling, so regen is fully backed off before a cell is anywhere near its actual limit |
 | Regen emergency high-voltage (hard cut, `charge_target_taper`) | 4.20 V | user edit, 2026-08-03 (was 4.30V) — set to the standard NMC charge ceiling exactly, tightening the margin above the 4.15V zero-regen point to 0.05V; second tier, above the zero-regen point — if a cell keeps climbing after regen is already at zero, something else is charging it |
-| AC charge full/zero/emergency (`ac_charge_taper`, split into its own feature 2026-08-01) | 4.00 V / 4.15 V / 4.20 V | emergency tier user edit, 2026-08-03 (was 4.30V, matching the regen-side change above); defaulted to the same starting curve as the regen taper above, not yet independently tuned now that it's its own feature — a real charger session may warrant a different curve than a regen event |
+| Regen min/max power request (`regen_min_kw`/`regen_max_kw`, added 2026-08-08) | 0.0 kW / 70.0 kW | **`regen_max_kw`=70.0kW is NOT researched-value-aligned** — kept deliberately unchanged from the pre-existing static default on rollout (user directive, 2026-08-08: ship with no behavior change rather than silently capping regen lower than it can reach today). `docs/12-nmc-bms-design-research.md` §6 actually puts real Leaf regen at "up to a few tens of kW ≈ up to ~0.5C into the pack" (~36kW for this pack's ~200Ah rating) — tune `regen_max_kw` down toward that figure once ready; this default is a placeholder, not a confirmed-correct number. `regen_min_kw`=0.0 preserves the pre-existing true-zero floor exactly. **Real-hardware finding (2026-08-09)**: `regen_min_kw` genuinely reaches true zero cleanly with no issue. But `regen_max_kw` only has any observable effect once set BELOW whatever the real car can actually accept — on the project's real ZE1 40kWh test vehicle, this default (70.0kW) and anything down to ~40kW are functionally identical, since the car's own regen ceiling sits around 40kW: a LEAF LIMIT, not something this bridge controls. Peak regen capability varies substantially by Leaf generation/pack — 1st-gen LEAF (24/30kWh) tops out ~20-30kW, 2nd-gen LEAF (40kWh, this project's real test vehicle) just over 40kW, LEAF PLUS (62kWh) can peak 60-80kW under optimal conditions. `regen_max_kw` should be set at/below whichever ceiling applies to the actual car in use to have any real effect. Documented starting point, not confirmed against every generation (docs/11). See `docs/15` B7 / `docs/16` A3. |
+| AC charge full/min/cutoff/emergency (`ac_charge_taper`, split into its own feature 2026-08-01, reworked 2026-08-06) | 4.00 V / 4.15 V / 4.18 V / 4.20 V | emergency tier user edit, 2026-08-03 (was 4.30V, matching the regen-side change above); `ac_min_v` (renamed from `ac_zero_v`) and `ac_cutoff_v` (new) added 2026-08-06 — see "AC charger taper rework" section below for the full rationale. `ac_cutoff_v` is a deliberate interior point of the already-researched safe envelope (below the 4.20V NMC ceiling), not a new external safety number |
+| AC taper minimum power floor (`ac_min_kw`, added 2026-08-06) | 0.5 kW | user-specified — the taper now holds at this floor instead of driving to true zero (see "AC charger taper rework" below) |
+| AC taper convergence rate thresholds (`_AC_LEVEL_DOWNSHIFT_KW`, added 2026-08-06) | 3.0/1.5/0.75/0.4/0.2/0.1/0.05 kW (levels 7..1) | new, tuned starting values, not researched/real-hardware-confirmed — picks which of the existing 0-7 `chg_uprate_level` rates to converge at based on remaining distance to target; see "AC charger taper rework" below |
+| AC charge power request bounds (`ac_min_kw`/`ac_max_kw`, added 2026-08-06) | 0.5 kW / 6.6 kW | user-specified — 6.6kW is the Leaf's actual onboard AC charger ceiling; clamps both the manual charger-ramp target and the AC taper's own floor |
+| DC fast-charge power request bounds (`dc_min_kw`/`dc_max_kw`, added 2026-08-06) | 5.0 kW / 50.0 kW | user-specified — **placeholder only**, not read by any active logic yet (see `docs/10-open-questions.md` #9) |
 | Low-voltage soft-cut persistence window (added 2026-07-31) | 2.0 s | researched — guards the min-cell soft cut against a single-tick voltage sag transient under a spike load (cold-pack internal resistance roughly doubles vs. 25°C); the discharge power taper is already collapsing current/sag on a faster ramp by the time this window matters in the normal case. Emergency low-voltage stays instantaneous, no persistence. |
 | Charge cold-derate start (added 2026-07-31, coldest probe) | 10°C (50°F) | researched — ramps charge/regen acceptance down approaching the freezing line instead of a single on/off block; plating risk rises well above 0°C at meaningful charge current. Full power at/above this, ramping to zero at "Charge temp low block." |
 | Charge temp low block (coldest probe, not hottest — **bug fixed 2026-07-31**) | 0°C (32°F) | lithium-plating risk below this while charging. Previously evaluated against the hottest probe, which let charging continue into a partly-frozen pack as long as the warmest corner read above freezing — fixed to key on the coldest probe, since plating happens in the coldest cells. |
@@ -126,6 +133,8 @@ against this specific pack per `11-manual-verification-checklist.md`.)
 | Cell imbalance warn spread (monitor only) | 100 mV | user edit, 2026-08-01 — widened from the original researched 50mV starting point. A cell resting 30-50mV below its neighbors at rest is a documented early signature of elevated self-discharge (a developing internal defect); monitor/warn only, this bridge cannot balance cells. |
 | Cell data cross-check delta (added 2026-08-03) | 150 mV | new feature — max allowed disagreement between the per-cell broadcast and the `0x020` pack min/max summary before it's treated as a data-integrity fault, not just normal reporting jitter between two independently-sampled sources |
 | Cell data cross-check soft-cut delay / hard escalation | 60 s / +5 s | matches the staleness watchdog's own timing, independently tunable from it |
+| Temperature data cross-check delta (added 2026-08-04) | 10 °F | new feature — max allowed disagreement between `0x4A7`'s pack temp extremes and the actual min/max of the 16 individual `0x4AA` probes; deliberately wider than a "genuine fault" margin needs to be, since real spatial temperature gradient across the pack's 4 physical sub-packs under load is a legitimate, expected source of disagreement — a data-integrity check, not a temperature-level protection feature (that's `over_temperature_derate`'s job). Documented starting point, not yet confirmed against real thermal gradient data on this pack. |
+| Temperature data cross-check soft-cut delay / hard escalation (added 2026-08-04) | 60 s / +5 s | matches the cell data cross-check's own timing, independently tunable from it |
 | Overcurrent discharge warn (added 2026-07-31, monitor only) | 150 A | derived from this project's own confirmed spec, not an invented number — set comfortably below the `0x023` current sensor's own ±204.7A saturation ceiling (docs/02), so a warning still means something (above ~205A the true magnitude is unmeasurable regardless). That ceiling is a sensor/encoding limit, not a battery limit — the real pack is rated to a 500A discharge fuse and ~660A short-burst peak (user correction, 2026-07-31, docs/02) — so this monitor cannot see anywhere near the pack's real operating range. No cell datasheet exists to source a real cutoff threshold from, so this is monitor-only, not wired to any derate/cut. |
 | Overcurrent charge/regen warn (added 2026-07-31, monitor only) | 30 A | derived from this project's own confirmed spec — set above the Leaf's onboard AC charger's documented ~19A/6.6kW max, so ordinary AC charging never trips it; catches only abnormal charge/regen current. Monitor-only, same reasoning as above. |
 | Overcurrent monitor persistence | 5.0 s | researched — avoids flagging a brief acceleration or regen spike as sustained overcurrent |
@@ -157,10 +166,23 @@ curves and config, so they were split into two features that happen to default t
   (proactive taper window) and `emergency_high_v` (hard-cut tier).
 - **`ac_charge_taper` (AC charger only, config lives in `charge_emulation` alongside the rest of
   the charger-ramp controls)** — drives `charger_limit_kw` ("Max power for charger," `0x1ED`) and
-  owns the daily/extended target SoC + `full_charge_flag`, ALL gated on `charge_permission_input`
-  (the RZ450e charging interlock) being active. Config: `ac_full_v`/`ac_zero_v`/`ac_emergency_v`
-  (same shape as the regen taper, defaulted to the same starting curve but independently tunable),
-  `daily_target_pct`/`extended_target_pct`, `extended_mode` (toggle between the two targets).
+  owns the daily/extended target SoC + `full_charge_flag`. Its ENTIRE effect — the taper reduction,
+  its own `ac_emergency_v` hard-cut tier, and the daily/extended target SoC + `full_charge_flag` —
+  is gated on `charge_permission_input` (the RZ450e charging interlock) being active
+  (**re-confirmed/tightened 2026-08-07**: previously only the target-SoC/`full_charge_flag` part
+  was actually gated in code; the taper reduction and its emergency tier ran every tick regardless,
+  which meant a per-cell voltage inside/above the AC taper's window while simply driving — nothing
+  plugged in — could still reduce or hard-cut `charger_limit_kw`. Fixed so charging and driving are
+  two fully separate control paths, matching `Refrance/Leaf_BMS_Emulator`'s confirmed real-hardware
+  behavior: `LB_MAX_POWER_FOR_CHARGER` sits fixed at its 1023/92.3kW idle placeholder whenever not
+  actually charging). While not charging, `charger_limit_kw` is left completely untouched —
+  whatever the Signal Mapping tab or the idle 92.3kW placeholder already produced; driving-mode
+  overvoltage protection is entirely `charge_target_taper`'s job (below). Config: `ac_full_v`/
+  `ac_min_v`/`ac_cutoff_v`/`ac_emergency_v` (reworked 2026-08-06 — see "AC charger taper rework"
+  below), `ac_min_kw`/`ac_max_kw` (AC power request bounds), `daily_target_pct`/
+  `extended_target_pct`, `extended_mode` (toggle between the two targets). Its convergence rate is
+  NOT a config field at all - it dynamically self-selects one of the existing 0-7 `chg_uprate_level`
+  rates (see "AC charger taper rework" below).
 
 Both features:
 - Monitor all 96 individual cell voltages (primary: `0x4A9`/`0x4C0`, not the `0x020` pack-level
@@ -180,13 +202,79 @@ Both features:
   (`relay_cut_request`) — if a cell is still climbing after power is already fully backed off,
   something else is charging it. Per-cell voltage is always the authority, not a pack average.
 
-**Deliberate asymmetry, decided 2026-08-03: only `charge_target_taper` (regen) has hysteresis.**
-`charge_target_taper` carries fast-attack/slow-release state between ticks (`recovery_ramp_s`,
-same pattern as `discharge_power_taper`) - `ac_charge_taper` does not; `ac_factor` is a pure
-function of the current instantaneous voltage, recomputed fresh every tick with no smoothing.
-Explicit decision, not an oversight ("let's leave it and mark it as such so it's not confusing in
-the future") - if this asymmetry is ever revisited, it needs a real decision first, not a silent
-"fix."
+**REVERSED 2026-08-06, then REWORKED again the same day: `ac_charge_taper` needed genuinely gentle
+convergence, not just hysteresis.** Previously (decided 2026-08-03) `ac_charge_taper` deliberately
+had NO hysteresis - `ac_factor` was a pure function of the current instantaneous voltage, recomputed
+fresh every tick with no smoothing ("let's leave it and mark it as such so it's not confusing in the
+future"). A real bench test (2026-08-05) showed exactly the failure mode that decision risked:
+`charger_limit_kw` oscillating (including a repeating full-cycle hunt,
+`33.1→27.5→21.9→16.3→10.6→5.0→0.0→5.0→33.1→...` kW, cycling every ~3s, with a `5.00→33.10` kW jump
+in a single 10ms tick). This was checked against the CODE DEFAULT `ac_full_v`/`ac_min_v` (4.00V/
+4.15V) first, which the log's cell voltage (3.616-3.640V) never reaches - but the user confirmed
+they had deliberately bracketed those two thresholds down to 3.62V/3.64V for this specific test
+(`docs/13`'s own "bracket the threshold, not the battery" technique), which the log's voltage sits
+squarely inside. Re-checked numerically against that actual configuration: the OLD zero-hysteresis
+formula (`ramped_kw × ac_factor`, `ramped_kw=92.3`) reproduces the log's observed
+`charger_limit_kw` values to within encoding rounding at every real voltage sample checked - an
+exact match, not a plausible-sounding guess. The diagnosis stands as originally stated: an
+**instant** downward step (even with a slow release afterward) lets voltage sag more than
+necessary, which a voltage-driven taper then reads as safe and overshoots recovering -
+fast-attack-on-a-dip is right for the discharge/regen tapers' real danger-response case, wrong for
+a charger converging to a steady-state setpoint, and was directly responsible for this log's
+observed hunting. (A separate, real bug was also found and fixed the same session -
+`RealtimeEngine._apply_charge_ramp()`'s own asymmetric rate-limiting, see this doc's charger-ramp
+precision note - but that is independent of, not a substitute for, this taper's own fix.)
+
+**Final design: `ac_charge_taper` dynamically self-selects one of the existing 0-7 `chg_uprate_level`
+rates** (`leaf_signals.CHG_RAMP_RAW_PER_S`, real-hardware-confirmed - 2.0kW/s at level 7, halving per
+level down) **instead of a fixed time constant**, symmetric in both directions. Always starts at
+level 7 (fastest) the moment convergence begins, then downshifts (and upshifts back, with hysteresis
+on the level switch itself so the selected level doesn't flap right at a boundary) as the remaining
+distance to the target narrows or grows - gentler the closer it gets, never overshooting (each step
+is clamped to land exactly on the target rather than asymptotically approaching). Per the user's own
+directive: the transmitted 0x1DC uprate bits are a real signal that may be "used somewhere else in
+the system," so the level actually chosen for convergence is what's transmitted while the taper is
+genuinely active (`ManagementEngine.ac_uprate_level`, read by `RealtimeEngine._compose_leaf_state()`)
+- overriding the manually-configured `chg_uprate_level` only during that window, never outside it.
+See `bridge/management_engine.py`'s `_select_ac_uprate_level()` for the exact algorithm and its
+7 threshold constants (new, tuned starting values sized for the AC charger's realistic 0.5-6.6kW
+span - not researched/real-hardware-confirmed, same discipline as any other new tunable constant).
+`ac_recovery_ramp_s` (the fixed-time-constant field from the first fix) was removed the same day -
+never reached a saved profile, so no migration was needed.
+
+### AC charger taper rework (2026-08-06)
+
+Four related changes, all from the same real bench test session and user directive:
+
+1. **`ac_zero_v` renamed to `ac_min_v`, and the taper's floor changed from a literal 0kW to a
+   configurable `ac_min_kw`** (default 0.5kW). Previously, as cell voltage climbed from `ac_full_v`
+   to `ac_zero_v`, `charger_limit_kw` ramped all the way down to true zero, relying on the Leaf's
+   own charger reacting to a near-zero power request to actually stop drawing current. Now the
+   taper ramps down to `ac_min_kw` and **holds** there - it does not, by itself, stop the session.
+2. **New `ac_cutoff_v`** (default 4.18V, between `ac_min_v` and `ac_emergency_v`) - the deliberate,
+   explicit stop-charging voltage. Crossing this while `charge_permission_input` is active sets
+   `full_charge_flag`/`charge_limit_kw=0`/`charger_limit_kw=-10`, the exact same convention the
+   existing SoC-target-reached stop already uses, ending the session outright instead of leaving it
+   to the vehicle's own reaction to a low power request. `ac_cutoff_v` is a deliberate interior
+   point of the already-researched safe envelope (below `ac_emergency_v`'s 4.20V NMC ceiling), not a
+   new external safety number - the config-sanity check enforces `ac_full_v < ac_min_v < ac_cutoff_v
+   < ac_emergency_v`.
+3. **`ac_min_kw`/`ac_max_kw` AC power request bounds** (default 0.5/6.6kW, 6.6kW being the Leaf's
+   actual onboard AC charger ceiling) - clamp both the manual charger-ramp target
+   (`charge_target_kw`) and the AC taper's own floor. A `dc_min_kw`/`dc_max_kw` pair also exists as
+   a **placeholder only** (not read by any active logic) for a future DC fast-charge feature - see
+   `docs/10-open-questions.md` #9.
+4. **Gentle, self-adjusting convergence rate** (a same-day follow-up after a fixed-time-constant
+   hysteresis, added earlier the same day, turned out to be the wrong fix - see the paragraph above
+   this section). The taper dynamically self-selects one of the existing 0-7 `chg_uprate_level`
+   rates based on remaining distance to target, always starting at level 7 and downshifting/
+   upshifting (with hysteresis on the level switch) as it converges - and that same dynamically-
+   selected level is what's transmitted in 0x1DC's uprate bits while actively converging, so the
+   real signal genuinely represents what's happening, per the user's own directive.
+
+An older saved `profile.json` with the pre-rename `ac_zero_v` key is migrated automatically on load
+(`bridge/config_profile.py`'s `_apply_charge_emulation()`) - its real tuned value is copied to
+`ac_min_v` rather than silently reverting to the new default.
 
 `ac_charge_taper`'s target-SoC/`full_charge_flag` logic specifically:
   - **Gated on `charge_permission_input` for a reason found and fixed 2026-07-31**: the

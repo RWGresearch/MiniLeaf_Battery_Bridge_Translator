@@ -1828,3 +1828,505 @@ by every `FAULT_DEFINITIONS` entry and every dynamically-discovered `clamp_<key>
 `'warn'`, per `RealtimeEngine._compose_leaf_state()`) - so this catalog's own per-item tier
 (15.1-15.20) is literally what drives the grouping, no separate mapping table needed. Verified via
 a GUI smoke test (window builds with no exceptions, all rows present).
+
+---
+
+## Part 16 — Round 5: full safety re-audit against docs/memory/checklist + NMC-BMS industry research (2026-08-04)
+
+Requested: a complete code review compared line-for-line against the docs, the review checklist,
+and this project's own memory, plus a check against undocumented/industry-standard NMC BMS safety
+practices not already covered by `docs/12`'s research pass - specifically to confirm nothing was
+missed and that every cutoff and error-handling path is genuinely correct. Method: re-read every
+doc in `docs/`, all 63 items and their outcomes in Parts 1-15 above, every line of
+`bridge/management_engine.py`, `bridge/realtime_engine.py`, `bridge/rz450e_signals.py`,
+`bridge/state.py`, `bridge/leaf_signals.py`, `bridge/fault_log.py`, `bridge/mapping_engine.py`,
+`bridge/config_profile.py`, `bridge/can_backend.py`, and the relevant GUI wiring; ran all 10
+`tests/test_*.py` files (all pass) and `tests/check_profile_drift.py` (0 drift against the saved
+`config/profile.json`).
+
+**Headline result: every documented cutoff/tier (Parts 7, 9, 15 above) is implemented correctly as
+designed** - low/emergency voltage, both charge/regen tapers, over-temperature (hot and cold side),
+staleness watchdog, cell-data cross-check, hard-cut latching and its two genuine re-arm conditions,
+input/checksum validation, output clamping, and the narrowed 5th wind-down trigger all trace
+through the code exactly as `docs/05`/`docs/12`/`docs/13` describe, with no logic drift from what
+Parts 1-15 already closed. No previously-fixed item has regressed. The findings below are new gaps
+this pass found, not re-litigation of anything above.
+
+### 16.1 — Two critical background threads have no top-level exception handling - an uncaught error permanently and silently kills bridge transmission
+- [x] Reviewed
+
+`RealtimeEngine._tx_loop()` (`bridge/realtime_engine.py:878-969`) has ZERO try/except anywhere in
+its body - if `_compose_leaf_state()` throws for any reason (a KeyError from an unexpected config
+shape, a ZeroDivisionError, any bug), the entire thread dies permanently. This IS eventually caught
+by the heartbeat check (`gui/app.py`'s `HEARTBEAT_STALE_S`=2.0s, item 2.2's fix) showing "Bridge:
+NOT RESPONDING" - but the bridge then goes completely silent on the Leaf bus for the rest of the
+session with no auto-recovery; only a full app restart brings it back.
+
+Worse, `_ingest_rz_bus()` (`:406-458`) and `_did_poll_loop()` (`:505-528`) have NO equivalent
+heartbeat at all. Their try/except only wraps the `queue.get(timeout=0.2)` call
+(`:412-415`, `:494-497`) - everything downstream of that (checksum validation, frame decoding,
+`_ingest_validated()`, DID request/response handling) is unprotected. If either thread dies from an
+uncaught exception, the only symptom is that RZ450e input data stops updating, indistinguishable
+from "the adapter genuinely stopped sending" - eventually caught by the staleness watchdog's normal
+60s/+5s schedule, but with no distinct "ingest thread crashed" indicator the way the TX loop now has
+one. A real BMS's response to an internal software fault should be a defined, immediately-visible
+safe state (ISO 26262's fail-safe principle, `docs/12` §8) - not "wait up to 65 seconds and let it
+look like a data-staleness cutoff."
+**Your notes:**
+so Qustion, if we fix this here, will it carry over when we port to the STM32? if not then we can leave it. if yes then we need to fix it. 
+
+**Outcome (2026-08-04): answered, then FIXED.** Direct answer: the literal Python `try`/`except`
+mechanism does NOT port to C - but the safety principle it satisfies (an internal software fault
+must not silently and permanently halt safety-relevant transmission) absolutely does need a
+firmware equivalent, and is actually a HARDER requirement in firmware (a hardware/software watchdog
+timer forcing a defined safe state or MCU reset is the standard automotive answer, stronger than
+this app's own best-effort catch-and-continue) - see `docs/09`'s new note for the full explanation
+and the two concrete firmware requirements this implies. Since the answer was yes, fixed: all three
+loops (`_tx_loop`, `_ingest_rz_bus`, `_did_poll_loop`) now catch an unexpected exception, log it
+(rate-limited to once/second so a fast-repeating failure can't flood the Log panel), and continue on
+the next iteration/frame/DID instead of dying permanently. Critically, `_tx_loop`'s
+`last_tick_monotonic` heartbeat stamp was moved to only update on a SUCCESSFUL tick (at each real
+exit point, inside the `try`) rather than unconditionally at the top of the loop - a one-off failure
+now self-heals invisibly (next good tick refreshes the heartbeat well inside the existing 2.0s
+window), but a PERSISTENT failure still correctly trips "Bridge: NOT RESPONDING" exactly as before;
+catch-and-continue must never silently mask an ongoing problem as "the loop is fine." All 10 test
+files still pass.
+
+### 16.2 — No plausibility cross-check between `temp_min` and `temp_max` (unlike the equivalent per-cell-vs-pack-summary check that already exists)
+- [x] Reviewed
+
+`rz450e_signals.PLAUSIBLE_RANGES` bounds `temp_max`/`temp_min` independently (each -60..250°F) but
+never checks them against each other. A decode fault or byte-swap on `0x4A7` (`decode_temp_minmax`,
+`rz450e_signals.py:151-159`) could produce a `temp_min` reading numerically higher than `temp_max`
+while both individually pass their own plausibility bounds - and `over_temperature_derate`
+(`management_engine.py:663-664`) feeds `temp_min` directly into the cold-side derate/block logic
+(`cold_ref = temp_min if temp_min is not None else temp_max`), the exact path that exists
+specifically to prevent charging into a partly-frozen pack (docs/12 finding F1). This project
+already has the right pattern for exactly this class of problem - `cell_data_cross_check`
+(added 2026-08-01) compares two independently-sourced readings of the same underlying quantity and
+escalates on disagreement - but no equivalent exists for temp_min vs. temp_max, which are two
+fields on the very same frame (`0x4A7`) and could be validated with a single `temp_min <= temp_max
++ margin` check at decode or ingest time.
+**Your notes:**
+we do have a min and max on the can buss live data. but no DID PID. sp we will need to compar that to the 16 temps and use the min max there to confirm. 
+
+**Outcome (2026-08-04): FIXED, exactly as directed.** New `temp_data_cross_check` feature
+(`bridge/management_engine.py`), same soft→hard escalation structure as `cell_data_cross_check`:
+compares `0x4A7`'s pack-level `temp_max`/`temp_min` against the ACTUAL min/max computed live from all
+16 individual `0x4AA` probes (`temp_01`..`temp_16`) - not a fixed on/off check, the real per-probe
+data as directed. Default 10°F max delta / 60s soft / +5s hard (documented starting point, not yet
+real-hardware-confirmed - see `docs/11`). Reports "no data to cross-check yet" (no false trigger)
+when the 16 individual probes haven't arrived, which is the state every pre-existing test in this
+project's suite uses (`base_inputs()` only sets `temp_max`/`temp_min`), confirmed by a dedicated test
+so this new feature can't retroactively break anything else. Fully wired: `FEATURE_FIELD_BOUNDS`,
+`ManagementPanel` fields/label/help text, `FAULT_DEFINITIONS` (`temp_data_mismatch`/
+`temp_data_mismatch_hard`), 3 new tests in `tests/test_management_engine.py`, `docs/05`/`docs/09`/
+`docs/11` updated. All 10 test files pass; `check_profile_drift.py` correctly reports the 4 new
+fields as "missing from profile" (expected for any new feature, safely defaulted at load per
+`ManagementEngine.from_dict()`'s known-fields pattern) until the profile is next re-saved.
+
+### 16.3 — Two safety-relevant soft-cut flags (`capacity_empty`, `full_charge_flag`) and the hard-cut's `interlock` companion are exposed as ordinary user-mappable Signal Mapping targets, unlike `relay_cut_request`
+- [x] Reviewed
+
+`leaf_signals.py`'s own comment (`:265-268`) explains that `relay_cut_request` is deliberately kept
+out of `SLIDERS`/`CHECKS` specifically because it's "driven exclusively by the battery-management
+layer, never a direct mapping target." `capacity_empty`, `full_charge_flag`, and `interlock` are
+all in `CHECKS` (`:98-104`) instead, which means all three flow into `OUTPUT_SIGNALS`
+(`_build_output_registry()`, `:248-260`) and are selectable today in the Signal Mapping tab's output
+dropdown (confirmed: `gui/panels.py:610` builds `MappingPanel`'s output list unfiltered from
+`OUTPUT_SIGNALS`) - with no warning that these three are meant to be management-only.
+
+This matters because of how `ManagementEngine.apply()` actually writes these fields: it only ever
+forces `capacity_empty`/`full_charge_flag` to **1** and `interlock` to **0** when its own condition
+is true (`management_engine.py:975-986`) - there is no corresponding `else: out['capacity_empty'] =
+0` etc. If a user creates a mapping tie targeting one of these three (deliberately, or by picking
+the wrong item from a long dropdown), whatever the mapping engine computes for it every tick
+(`_compose_leaf_state()` applies mapping BEFORE management, `realtime_engine.py:781-785`) becomes
+the value on any tick where management's own condition is false - management can add its own
+force-on, but can never force the field back to a "clear" state the mapping tie is holding it away
+from. Concretely: a tie that evaluates non-zero could keep `capacity_empty` (or `full_charge_flag`,
+or a cleared `interlock`) permanently stuck asserted regardless of real battery condition, and
+because this happens entirely inside the mapping layer, none of it shows up in the Fault History
+window (which only reflects `ManagementEngine`'s own fault_log) - a technician would see the
+dashboard say "cut off" with every management status line reading "ok."
+**Your notes:**
+yeah, we need to fix this. we need to be sure those are somewhere in the dashboard so we can see there output sendt.
+
+**Outcome (2026-08-04): FIXED, both parts, plus a real bug found and corrected along the way.**
+While tracing the fix, found the write-up above had actually UNDERSTATED the problem: the code
+comment claiming `relay_cut_request` was "not itself in SLIDERS/CHECKS... never a direct mapping
+target" was simply WRONG - it had been sitting in `SLIDERS`, fully user-mappable, the entire time,
+alongside `capacity_empty`/`full_charge_flag`/`interlock`, none of which were ever actually
+protected. Fixed properly rather than just updating the stale comment: new
+`leaf_signals.MANAGEMENT_EXCLUSIVE_KEYS` (`relay_cut_request`, `capacity_empty`, `full_charge_flag`,
+`interlock`) excludes all four from `OUTPUT_SIGNALS` (`_build_output_registry()`) so none can be
+picked as a Signal Mapping tie's output, while staying in `SLIDERS`/`CHECKS`/`DEFAULTS`/`RANGES` for
+everything else (dashboard display, output clamping). Second half: `ManagementEngine.apply()` now
+explicitly clears `capacity_empty`/`relay_cut_request`/`interlock` back to their safe value every
+tick when no condition holds, not just conditionally forcing the cut value - closing the gap even if
+some other future bug ever re-exposed these fields. `full_charge_flag` deliberately did NOT get the
+same explicit-clear treatment - it's legitimately also set by `RealtimeEngine._apply_charge_ramp()`
+in a different module/moment, and a centralized unconditional clear inside `ManagementEngine.apply()`
+would race against and undo that; removing it as a mapping target alone closes the actual
+vulnerability without that risk. **Dashboard visibility**: `capacity_empty`/`full_charge_flag`/
+`interlock` were already shown in the Flags section (reads `CHECKS` directly, unaffected by the
+`OUTPUT_SIGNALS` change) and `relay_cut_request` was already shown in the main per-signal bar list
+(reads `SLIDERS` directly) - both confirmed unaffected by this fix. Per your direct ask, also added
+`relay_cut_request` to the Flags section too (previously only in the main list), so all four
+safety-relevant flags are now visually grouped together where a technician would look first for "is
+something cut off right now." 2 new tests added (`tests/test_mapping_engine.py`,
+`tests/test_management_engine.py`); `docs/03` corrected to remove the stale/wrong claim and document
+the real, now-fixed behavior. All 10 test files pass.
+
+### 16.4 — Two standard EV-pack safety practices from `docs/12`'s own research area are not addressed anywhere in this project's docs, and were never explicitly scoped in or out
+- [x] Reviewed
+
+Checked against the same ISO 26262/UL 2580/IEC 62660 literature `docs/12` already cites, plus
+general NMC/EV-pack BMS design practice, for anything `docs/12`'s original research pass didn't
+cover:
+
+- **Insulation/isolation-resistance monitoring** (HV+/HV- to chassis ground leakage) is a standard,
+  often regulatorily-required EV HV-pack safety function (ISO 6469-1, UL 2580) - a degrading
+  insulation fault is a shock/fire hazard independent of any voltage/temperature/current condition
+  this bridge already watches. Nothing in `docs/02`'s confirmed-signal list or `docs/10`'s open
+  questions mentions whether the RZ450e pack exposes an isolation-monitor signal at all, or whether
+  its own internal isolation monitoring (if any) still functions once bridged into this
+  configuration (same open question already raised for cell balancing, `docs/10` #7). Unlike
+  overcurrent/DC-fast-charging (`docs/10` #8/#9), which got an explicit "here's why this is out of
+  scope" writeup, isolation monitoring was never discussed at all.
+- **Contactor/relay commanded-vs-actual-state readback** (weld detection) - this bridge asserts
+  `relay_cut_request`/`interlock` as open-loop *requests* to the Leaf's own VCM; it has no signal
+  path to confirm the real contactors actually opened (or that the RZ450e-side contactors, if any
+  exist independent of the Leaf's own pack contactors, responded either). This is architecturally
+  inherent (the bridge doesn't own or directly drive contactor hardware on either side) and may be
+  a legitimate, permanent "not this project's job" - but per this project's own confirmed-vs-
+  documented discipline, that should be a written, deliberate scope statement in `docs/10`, not
+  silence.
+
+Neither is a code change - both are candidates for a new `docs/10` open-question entry (matching
+the treatment `docs/10` #7/#8/#9 already got) so a future session doesn't have to rediscover that
+these were considered and knowingly left out, versus simply never having come up.
+**Your notes:**
+is there DTC's on the RZ450e that detect the insulation/isolation-resistance monitoring? we could add those 
+and if true we can check that and create a result if we need to. or jsut set a flag for monitering.
+
+lets look online, there is TDC's for weld detection for this but there no from the battery ( i dont think ) 
+I think there from the VCM or other on the leaf. so we should look for where that comes from. and possinbaly 
+we could detect that there? 
+
+**Outcome (2026-08-04): researched via web search, both questions answered directly, added as
+`docs/10` open questions #14/#15 (no code change - neither is implementable from what this project
+currently has).**
+
+**Isolation/insulation monitoring - yes, real, and there's a generic DTC for it.** Confirmed via
+web research: **P0AA6** ("HV Isolation Fault") is a standardized, generic OBD-II code used across
+the EV industry for exactly this - explicitly confirmed applicable to both Toyota/Lexus and Nissan
+EVs, not a hypothetical. It's plausible the RZ450e's own ECU maintains this internally. **But it's
+not currently reachable, for a specific reason**: every diagnostic signal this project reads
+(`docs/02`) uses UDS **ReadDataByIdentifier (service `0x22`)** - DTC-style isolation faults are read
+via a completely different UDS service, **ReadDTCInformation (service `0x19`)**, which this project
+(and the RZ450e reference project) has never attempted. Concrete next step, not vague: try a UDS
+`0x19` request against the same confirmed `0x747`→`0x74F` diagnostic addressing already used for
+service `0x22`, and see whether the pack responds at all - genuinely unknown until that capture
+happens. See `docs/10` item 14.
+
+**Weld detection - correctly guessed, and it's structurally unreachable, not just unimplemented.**
+Confirmed: this is a VCM/inverter-side electromechanical check (did a commanded contactor-open
+actually produce a real disconnect), verified via vehicle-side contactor-drive/F/S-relay feedback
+lines that have no representation on either CAN bus this project taps into. It isn't something the
+*battery* reports in any EV architecture - your instinct that it comes from the VCM/Leaf side, not
+the battery, was correct. The Leaf's own unmodified VCM (which this bridge feeds HVBAT frames, per
+`docs/07`) presumably runs its own weld-detection logic entirely independently of what this bridge
+sends. Unlike isolation monitoring, there's no plausible signal path to go looking for here - this
+stays permanently out of scope. See `docs/10` item 15.
+
+---
+
+## Part 17 — Round 6: first real-bench-hardware test findings (2026-08-06)
+
+Different in kind from Parts 1-16: those were code-review passes with no real hardware involved.
+This is the first round driven by actual `.trc` captures off the real bench pack (the data logger
+Part 11 asked for) - two sessions, `logs/minileaf_20260805_200831_Charging to xx% the restart.trc`
+and `logs/minileaf_20260805_202221 testing cell cutoff and ramp down.trc`. Method: wrote two new
+diagnostic scripts (`tests/check_charge_ramp_log.py`, `tests/check_shutdown_sequencer_replay.py`)
+to decode the actual captured CAN traffic and, for the shutdown question, replay it through the
+REAL `ShutdownSequencer` class rather than reasoning about the code in the abstract - root causes
+below are traced from real decoded data, not inferred from reading the source alone.
+
+### 17.1 — Log save location defaults into `config/`, not a dedicated logs folder
+- [x] Reviewed
+
+Start Log's save dialog (`gui/app.py`'s `_toggle_trc_log()`) defaulted `initialdir` to
+`config_profile.CONFIG_DIR` - functional, but mixes one-off `.trc` captures in with the
+deliberately-tracked `config/*.json` backup files.
+**Your notes:**
+I would like to change the log location to the log folder, which I've created. So the default
+should be there when you hit save log.
+
+**Outcome (2026-08-06): FIXED.** New `config_profile.LOGS_DIR` (sibling of `config/`, matching the
+`logs/` folder already created) + `_ensure_logs_dir()` helper; `_toggle_trc_log()` now defaults
+there instead. `logs/` added to `.gitignore` (per-session capture artifacts, not a deliberate
+tracked backup like `config/*.json` - flagged to the user in case captures should actually stay
+tracked). Software-verified only (`config_profile.LOGS_DIR` resolves to the real existing `logs/`
+folder) - not yet re-confirmed by actually clicking Start Log in the running app.
+
+### 17.2 — Bridge stayed awake and transmitting for ~110s past where every wind-down trigger's own timer should have fired, one real charge cycle out of three
+- [x] Reviewed
+
+Decoded the "restart" log: 2 of 3 charge cycles wound down and slept correctly - confirmed by
+replaying the REAL captured Leaf-bus traffic through the actual `ShutdownSequencer` class
+(`tests/check_shutdown_sequencer_replay.py`), which reproduces both real wind-downs almost exactly
+(within ~1.2s of the real observed timing, matching the staged power-down timing table itself). The
+3rd cycle did not: continuous Leaf-bus TX for another ~110s with zero gap, even though replaying
+that exact same captured traffic predicts wind-down ~3s after the last `0x1F2` frame, regardless of
+what `charge_permission_input` was doing at the time (checked both forced-True and forced-False).
+**Your notes:**
+there are two logs i created while testing. both of them have something slightly different in them.
+however, both of them show when the charger is disconnected, it starts up the bridge and never
+shuts off. i don't really know the condition to shut off in that scenario. this is after charge is
+full is triggered. everything comes back online ok but it should sleep at some point? it powers
+down correctly when it's supposed to, but then when i go to disconnect the charger plug, it fires
+back up. i didn't leave it on for a super long time, but i don't think it would have shut down.
+
+**Outcome (2026-08-06): PARTIALLY RESOLVED - root cause of the specific 3rd-cycle discrepancy NOT
+identified, honestly documented as still open (`docs/10` #16), NOT swept under the rug.** Every
+trigger's own inputs, replayed offline, look like they should have resolved normally for that cycle
+too - the replay is a simplified event-driven reconstruction of `charge_permission_input` from the
+logged `0x358` frames, and may not perfectly capture some live-app-only timing/threading
+interaction the static replay can't reproduce. What IS fixed, unconditionally: added a 6th,
+bridge-specific defensive wind-down trigger (`leaf_signals.BUS_SILENCE_TIMEOUT_S` = 30.0s,
+`ShutdownSequencer._should_wind_down()`) - if the Leaf bus goes completely silent for 30s regardless
+of any other trigger's state, wind down anyway. This bench rig has no ignition wiring at all, so
+only the charge-session triggers can ever fire; this closes the general "none of them ever resolve,
+for whatever reason" gap even though it doesn't explain this specific case. Re-ran the replay
+script against both logs with the new trigger in place: timings for all 5 genuine wind-downs across
+both logs are UNCHANGED (the 6th trigger never preempts a legitimate faster trigger), confirming it
+doesn't introduce a regression. Documented in `docs/07` ("Sixth trigger" section), `docs/10` (#16,
+the open discrepancy itself), `docs/11` (new row, marked Documented/unverified). Needs a re-test
+with the Log panel's timestamps cross-referenced against a fresh `.trc` capture to actually catch
+the original discrepancy in the act, if it recurs.
+
+### 17.3 — AC charger ramp "jumps around" during a ramp-down test; related AC-charger config requests
+- [x] Reviewed
+
+Decoded the cutoff-test log: `charger_limit_kw` genuinely oscillating
+(`5.20->5.00->5.10->5.20->...->5.70->5.40->...` kW) while cell voltage sat at 3.615-3.627V - squarely
+inside a deliberately tight 3.62V/3.64V test band the user had configured for a separate cell-cutoff
+test. Root cause: `ac_charge_taper` was built with a deliberate 2026-08-03 "no hysteresis" decision
+(`docs/13` Part 9) - a pure function of instantaneous per-cell voltage, recomputed fresh every tick
+from noisy individual-cell readings; inside a 20mV test band that's a large multiplier swing per mV
+of noise. Separately, found while reading the ramp code (not from this log): `RealtimeEngine.
+_apply_charge_ramp()`'s target tracking only rate-limited an INCREASING target
+(`min(current+rate*dt, target)`) - a DECREASING target snapped instantly with zero rate limit, the
+actual mechanism behind the oscillation once it's traced through: a live target/factor change could
+produce an instant multi-hundred-watt jump in a single 10ms tick.
+**Your notes:**
+the test where i test the stop at charge % seems to work fine see log for reference. for the test
+where i try to ramp down to allow the voltage to come to a steady state didn't work very well
+because the ramp down wasn't high precision, we need fine 100W precision on the ramp. it seemed to
+jump around quite a bit. [...] the maximum AC charging is only 6.6 kilowatt for the leaf. therefore,
+it needs to ramp from let's say 7 kilowatt down to 500 watts for example. let's make this
+configurable, min and max kW request for AC, and min and max kW for DC charging [...] right now it
+should when it reaches the set value for zero power trigger the full charge bit and stop. we need
+to add one more value for this to work, this value will be the minimum charge voltage [...] which
+the ramp down will go to until it reaches the voltage value. it will hold the minimum kw charge
+request from the ramp and then shut off once it reaches the zero value, so really rename the zero
+power to minimum value and make a new value called cutoff or stop charging for a set voltage [...]
+we also need a bit more hysteresis time for the charger, let's make that configurable as well.
+
+**Outcome (2026-08-06): FIXED, all parts.** Reversed the 2026-08-03 no-hysteresis decision based on
+this new real-hardware evidence (`docs/05`'s "AC charger taper rework" section documents the
+reversal explicitly, replacing the old note rather than silently deleting it) - `ac_charge_taper`
+now carries the same fast-attack/slow-release hysteresis the sibling regen/discharge tapers already
+had, via new configurable `ac_recovery_ramp_s`. `ac_zero_v` renamed to `ac_min_v`; the taper's floor
+changed from a literal 0kW to configurable `ac_min_kw` (holds there instead of driving to true
+zero, and does not force a ramp value already below the floor UP to it - preserves the ramp's own
+startup precision). New `ac_cutoff_v` (interior point of the already-researched safe envelope,
+between `ac_min_v` and the existing `ac_emergency_v` NMC ceiling) deliberately ends the session
+(`full_charge_flag`) once crossed, gated on `charge_permission_input` the same as the existing
+SoC-target-reached stop (must not fire while simply driving). New configurable `ac_min_kw`/
+`ac_max_kw` (6.6kW default ceiling = the Leaf's real onboard AC charger max, per user spec) clamp
+both this taper's floor and the manual `charge_target_kw` ramp target. `dc_min_kw`/`dc_max_kw` added
+as a PLACEHOLDER ONLY (confirmed scope with the user - no active DC charging logic exists yet),
+surfaced on the Future tab. The ramp's symmetric-rate-limiting bug fixed separately: decreases now
+rate-limit exactly like increases always did, giving real fine (100W-scale, matching the user's
+explicit ask) control over a falling target either from a live edit or the new min/max clamp.
+7 new tests added (`tests/test_management_engine.py`, `tests/test_charge_ramp.py`) covering the
+floor behavior, the cutoff, the hysteresis, and the symmetric ramp - all pass. An older saved
+`profile.json`'s `ac_zero_v` value migrates automatically to `ac_min_v` on load
+(`bridge/config_profile.py`), confirmed against the real saved profile. `docs/05`, `docs/09`,
+`docs/11` all updated. Software-verified only (unit tests + a replay of the OLD oscillation bug
+against the real log, confirming the diagnosis) - the NEW behavior (min-kW floor, cutoff voltage,
+hysteresis) has not yet been re-tested against real charging hardware; see `docs/15` for the
+specific real-hardware follow-up items.
+
+**Correction (2026-08-06, same day, found while writing 17.5's regression test): the root-cause
+attribution above was WRONG - `ac_charge_taper` was never actually engaged during this log at
+all.** Checked directly: `_ramp_factor(3.62, floor=ac_full_v=4.00, ceiling=ac_min_v=4.15)` and the
+same at 3.64V both evaluate to exactly `0.0` - the cell voltage throughout the ENTIRE log
+(confirmed by scanning every `0x020` frame in the capture: 3.616-3.640V range, never higher) never
+once entered the taper's 4.00-4.15V window. `instant_factor` was a constant `1.0` (full power,
+completely untapered) the whole session in BOTH the old and new code - the taper's own hysteresis
+(or lack of it) cannot be what produced the observed oscillation, in either this log's small early
+swings or the later `33.1→...→0.0→33.1` repeating cycle (also re-checked: same 3.6-3.7V range
+throughout). The real mechanism is almost certainly the SECOND thing found in this item's own
+original writeup above - `_apply_charge_ramp()`'s asymmetric rate-limiting bug (decreasing target
+snapped instantly) - most likely triggered by the user live-adjusting the "Charger ramp target
+(kW)" GUI field during the test (each keystroke fires an immediate config write via
+`ChargeEmulationPanel`'s `trace_add`, consistent with the small-scale swings) or by real
+Leaf-commanded `0x1F2` power values changing (confirmed varying between 100/150/160 during the
+later repeating-cycle window, though `trans` stayed continuously active so a ramp reset from a
+literal request drop looks unlikely on its own). That specific bug was already fixed earlier the
+same session (this item's own outcome above, "the ramp's symmetric-rate-limiting bug fixed
+separately") - independent of and prior to 17.5's AC-taper convergence-rate rework below. 17.5's
+fix is a real, sound improvement for when the taper genuinely IS engaged (a pack actually
+approaching 4.00V+) - the user's CC-CV physics reasoning is correct and general - but it is **not
+confirmed to be what fixed the specific evidence cited in this log**, and the `docs/11`/`docs/15`
+entries referencing "confirmed against this log" have been corrected to reflect that distinction.
+
+**THIS CORRECTION WAS ITSELF WRONG - see item 17.6 below.** It checked cell voltage against the
+CODE DEFAULT `ac_full_v`/`ac_min_v` (4.00V/4.15V) - but the user had NOT been running with the
+defaults for this test; they had deliberately bracketed those thresholds down to 3.62V/3.64V
+(this project's own "bracket the threshold" technique, `docs/15`), which the log's voltage sits
+squarely inside. 17.6 re-verifies numerically against the actual configuration used and confirms
+the ORIGINAL diagnosis (this item's own outcome above, before this now-retracted correction) was
+right all along.
+
+### 17.4 — Charge Emulation tab number fields accept empty/out-of-range input with no visual feedback
+- [x] Reviewed
+
+Unlike the Battery Management tab's `ManagementPanel` (which flags "invalid"/"clamped" next to
+every field, added `docs/13` Part 4), `ChargeEmulationPanel._set_float`/`_set_int` silently `pass`
+on a `ValueError` (empty/non-numeric input just leaves the last-good config value with zero
+indication anything was wrong) and silently clamp out-of-range input with no visual flag either.
+**Your notes:**
+also check that we can't enter a non valid value in the charger inputs. it seems i was able to
+enter nothing and also outside safe limits.
+
+**Outcome (2026-08-06): FIXED.** Ported `ManagementPanel`'s exact invalid/clamped `flag_lbl`
+pattern into every numeric Entry on the Charge Emulation tab (including the new fields from 17.3
+and the new DC placeholder fields on the Future tab). Directly verified (not just by inspection):
+scripted an empty-string entry -> flag reads "invalid", config value unchanged; scripted an
+out-of-range entry (999 against a 0-5.0 bound) -> flag reads "clamped", config value clamped to 5.0.
+
+### 17.5 — 17.3's hysteresis fix was itself the wrong model: a closer look at the same log showed a repeating hunt, not just a rough jump
+- [x] Reviewed
+
+Continuing 17.3's investigation the same day: re-decoded the FULL `.trc` log (not just the tail
+originally inspected) and found a much clearer picture of the failure than "jumps around" - a
+repeating full-cycle hunt late in the log (`33.1→27.5→21.9→16.3→10.6→5.0→0.0→5.0→33.1→...` kW,
+cycling every ~3s for over 20 seconds straight), including a `5.00→33.10` kW jump in a single 10ms
+tick - well beyond what 17.3's fixed-time-constant hysteresis fix (instant fast-attack down, slow
+release up) would have prevented, since that fix kept the DOWN direction instant, copying the
+discharge/regen tapers' own design.
+**Your notes:**
+so for the ramp, what the system must do is ramp slowly the closer it gets to minimum kW request.
+in yesterday's test it was jumping from 4.4kw to 0, never anything in between [...] it should ramp
+down slowly. of course the closer it gets to its set value the slower it will ramp. here is what
+we are solving for, under charge load, the voltage will jump up. so lowering the input current
+will reduce this. we are using the CC-CV charge characteristics, therefore the ramp must be gentle
+enough to change the input in a way where the closer it gets to the minimum power set point, the
+gentler it needs to adjust. 500W of input power jump could bump the current up a lot and then it
+will hunt for a steady state. that's what it's doing now.
+
+[Follow-up, after a proposed exponential/proportional-filter design]: i think this makes sense. we
+already have a 0-7 ramp rate. i suggest we use that to control how fast we ramp. the closer we get
+to the required minimum power the slower we change the ramp. [...] especially when trying to ramp
+down. then use a slower ramp up and it will help not hunt but instead self-adjust because the
+closer we get to the min set point the slower we need to respond. [Clarified when asked whether the
+transmitted uprate bits should reflect this too:] the 0-7# is a driven number that gets sent out on
+the bus. so it needs to kinda represent what's going on with the request in case it's used
+somewhere else in the system [...] stick with always starting at #7. then change as required if
+things are in the window that is supposed to ramp.
+
+**Outcome (2026-08-06): FIXED - the fast-attack/slow-release hysteresis from 17.3 removed and
+replaced the same day with a dynamically-selected 0-7 convergence rate, per the user's own
+architecture.** Correct root-cause diagnosis: this is a CC-CV charging control loop, not a danger-
+response cutoff - an instant downward step (even with a slow release afterward) lets voltage sag
+more than necessary, the taper reads that as safe and lets power back up, overshoots, and the loop
+hunts. Fast-attack-on-a-dip is the right model for the discharge/regen tapers (arresting real cell
+sag under load, unchanged) but the wrong one here. New design (`bridge/management_engine.py`'s
+`ac_charge_taper` block + new `_select_ac_uprate_level()`): the taper dynamically self-selects one
+of the existing 0-7 `chg_uprate_level` rates (`leaf_signals.CHG_RAMP_RAW_PER_S`, real-hardware-
+confirmed - 2.0kW/s at level 7, halving per level down) based on remaining distance to target,
+always starting at level 7 the moment convergence begins, downshifting/upshifting symmetrically
+(with hysteresis on the level switch itself, via new `_AC_LEVEL_DOWNSHIFT_KW`/
+`_AC_LEVEL_HYSTERESIS_MULT`, so the SELECTED LEVEL doesn't flap right at a boundary - verified
+directly with a scripted oscillation right at a threshold: stayed locked at one level instead of
+flapping). Each step is clamped to land exactly on target, never overshoots. Per the user's explicit
+clarification, the dynamically-selected level is now what's actually TRANSMITTED in `0x1DC`'s uprate
+bits while the taper is genuinely converging (`ManagementEngine.ac_uprate_level`, read by
+`RealtimeEngine._compose_leaf_state()`) - overriding the manually-configured `chg_uprate_level` only
+during that window, "always starting at #7" then changing "as required" exactly as directed.
+`ac_recovery_ramp_s` (17.3's fixed-time-constant field) removed cleanly - never reached a saved
+profile, no migration needed. New tests in `tests/test_management_engine.py` include a directed
+regression test that puts cell voltage genuinely INSIDE the taper's `ac_full_v`-`ac_min_v` window
+(the DEFAULT 4.00-4.15V window specifically - a synthetic scenario, not a replay of the real log's
+own sequence) and confirms the new algorithm never produces a same-tick multi-kW jump there,
+converges without overshoot, and correctly starts at level 7. `docs/05`, `docs/08`, `docs/09`,
+`docs/11`, `docs/15` all updated. Software-verified only at the time this item was written (unit
+tests + level-selection logic verified standalone) - **see item 17.6 below**, written shortly
+after this one: the "2026-08-05 log never reached the taper's window" claim above turned out to be
+checked against the wrong (default) configuration, and a REAL replay of the actual log against
+this exact new algorithm is now also available, with real-data results. `docs/15` B20 tracks the
+remaining live-hardware retest, explicitly flagged as the item most likely to need a follow-up
+tuning pass (the 7 threshold constants are new, not real-hardware-confirmed).
+
+### 17.6 — 17.3's original diagnosis was RIGHT after all - my own "correction" (above, in 17.3) was wrong, caused by checking the wrong config values
+- [x] Reviewed
+
+17.3's own correction above concluded the AC taper was never engaged during the 2026-08-05 log,
+based on checking cell voltage (3.616-3.640V) against the CODE DEFAULT `ac_full_v`/`ac_min_v`
+(4.00V/4.15V). That check itself was correct - but it checked the wrong configuration. The user
+had NOT been running with the defaults for this specific test; they had deliberately bracketed
+`ac_full_v`/`ac_min_v` down to 3.62V/3.64V (`docs/15`'s own "bracket the threshold, not the
+battery" technique - moving a feature's threshold to sit just past the pack's real, current,
+everyday voltage to test the logic without needing genuine extremes), exactly matching the log's
+filename ("testing cell cutoff and ramp down").
+**Your notes:**
+you were correct. i set the values to 3.62 and 3.64 for testing. so that's correct. you can retest
+with those values if you want. [...] of course that's not the typical, but that's what i tested
+at. [clarifying, when asked:] typical is what you already tested with.
+
+**Outcome (2026-08-06): Re-verified numerically against the real log with the correct (actually-
+tested) values - 17.3's ORIGINAL diagnosis is confirmed, not the "correction."** Checked
+`_ramp_factor(3.62..3.64, floor=3.62, ceiling=3.64)` - the log's actual cell voltage range sits
+squarely inside that window (unlike the 4.00-4.15V default window, which it never reached).
+Cross-referenced the OLD (pre-fix) zero-hysteresis formula directly against the real log's
+`0x020` cell_max readings and observed `charger_limit_kw` values, with `ramped_kw=92.3` (the idle
+DEFAULTS ceiling): predicted `50.07/44.44/27.54/21.90/16.27/5.00/0.00` kW against OBSERVED
+`50.00/44.40/27.50/21.90/16.30/5.00/0.00` kW - an exact match to within encoding rounding. This is
+airtight: the taper's own zero-hysteresis, per-cell-voltage-driven formula, evaluated against the
+user's ACTUAL bracketed test window, fully explains the log's observed oscillation (both the small
+early swings from single-ADC-count voltage noise, ~1.2mV, producing large relative swings inside
+a tight 20mV window, and the later repeating cycle, which lines up with real, continuous, slowly-
+drifting voltage climbing steadily through the window and dropping back - itself plausibly the
+real CC-CV hunting interaction the user described: cut power hard, voltage relaxes, release power,
+voltage climbs, repeat).
+
+**Retest performed as requested**, using a new diagnostic script
+(`tests/check_ac_taper_log_replay.py`, added this session) that replays the real captured cell-
+voltage trace from the log through the ACTUAL current `ManagementEngine.apply()` (real elapsed
+time between calls) with `ac_full_v=3.62`/`ac_min_v=3.64` - the same bracketed values actually
+used. Result: worst single-call jump across the entire ~1780-second real replay is **0.819kW**
+(vs. the original log's real multi-kW same-tick jumps) - the new dynamically-selected 0-7
+convergence rate genuinely fixes the exact real scenario captured in this log, confirmed against
+real data, not just a synthetic scenario. The 3.62V/3.64V window is explicitly a deliberate
+bracketed TEST configuration, not the "typical"/default operating thresholds (4.00V/4.15V, per
+user clarification "typical is what you already tested with") - 17.5's synthetic regression test
+(midpoint 4.075V, the default window) remains valid coverage for ordinary/typical operation
+alongside this real-data confirmation for the bracketed-test scenario.
+
+**Docs corrected back** (17.3's "Correction" paragraph above is left in place, not deleted, per
+this project's own convention of keeping the mistake-and-correction trail visible rather than
+silently rewriting history - it explains WHY the wrong conclusion was reached, which remains
+useful): `docs/05`'s "REVERSED... then REWORKED" note, `docs/11`'s AC-taper row, and `docs/15`'s
+B20 intro all updated to reinstate the original diagnosis with this stronger, now-real-data-backed
+evidence, replacing the incorrect walk-back. **Lesson for future sessions, worth remembering
+generally for this project**: when diagnosing a bug from a real `.trc` capture, always check the
+ACTUAL live/session-configured threshold values that were in effect during that specific test, not
+the code defaults - `docs/15`'s own "bracket the threshold" technique means a real test session
+frequently runs with thresholds deliberately moved away from their defaults, so assuming defaults
+were in effect during a specific historical capture is not a safe shortcut.
+
+---

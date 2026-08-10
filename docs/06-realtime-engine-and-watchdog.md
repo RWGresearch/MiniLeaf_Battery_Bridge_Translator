@@ -183,10 +183,10 @@ The problem auto-clearing alone creates: a brief fault could trip and self-clear
 GUI status polls, with no record it ever happened. `bridge/fault_log.py`'s `FaultLog` sits inside
 `ManagementEngine` and records every trigger/clear transition for every tracked condition
 (`FAULT_DEFINITIONS`) plus every output-clamp event (section 4 above) — a running count, first/last
-triggered, last cleared, and the live active/cleared state — surfaced in the **Fault History**
-section of the Dashboard window's right column (`gui/dashboard.py`, see `08-gui-design.md` — moved
-there from beside the Log panel in the main window per user follow-up the same day, so it sits
-alongside the rest of the live status info). A per-entry **Reset** button
+triggered, last cleared, and the live active/cleared state — surfaced in its own **Fault History
+window** (`gui/fault_history_window.py`, see `08-gui-design.md`'s "Fault History window" section —
+it moved through the Dashboard's right column and left list before ending up in its own
+`tk.Toplevel` once there wasn't room for it alongside everything else). A per-entry **Reset** button
 lets the user acknowledge/clear the recorded history for one entry — this cannot and does not force
 a still-true condition to false (that value is re-derived from live sensor data every tick,
 unchanged); if the condition is genuinely still active, the very next tick sees a fresh trigger and

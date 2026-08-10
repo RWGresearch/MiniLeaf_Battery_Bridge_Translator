@@ -239,6 +239,17 @@ class ShutdownSequencer:
             else:
                 self._chg_stall_since = None
 
+            # 6th trigger, bridge-specific defensive fallback (docs/07,
+            # added 2026-08-06 - see leaf_signals.BUS_SILENCE_TIMEOUT_S's own
+            # comment for the full rationale): if the Leaf bus has gone
+            # completely silent (no frame of ANY ID, not just ignition/charge
+            # IDs) for this long while still in startup/running, wind down
+            # regardless of what the other triggers are doing. last_leaf_rx_t
+            # is guaranteed non-None here (reaching startup/running at all
+            # required at least one prior note_leaf_rx() call).
+            if now - self.last_leaf_rx_t >= leaf_signals.BUS_SILENCE_TIMEOUT_S:
+                return True
+
             return False
 
     def tick(self, staleness_hard_cut, charge_authorized=True):
@@ -408,6 +419,19 @@ class RealtimeEngine:
         every ID (diagnostic/DID traffic and the fast internal-bus broadcasts
         together), split by CAN ID rather than by physical bus, matching how
         this project's hardware is actually wired."""
+        # Fault containment (docs/13 item 16.1, added 2026-08-04) - see
+        # _tx_loop's own comment for the full rationale. This thread has no
+        # heartbeat of its own; before this fix, a single bad/unexpected
+        # frame throwing anywhere past the queue.get() (decode, checksum
+        # check, validation, state update) permanently killed RZ450e ingest
+        # for the rest of the session - the only symptom would have been
+        # every input signal eventually going stale and tripping the
+        # staleness watchdog ~60s later, indistinguishable from a genuine
+        # hardware disconnect. Now one bad frame is logged and dropped; the
+        # next frame is processed normally. Log spam rate-limited to
+        # once/second, same pattern as _tx_loop.
+        last_exc_log_t = 0.0
+        exc_count_since_log = 0
         while self._running:
             try:
                 kind, _label, msg = self.rz_bus.rx_queue.get(timeout=0.2)
@@ -415,47 +439,56 @@ class RealtimeEngine:
                 continue
             if kind != 'rx':
                 continue
-            arb_id, data = msg.arbitration_id, bytes(msg.data)
-            if self.trc_logger:
-                self.trc_logger.log_frame('rz450e', False, arb_id, len(data), data)
-            if self.did_client.feed(arb_id, data):
-                continue
-            # Checksum validation (docs/13 item 13.5, added 2026-08-03, user
-            # directive): reject a frame that fails its confirmed Toyota
-            # additive checksum BEFORE decoding it at all - this project's
-            # own docs said this check "should" be wired in as a corruption
-            # detector, but it never actually was until now. A frame that
-            # fails this is never decoded, same treatment as a plausibility-
-            # check rejection (see _ingest_validated below). Toggleable
-            # (docs/13 item 15.15, added 2026-08-03, default ON) - reading
-            # this live every frame (not cached) so flipping the checkbox
-            # takes effect immediately, same as every other management
-            # feature; when off, corrupt frames are decoded anyway (for
-            # deliberately testing what happens downstream with bad data).
-            if self.management.config['checksum_validation']['enabled'] \
-                    and not rz450e_signals.frame_checksum_ok(arb_id, data):
-                self.state.note_checksum_failure(arb_id)
-                self.log_fn(f'REJECTED corrupt frame (checksum mismatch): CAN 0x{arb_id:03X}')
-                continue
-            if arb_id == rz450e_signals.ID_TICK_424:
-                vals = rz450e_signals.decode_424(data)
+            try:
+                arb_id, data = msg.arbitration_id, bytes(msg.data)
+                if self.trc_logger:
+                    self.trc_logger.log_frame('rz450e', False, arb_id, len(data), data)
+                if self.did_client.feed(arb_id, data):
+                    continue
+                # Checksum validation (docs/13 item 13.5, added 2026-08-03, user
+                # directive): reject a frame that fails its confirmed Toyota
+                # additive checksum BEFORE decoding it at all - this project's
+                # own docs said this check "should" be wired in as a corruption
+                # detector, but it never actually was until now. A frame that
+                # fails this is never decoded, same treatment as a plausibility-
+                # check rejection (see _ingest_validated below). Toggleable
+                # (docs/13 item 15.15, added 2026-08-03, default ON) - reading
+                # this live every frame (not cached) so flipping the checkbox
+                # takes effect immediately, same as every other management
+                # feature; when off, corrupt frames are decoded anyway (for
+                # deliberately testing what happens downstream with bad data).
+                if self.management.config['checksum_validation']['enabled'] \
+                        and not rz450e_signals.frame_checksum_ok(arb_id, data):
+                    self.state.note_checksum_failure(arb_id)
+                    self.log_fn(f'REJECTED corrupt frame (checksum mismatch): CAN 0x{arb_id:03X}')
+                    continue
+                if arb_id == rz450e_signals.ID_TICK_424:
+                    vals = rz450e_signals.decode_424(data)
+                    if vals:
+                        self.state.note_counter('counter_5s', int(vals['counter_5s']))
+                    continue
+                if arb_id == rz450e_signals.ID_ALIVE_3F1:
+                    vals = rz450e_signals.decode_3f1(data)
+                    if vals:
+                        self.state.note_counter('alive_3f1', int(vals['alive_3f1']))
+                    continue
+                if arb_id == rz450e_signals.ID_CHARGE_PERM:
+                    vals = rz450e_signals.decode_358(data)
+                    if vals:
+                        self.state.update_input('charge_permission_input', vals['charge_permission_input'])
+                        self.state.note_counter('alive_358', int(vals.get('alive_358', 0)))
+                    continue
+                vals = rz450e_signals.decode_frame(arb_id, data)
                 if vals:
-                    self.state.note_counter('counter_5s', int(vals['counter_5s']))
-                continue
-            if arb_id == rz450e_signals.ID_ALIVE_3F1:
-                vals = rz450e_signals.decode_3f1(data)
-                if vals:
-                    self.state.note_counter('alive_3f1', int(vals['alive_3f1']))
-                continue
-            if arb_id == rz450e_signals.ID_CHARGE_PERM:
-                vals = rz450e_signals.decode_358(data)
-                if vals:
-                    self.state.update_input('charge_permission_input', vals['charge_permission_input'])
-                    self.state.note_counter('alive_358', int(vals.get('alive_358', 0)))
-                continue
-            vals = rz450e_signals.decode_frame(arb_id, data)
-            if vals:
-                self._ingest_validated(f'CAN 0x{arb_id:03X}', vals)
+                    self._ingest_validated(f'CAN 0x{arb_id:03X}', vals)
+            except Exception as exc:
+                exc_count_since_log += 1
+                now = time.monotonic()
+                if now - last_exc_log_t >= 1.0:
+                    self.log_fn(f'RZ450e INGEST ERROR (frame dropped, thread continuing) - '
+                                f'{exc_count_since_log}x in the last ~1s, most recent: {exc!r}')
+                    last_exc_log_t = now
+                    exc_count_since_log = 0
 
     def _ingest_validated(self, source_label, vals):
         """Plausibility-check a freshly-decoded {key: value} dict
@@ -517,14 +550,30 @@ class RealtimeEngine:
             (rz450e_signals.DID_PRIMARY_V_I, rz450e_signals.decode_primary_v_i),
         ]
         idx = 0
+        # Fault containment (docs/13 item 16.1, added 2026-08-04) - same
+        # pattern/rationale as _tx_loop and _ingest_rz_bus. `idx` is
+        # incremented BEFORE the risky request()/decode() call so a failure
+        # on one DID doesn't get the loop stuck retrying that same DID
+        # forever - it still advances to the next one in the round-robin.
+        last_exc_log_t = 0.0
+        exc_count_since_log = 0
         while self._running:
             did, decoder = cycle[idx % len(cycle)]
             idx += 1
-            resp = self.did_client.request(did, timeout=rz450e_signals.DID_RESPONSE_TIMEOUT_S)
-            if resp:
-                vals = decoder(resp)
-                if vals:
-                    self._ingest_validated(f'DID 0x{did[0]:02X}{did[1]:02X}', vals)
+            try:
+                resp = self.did_client.request(did, timeout=rz450e_signals.DID_RESPONSE_TIMEOUT_S)
+                if resp:
+                    vals = decoder(resp)
+                    if vals:
+                        self._ingest_validated(f'DID 0x{did[0]:02X}{did[1]:02X}', vals)
+            except Exception as exc:
+                exc_count_since_log += 1
+                now = time.monotonic()
+                if now - last_exc_log_t >= 1.0:
+                    self.log_fn(f'DID POLL ERROR (thread continuing) - '
+                                f'{exc_count_since_log}x in the last ~1s, most recent: {exc!r}')
+                    last_exc_log_t = now
+                    exc_count_since_log = 0
             time.sleep(rz450e_signals.DID_INTER_REQUEST_GAP_S)
 
     # ── TX side ──────────────────────────────────────────────────────────
@@ -640,10 +689,39 @@ class RealtimeEngine:
                 self.log_fn(f'0x1F2 charge request active + RZ450e permission granted + battery data '
                             f'genuinely live - starting 0x1DC charger ramp: level {level}, 0 kW rising '
                             f'{rate * 0.1:.3g} kW/s')
-            target_kw = float(chg_cfg.get('charge_target_kw', 0.0))
+            # Clamp the configured ramp target into [ac_min_kw, ac_max_kw]
+            # (added 2026-08-06, user directive: "the maximum AC charging is
+            # only 6.6 kilowatt for the leaf... make this configurable, min
+            # and max kW request for AC") before converting to raw counts -
+            # protects against a target left above the Leaf's real AC
+            # charger ceiling (or below its floor) regardless of what the
+            # slider's own wider GUI bounds allow.
+            ac_min_kw = float(chg_cfg.get('ac_min_kw', 0.0))
+            ac_max_kw = float(chg_cfg.get('ac_max_kw', leaf_signals.CHARGE_EMULATION_BOUNDS['charge_target_kw'][1]))
+            target_kw = max(ac_min_kw, min(ac_max_kw, float(chg_cfg.get('charge_target_kw', 0.0))))
             target_raw = round((target_kw + 10) / 0.1)
-            self._chg_ramp_raw = min(self._chg_ramp_raw + rate * dt,
-                                      float(target_raw), leaf_signals.CHG_IDLE_RAW - 1.0)
+            target_raw = max(leaf_signals.CHG_RAMP_START_RAW, min(target_raw, leaf_signals.CHG_IDLE_RAW - 1.0))
+            # Symmetric rate-limited step toward the target (bug fix,
+            # 2026-08-06, found from a real bench test log showing
+            # charger_limit_kw jumping straight from 5.20kW to 5.00kW in a
+            # single 10ms tick - physically impossible at the configured
+            # ramp rate): previously used min(current + rate*dt, target),
+            # which correctly rate-limits an INCREASING target but lets a
+            # DECREASING target (e.g. the user lowering charge_target_kw
+            # live, or the ac_min_kw/ac_max_kw clamp above moving the
+            # effective target) snap the raw value straight down to the new
+            # target on the very next tick with no rate limit applied at
+            # all - the actual cause of the observed "ramp down jumps
+            # around" symptom. Now moves toward the target by at most
+            # rate*dt per tick in EITHER direction, giving real fine
+            # (100W-scale, per the user's "fine 100W precision" request)
+            # control over a falling target, matching the existing rising
+            # behavior exactly.
+            step = rate * dt
+            if self._chg_ramp_raw < target_raw:
+                self._chg_ramp_raw = min(self._chg_ramp_raw + step, float(target_raw))
+            elif self._chg_ramp_raw > target_raw:
+                self._chg_ramp_raw = max(self._chg_ramp_raw - step, float(target_raw))
             raw = max(leaf_signals.CHG_RAMP_START_RAW, int(self._chg_ramp_raw))
             leaf_state['charger_limit_kw'] = raw * 0.1 - 10
             self._chg_uprate_current = level
@@ -784,6 +862,20 @@ class RealtimeEngine:
         leaf_state = self._apply_charge_ramp(leaf_state)
         leaf_state = self.management.apply(leaf_state, self.state)
 
+        # AC-taper dynamic uprate override (added 2026-08-06, user
+        # directive: the transmitted 0x1DC uprate bits are a real signal
+        # "used somewhere else in the system" and must genuinely represent
+        # the rate actually in use, not just the manually-configured
+        # chg_uprate_level). ManagementEngine.ac_uprate_level is None
+        # whenever the AC taper isn't actively converging (full power,
+        # disabled, no data, emergency) - only overrides the ramp's own
+        # static-level assignment (_apply_charge_ramp, above) while the
+        # taper is genuinely rate-limiting, so it never fights the user's
+        # manual setting outside that window. See management_engine.py's
+        # ac_charge_taper block / _select_ac_uprate_level().
+        if self.management.ac_uprate_level is not None:
+            self._chg_uprate_current = self.management.ac_uprate_level
+
         # Final safety net (docs/06): guarantees every field is inside its
         # documented encodable range before frame-building bitpacks it - the
         # bitmask encode WRAPS an out-of-range value instead of saturating it
@@ -880,90 +972,127 @@ class RealtimeEngine:
         last_phase = None
         last_soft_cut = False
         last_hard_cut = False
+        # Fault containment (docs/13 item 16.1, added 2026-08-04): this loop
+        # previously had ZERO exception handling anywhere in its body - an
+        # uncaught error inside _compose_leaf_state() or frame-building
+        # (a KeyError from an unexpected config shape, any bug) permanently
+        # killed this thread for the rest of the app session, with only the
+        # heartbeat below (item 2.2's fix) eventually noticing 2s later and
+        # showing "NOT RESPONDING," never recovering without a full app
+        # restart. Now a single bad tick is caught, logged, and skipped -
+        # the loop keeps running and the very next tick tries again.
+        # last_tick_monotonic is deliberately only stamped at each
+        # successful exit point BELOW, inside the try, not unconditionally
+        # at the top of the loop as it was before - this matters: if it were
+        # stamped unconditionally, a PERSISTENTLY failing tick (not a
+        # one-off) would look identical to a healthy loop to the heartbeat
+        # check, silently defeating the exact warning item 2.2 built. With
+        # this placement, one-off failures self-heal invisibly (the next
+        # good tick refreshes the heartbeat well inside the 2.0s window) but
+        # a persistent failure still correctly trips "NOT RESPONDING" -
+        # catch-and-continue must never mask an ongoing problem as "fine."
+        # Log spam is rate-limited to once/second (with a count of how many
+        # occurred) since a fast-repeating failure could otherwise flood the
+        # Log panel faster than a human (or the Dashboard's mirrored log)
+        # could read it.
+        last_exc_log_t = 0.0
+        exc_count_since_log = 0
         while self._running:
             now = time.monotonic()
-            self.last_tick_monotonic = now
+            try:
+                # Bridge not started (idle) or armed but no real Leaf traffic
+                # seen yet (waiting_for_wake): nothing to compose, nothing to
+                # send - RZ450e monitoring/mapping edits keep working via the
+                # ingest threads regardless (see main.py rev 6 changelog).
+                if self.sequencer.phase in ('idle', 'waiting_for_wake'):
+                    phase = self.sequencer.phase
+                    if phase != last_phase:
+                        self.log_fn(f'Sequencer phase: {last_phase} -> {phase}')
+                        last_phase = phase
+                    self.last_tick_monotonic = now
+                    time.sleep(0.02)
+                    continue
 
-            # Bridge not started (idle) or armed but no real Leaf traffic
-            # seen yet (waiting_for_wake): nothing to compose, nothing to
-            # send - RZ450e monitoring/mapping edits keep working via the
-            # ingest threads regardless (see main.py rev 6 changelog).
-            if self.sequencer.phase in ('idle', 'waiting_for_wake'):
-                phase = self.sequencer.phase
+                leaf_state = self._compose_leaf_state()
+                self.state.set_leaf_tx_many(leaf_state)
+                self.state.set_management_status(self.management.status)
+
+                hard_cut = leaf_state.get('relay_cut_request', 0) not in (0, None)
+                soft_cut = bool(leaf_state.get('capacity_empty')) or bool(leaf_state.get('full_charge_flag'))
+                if hard_cut and not last_hard_cut:
+                    self.log_fn('HARD CUT asserted (relay_cut_request) - ' + '; '.join(
+                        f'{k}: {v}' for k, v in self.management.status.items() if 'EMERGENCY' in v or 'STALE' in v))
+                elif soft_cut and not last_soft_cut and not hard_cut:
+                    self.log_fn('Soft cut asserted (capacity_empty/full_charge_flag)')
+                last_hard_cut, last_soft_cut = hard_cut, soft_cut
+
+                charge_authorized = bool(self.state.get_input('charge_permission_input'))
+                # Wind-down trigger 5 is staleness-specific ONLY (docs/13 item
+                # 14.3, fixed 2026-08-03) - `hard_cut` above (used for the Log
+                # panel/last_hard_cut tracking) reflects ANY hard-cut source, but
+                # only the staleness watchdog's own escalation is allowed to wind
+                # the bridge down; every other hard cut just latches and keeps
+                # the bridge running/transmitting (see ManagementEngine.
+                # staleness_hard_cut's docstring).
+                phase, timing = self.sequencer.tick(self.management.staleness_hard_cut, charge_authorized)
                 if phase != last_phase:
+                    if phase == 'startup' and last_phase == 'waiting_for_wake' and self.sequencer.rearmed_naturally:
+                        # A waiting_for_wake -> startup transition following a
+                        # NATURAL re-arm (the sequencer itself completed a real
+                        # wind-down, not just a Stop/Start Bridge button press -
+                        # see ShutdownSequencer.rearmed_naturally) is the closest
+                        # analog this bridge has to "the car being powered down
+                        # and back on" (docs/12 finding F8, added 2026-08-01) -
+                        # clears a latched hard cut. Bug fixed 2026-08-01 (found
+                        # by an independent review pass): this originally fired
+                        # on EVERY such transition, including a bare Stop/Start
+                        # Bridge toggle with the car's VCM never having lost
+                        # power at all - silently clearing an emergency-tier
+                        # latch with no relation to an actual power cycle.
+                        self.management.notify_session_start()
                     self.log_fn(f'Sequencer phase: {last_phase} -> {phase}')
                     last_phase = phase
-                time.sleep(0.02)
+
+                if phase in ('idle', 'waiting_for_wake', 'stopped'):
+                    self.last_tick_monotonic = now
+                    time.sleep(0.02)
+                    continue
+
+                vehicle = self.state.snapshot_vehicle()
+                active_ids = leaf_signals.hvbat_ids_for(vehicle['battery_gen'], vehicle['battery_kwh'])
+
+                for arb_id, period_ms in leaf_signals.TX_PERIOD_MS.items():
+                    if arb_id not in active_ids:
+                        continue
+                    if phase == 'winding_down' and not self.sequencer.id_active_during_winddown(arb_id, timing):
+                        continue
+                    if arb_id in (leaf_signals.HVBAT_ID_1C2,):
+                        pass  # heartbeat is immediate from bus-wake, no start-offset gate
+                    elif arb_id in (0x1DB, 0x1DC) and phase == 'startup' and timing < leaf_signals.T_1DB_START:
+                        continue
+                    elif arb_id in (0x55B, 0x5BC) and phase == 'startup' and timing < leaf_signals.T_55B_START:
+                        continue
+                    elif arb_id in (0x59E, 0x5C0, leaf_signals.HVBAT_ID_5EB) and phase == 'startup' \
+                            and timing < leaf_signals.T_59E_START:
+                        continue
+
+                    if now < next_due[arb_id]:
+                        continue
+                    next_due[arb_id] = now + period_ms / 1000.0
+
+                    frame = self._build_frame(arb_id, leaf_state, timing, phase == 'startup')
+                    if frame is not None:
+                        self.leaf_bus.send(arb_id, frame)
+
+                self.last_tick_monotonic = now
+            except Exception as exc:
+                exc_count_since_log += 1
+                if now - last_exc_log_t >= 1.0:
+                    self.log_fn(f'TX LOOP ERROR (tick skipped, thread continuing) - '
+                                f'{exc_count_since_log}x in the last ~1s, most recent: {exc!r}')
+                    last_exc_log_t = now
+                    exc_count_since_log = 0
+                time.sleep(0.01)
                 continue
-
-            leaf_state = self._compose_leaf_state()
-            self.state.set_leaf_tx_many(leaf_state)
-            self.state.set_management_status(self.management.status)
-
-            hard_cut = leaf_state.get('relay_cut_request', 0) not in (0, None)
-            soft_cut = bool(leaf_state.get('capacity_empty')) or bool(leaf_state.get('full_charge_flag'))
-            if hard_cut and not last_hard_cut:
-                self.log_fn('HARD CUT asserted (relay_cut_request) - ' + '; '.join(
-                    f'{k}: {v}' for k, v in self.management.status.items() if 'EMERGENCY' in v or 'STALE' in v))
-            elif soft_cut and not last_soft_cut and not hard_cut:
-                self.log_fn('Soft cut asserted (capacity_empty/full_charge_flag)')
-            last_hard_cut, last_soft_cut = hard_cut, soft_cut
-
-            charge_authorized = bool(self.state.get_input('charge_permission_input'))
-            # Wind-down trigger 5 is staleness-specific ONLY (docs/13 item
-            # 14.3, fixed 2026-08-03) - `hard_cut` above (used for the Log
-            # panel/last_hard_cut tracking) reflects ANY hard-cut source, but
-            # only the staleness watchdog's own escalation is allowed to wind
-            # the bridge down; every other hard cut just latches and keeps
-            # the bridge running/transmitting (see ManagementEngine.
-            # staleness_hard_cut's docstring).
-            phase, timing = self.sequencer.tick(self.management.staleness_hard_cut, charge_authorized)
-            if phase != last_phase:
-                if phase == 'startup' and last_phase == 'waiting_for_wake' and self.sequencer.rearmed_naturally:
-                    # A waiting_for_wake -> startup transition following a
-                    # NATURAL re-arm (the sequencer itself completed a real
-                    # wind-down, not just a Stop/Start Bridge button press -
-                    # see ShutdownSequencer.rearmed_naturally) is the closest
-                    # analog this bridge has to "the car being powered down
-                    # and back on" (docs/12 finding F8, added 2026-08-01) -
-                    # clears a latched hard cut. Bug fixed 2026-08-01 (found
-                    # by an independent review pass): this originally fired
-                    # on EVERY such transition, including a bare Stop/Start
-                    # Bridge toggle with the car's VCM never having lost
-                    # power at all - silently clearing an emergency-tier
-                    # latch with no relation to an actual power cycle.
-                    self.management.notify_session_start()
-                self.log_fn(f'Sequencer phase: {last_phase} -> {phase}')
-                last_phase = phase
-
-            if phase in ('idle', 'waiting_for_wake', 'stopped'):
-                time.sleep(0.02)
-                continue
-
-            vehicle = self.state.snapshot_vehicle()
-            active_ids = leaf_signals.hvbat_ids_for(vehicle['battery_gen'], vehicle['battery_kwh'])
-
-            for arb_id, period_ms in leaf_signals.TX_PERIOD_MS.items():
-                if arb_id not in active_ids:
-                    continue
-                if phase == 'winding_down' and not self.sequencer.id_active_during_winddown(arb_id, timing):
-                    continue
-                if arb_id in (leaf_signals.HVBAT_ID_1C2,):
-                    pass  # heartbeat is immediate from bus-wake, no start-offset gate
-                elif arb_id in (0x1DB, 0x1DC) and phase == 'startup' and timing < leaf_signals.T_1DB_START:
-                    continue
-                elif arb_id in (0x55B, 0x5BC) and phase == 'startup' and timing < leaf_signals.T_55B_START:
-                    continue
-                elif arb_id in (0x59E, 0x5C0, leaf_signals.HVBAT_ID_5EB) and phase == 'startup' \
-                        and timing < leaf_signals.T_59E_START:
-                    continue
-
-                if now < next_due[arb_id]:
-                    continue
-                next_due[arb_id] = now + period_ms / 1000.0
-
-                frame = self._build_frame(arb_id, leaf_state, timing, phase == 'startup')
-                if frame is not None:
-                    self.leaf_bus.send(arb_id, frame)
 
             time.sleep(0.001)

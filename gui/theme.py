@@ -14,6 +14,22 @@ FG, FG_DIM, ACC, ERR, OK = '#dcdcdc', '#9a9aa0', '#4da3ff', '#ff6b6b', '#5fd38d'
 
 BAR_W, BAR_H = 170, 12
 
+
+def no_wheel(combo):
+    """Prevent mouse-wheel scrolling from silently changing a readonly
+    Combobox's selection (added 2026-08-01, user report: "when I'm
+    scrolling with the wheel I have accidentally changed the inputs/
+    outputs... this data should only be valid if selected with a mouse
+    pointer and click"; moved here from gui/panels.py 2026-08-06 so
+    gui/dashboard.py's scale dropdowns - which sit inside the same kind of
+    scrollable VScrollFrame - can share it instead of duplicating it). An
+    instance-level binding fires before both the Combobox's own class
+    binding (which changes the value on wheel scroll) and VScrollFrame's
+    page-scroll bind_all handler below - so returning "break" here stops
+    both; only an explicit click can change the selection now."""
+    for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+        combo.bind(seq, lambda e: 'break')
+
 # Shared base font (added 2026-07-31, user request: main app fonts weren't
 # actually shrinking in a few spots even after apply_style()'s ~15% scale-
 # down). ttk widgets pick up apply_style()'s '.' style font automatically,
@@ -27,6 +43,15 @@ BAR_W, BAR_H = 170, 12
 # to every such widget - confirmed via winfo_reqheight()/winfo_reqwidth()
 # that this is the only way to actually shrink a plain tk.Text widget.
 BASE_FONT = ('Segoe UI', 8)
+
+# Monospace variant (added 2026-08-06) - used ONLY by the label:value
+# 'live data' Text widgets (gui/panels.py's LiveMonitorPanel,
+# gui/dashboard.py's right column). Alignment itself now comes from a
+# right-aligned Tk tab stop (see write_field()/configure_field_tags()
+# below), which works in any font - this is kept as a deliberate look for
+# these specific data-table-style boxes, distinct from BASE_FONT's use for
+# prose (Log/help text) elsewhere.
+MONO_FONT = ('Consolas', 8)
 
 
 def apply_style(root):
@@ -87,6 +112,51 @@ def apply_style(root):
                      ('*TCombobox*Listbox*selectBackground', ACC),
                      ('*TCombobox*Listbox*selectForeground', BG)):
         root.option_add(pat, val)
+
+
+def configure_field_tags(box):
+    """Configures the tag write_section() below relies on, AND a single
+    right-aligned tab stop write_field() below relies on to push every
+    value flush against the box's actual right edge - shared by every
+    'live data as tagged Text' panel (gui/panels.py's LiveMonitorPanel and
+    gui/dashboard.py's right column). Call once per Text widget, right
+    after creating it.
+
+    Fixed-character-count padding (label:<40 value:>12, the previous
+    approach) assumed a specific box width in characters; whenever the
+    real box was narrower than that guess (a resized pane, the Dashboard's
+    RIGHT_COL_W column), lines that should have fit were wrapping anyway,
+    and when it was wider, label and value sat closer together than
+    intended (user reports: "the data boxes look close... its still
+    wraping incorectly. some data output is wraping"). A tab stop is
+    measured in actual pixels against the box's OWN winfo_width(), so it
+    tracks whatever the box's real size is - a label only pushes its value
+    onto a second line when the label itself is genuinely too long to fit
+    the box, never as an artifact of a wrong guessed character count.
+    Re-measured on every <Configure> (resize) so a resizable pane (the
+    main window's PanedWindow-based live panels) keeps the value flush
+    right after the user drags a sash."""
+    box.tag_configure('hdr', foreground=ACC)
+
+    def _retab(event=None):
+        w = box.winfo_width()
+        if w > 20:
+            box.configure(tabs=f'{w - 10} right')
+
+    box.bind('<Configure>', _retab)
+    _retab()
+
+
+def write_section(box, title):
+    box.insert('end', f'{title}\n', 'hdr')
+
+
+def write_field(box, label, value):
+    """One field as a single label:value line - the label starts flush
+    left, a tab jumps to configure_field_tags()'s right-aligned stop, and
+    the value lands flush against the box's actual right edge. Requires
+    configure_field_tags(box) to have been called on this widget first."""
+    box.insert('end', f'{label}\t{value}\n')
 
 
 class VScrollFrame(ttk.Frame):

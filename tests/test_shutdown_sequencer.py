@@ -176,6 +176,40 @@ def test_unauthorized_charge_request_eventually_winds_down():
           'the sequencer decides to wind down', result is True)
 
 
+# ── 6th trigger: bus-silence timeout, defensive fallback (added 2026-08-06 -
+# see leaf_signals.BUS_SILENCE_TIMEOUT_S's own comment and docs/07's "Sixth
+# trigger" section for the full rationale: a real bench test showed the
+# bridge staying awake ~110s past where every other trigger should have
+# fired, root cause not identified from the capture alone). ───────────────
+def test_bus_silence_does_not_fire_before_the_timeout():
+    seq = ShutdownSequencer()
+    seq.arm()
+    seq.note_leaf_rx(0x999, b'\x00')   # arbitrary non-ignition/non-charge ID - just needs to wake the sequencer
+    check('sanity: sequencer entered startup', seq.phase == 'startup')
+    seq.last_leaf_rx_t = time.monotonic() - (leaf_signals.BUS_SILENCE_TIMEOUT_S - 5.0)
+    check('bus-silence trigger does not fire before BUS_SILENCE_TIMEOUT_S has elapsed',
+          seq._should_wind_down(False) is False)
+
+
+def test_bus_silence_eventually_winds_down_with_no_other_trigger_active():
+    seq = ShutdownSequencer()
+    seq.arm()
+    seq.note_leaf_rx(0x999, b'\x00')
+    check('sanity: sequencer entered startup', seq.phase == 'startup')
+    seq.last_leaf_rx_t = time.monotonic() - leaf_signals.BUS_SILENCE_TIMEOUT_S - 0.1
+    check('bus-silence trigger fires once the Leaf bus has been completely silent for '
+          'BUS_SILENCE_TIMEOUT_S, with none of the other four triggers active',
+          seq._should_wind_down(False) is True)
+
+
+def test_bus_silence_trigger_does_not_preempt_active_traffic():
+    seq = ShutdownSequencer()
+    seq.arm()
+    seq.note_leaf_rx(0x108, b'\x00')   # fresh ignition traffic - ordinary running state
+    check('bus-silence trigger stays quiet while the bus is genuinely active (last_leaf_rx_t fresh)',
+          seq._should_wind_down(False) is False)
+
+
 if __name__ == '__main__':
     for fn in [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]:
         fn()

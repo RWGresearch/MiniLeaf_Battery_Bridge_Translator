@@ -18,26 +18,55 @@ visual spot-check.
 ### 2. GIDS / QC capacity have no RZ450e equivalent — must be derived
 
 Leaf's GIDS (remaining capacity, ~80Wh/gid) and QC full/remaining capacity (Wh) aren't things the
-RZ450e reports directly. Derive:
+RZ450e reports directly. Derive (**rewritten 2026-08-08, docs/16 parameter-clamping audit finding**
+— the original formula below conflated gross and usable pack capacity, overstating GIDs by ~12.5%
+for a real pack with a top/bottom reserve buffer):
 
 ```
-usable_wh   = rz450e_soc_pct / 100.0 × rz450e_capacity_ah × rz450e_pack_voltage
-gids        = usable_wh / 80.0                      → 0x5BC remaining capacity
-qc_full_wh  = rz450e_capacity_ah × rz450e_pack_voltage   → 0x59E QC full capacity
-qc_remain_wh = usable_wh                             → 0x59E QC remaining capacity
+soh_fraction     = rz450e_capacity_ah / vehicle.nameplate_capacity_ah   (201.00 Ah default, docs/02)
+usable_kwh_at_soh = vehicle.usable_capacity_kwh × soh_fraction       (64.0kWh default - spec-sourced,
+                                                                       not bench-confirmed for THIS
+                                                                       pack's exact buffer)
+usable_wh        = rz450e_soc_pct / 100.0 × usable_kwh_at_soh × 1000
+gids             = usable_wh / 80.0                                  → 0x5BC remaining capacity
+qc_ceiling_wh    = usable_kwh_at_soh × 1000 × (charge_emulation.qc_max_soc_pct / 100.0)   (80% default)
+qc_full_wh       = qc_ceiling_wh                                     → 0x59E QC full capacity
+qc_remain_wh     = max(0, qc_ceiling_wh − usable_wh)                 → 0x59E QC remaining capacity
 ```
 
-Uses RZ450e SoC (DID `0x1F5B`, slow) × capacity (DID `0x1D3E`, very slow, effectively static) ×
-voltage (raw CAN `0x020` `pack_v`, fast). Known threshold behaviors to preserve on the Leaf side
-(from the Leaf project's real-hardware testing): **GIDS ≈ 49 triggers the low-battery warning**,
-**GIDS ≈ 5 triggers turtle mode** (VCM limits to dash "6 bars"). These are real VCM-side
-thresholds, not tunable on this project's end — just something to be aware of when picking the
-**cell-voltage** thresholds in `05-battery-management-safety.md`'s `discharge_power_taper` (full
-power ≥3.00V, zero ≤2.60V/cell as of the 2026-08-01 re-anchoring) and `low_voltage_cutoff` (soft
-cut 3.00V/cell, emergency hard cut 2.60V/cell — SoC is a backup check only there as of the
-2026-07-31 correction, not an independent floor). A 2.60-3.00V/cell window on a ~194.97Ah/348V pack
-is nowhere near GIDS≈5, so no conflict expected, but worth re-checking once real GIDS values are
-flowing — see `10-open-questions.md`, item 3.
+`pack_v` (live pack voltage) is deliberately no longer part of this formula at all — the old
+formula's only use of it, gross `capacity_ah × pack_v`, is replaced by the usable-capacity figure.
+The QC ceiling (`qc_max_soc_pct`, default 80%) is **PROVISIONAL, not yet tested against a real DC
+fast-charge session** (no DC testing has been done on this project at all yet) — real DC fast
+charging only usefully charges to roughly that point before CC-CV tapering makes the rest pointless,
+same "documented, not confirmed" status as `temp_segment_pct`'s own mapping tie.
+
+Three configurable inputs feed this formula, split across two GUI locations (2026-08-08, same-day
+follow-up per user directive): `usable_capacity_kwh`/`nameplate_capacity_ah` are RZ450e source-pack
+specs, live in `state.vehicle` (GUI: Vehicle panel, `08-gui-design.md`) — `nameplate_capacity_ah`
+was a hardcoded `mapping_engine.NAMEPLATE_CAPACITY_AH` module constant until this same follow-up
+made it configurable too (still the fallback default). `qc_max_soc_pct` is charging behavior, not a
+pack spec, so it lives in `state.charge_emulation` (`leaf_signals.CHARGE_SLIDERS`, GUI: Charge
+Emulation tab, next to the `dc_min_kw`/`dc_max_kw` DC fast-charge placeholder fields it shares a
+theme with) instead of `state.vehicle` where it briefly lived for about a day. All three validated
+on profile load (`bridge/config_profile.py`'s `_apply_vehicle()`/`_apply_charge_emulation()`,
+`mapping_engine.VEHICLE_FIELD_BOUNDS`/`leaf_signals.CHARGE_EMULATION_BOUNDS`) — including a one-time
+migration for a profile saved during the brief window `qc_max_soc_pct` lived in `vehicle`.
+
+Uses RZ450e SoC (DID `0x1F5B`, slow) × capacity (DID `0x1D3E`, very slow, effectively static).
+Known threshold behaviors to preserve on the Leaf side (from the Leaf project's real-hardware
+testing): **GIDS ≈ 49 triggers the low-battery warning**, **GIDS ≈ 5 triggers turtle mode** (VCM
+limits to dash "6 bars"). These are real VCM-side thresholds, not tunable on this project's end —
+just something to be aware of when picking the **cell-voltage** thresholds in
+`05-battery-management-safety.md`'s `discharge_power_taper` (full power ≥3.00V, zero ≤2.60V/cell as
+of the 2026-08-01 re-anchoring) and `low_voltage_cutoff` (soft cut 3.00V/cell, emergency hard cut
+2.60V/cell — SoC is a backup check only there as of the 2026-07-31 correction, not an independent
+floor). Re-checked against this new formula (2026-08-08, back-of-envelope, `usable_capacity_kwh`=
+64.0, 94% SOH → 752 GIDs at 100% SOC, linear in SoC%): GIDS≈49 falls at ~6.5% SoC, GIDS≈5 falls at
+~0.66% SoC — both very close to where the OLD formula already put them (~6.0%/~0.6%), so this
+rewrite doesn't meaningfully change the picture. This is still an SoC%-based sanity check, not the
+voltage-based one this open question actually wants — see `10-open-questions.md`, item 3, still
+open.
 
 **Dash SOC% (`soc_correction`, `0x59E` byte 7) — confirmed 2026-07-31.** A separate field from
 GIDS/QC above, and from `usable_soc`/`fine_soc_pct` — per the Leaf project's own findings, the

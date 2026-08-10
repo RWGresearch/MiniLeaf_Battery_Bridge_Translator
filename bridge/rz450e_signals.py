@@ -144,7 +144,10 @@ def decode_temp_msg(d):
     for j in range(1, 8):
         probe = mux + j
         if probe <= 16:
-            out[f'temp_{probe:02d}'] = d[j] * 9 / 5 + 32.0
+            # Raw byte is already 1°C/bit, 0 offset (2026-08-09: this project
+            # now stores/displays every temperature in °C - previously
+            # converted to °F here, the only place that conversion happened).
+            out[f'temp_{probe:02d}'] = float(d[j])
     return out
 
 
@@ -152,8 +155,8 @@ def decode_temp_minmax(d):
     if len(d) < 4:
         return {}
     return {
-        'temp_max': d[0] * 9 / 5 + 32.0,
-        'temp_min': d[1] * 9 / 5 + 32.0,
+        'temp_max': float(d[0]),
+        'temp_min': float(d[1]),
         'temp_max_probe': float(d[2]),
         'temp_min_probe': float(d[3]),
     }
@@ -295,8 +298,8 @@ def _build_input_registry():
         {'key': 'cell_max', 'label': 'Max cell voltage (pack summary)', 'unit': 'V', 'fast': True, 'source': '0x020', 'group': '0x020 Pack V / cell min-max', 'range': (2.5, 5.0)},
         {'key': 'current', 'label': 'Pack current (+discharge/-charge)', 'unit': 'A', 'fast': True, 'source': '0x023', 'group': '0x023 Pack current', 'range': (-220, 220)},
         {'key': 'current_b', 'label': 'Pack current, 2nd sensor tap', 'unit': 'A', 'fast': True, 'source': '0x023', 'group': '0x023 Pack current', 'range': (-220, 220)},
-        {'key': 'temp_max', 'label': 'Max pack temperature', 'unit': '°F', 'fast': True, 'source': '0x4A7', 'group': '0x4A7 Temp extremes', 'range': (-40, 160)},
-        {'key': 'temp_min', 'label': 'Min pack temperature', 'unit': '°F', 'fast': True, 'source': '0x4A7', 'group': '0x4A7 Temp extremes', 'range': (-40, 160)},
+        {'key': 'temp_max', 'label': 'Max pack temperature', 'unit': '°C', 'fast': True, 'source': '0x4A7', 'group': '0x4A7 Temp extremes', 'range': (-40, 71)},
+        {'key': 'temp_min', 'label': 'Min pack temperature', 'unit': '°C', 'fast': True, 'source': '0x4A7', 'group': '0x4A7 Temp extremes', 'range': (-40, 71)},
         {'key': 'charge_permission_input', 'label': 'Charge permission input (interlock)', 'unit': '', 'fast': True, 'source': '0x358', 'group': '0x358 Charge interlock', 'range': (0, 1)},
         {'key': 'soc_pct', 'label': 'State of charge', 'unit': '%', 'fast': False, 'source': 'DID 0x1F5B', 'group': 'DID 0x1F5B SoC (slow)', 'range': (0, 100)},
         {'key': 'capacity_pack1_ah', 'label': 'Pack 1 capacity/SOH', 'unit': 'Ah', 'fast': False, 'source': 'DID 0x1D3E', 'group': 'DID 0x1D3E capacity (very slow)', 'range': (0, 210)},
@@ -312,8 +315,8 @@ def _build_input_registry():
                     'range': (2.5, 5.0)})
     for probe in range(1, 17):
         reg.append({'key': f'temp_{probe:02d}', 'label': f'Temp probe {probe}',
-                    'unit': '°F', 'fast': True, 'source': '0x4AA', 'group': '0x4AA per-probe temps (16)',
-                    'range': (-40, 160)})
+                    'unit': '°C', 'fast': True, 'source': '0x4AA', 'group': '0x4AA per-probe temps (16)',
+                    'range': (-40, 71)})
     return reg
 
 
@@ -342,8 +345,8 @@ PLAUSIBLE_RANGES = {
     'cell_max': (0.50, 5.00),
     'current': (-210.0, 210.0),
     'current_b': (-210.0, 210.0),
-    'temp_max': (-60.0, 250.0),
-    'temp_min': (-60.0, 250.0),
+    'temp_max': (-51.1, 121.1),
+    'temp_min': (-51.1, 121.1),
     'soc_pct': (0.0, 100.0),
     'capacity_pack1_ah': (0.0, 300.0),
     'capacity_pack2_ah': (0.0, 300.0),
@@ -355,7 +358,7 @@ PLAUSIBLE_RANGES = {
 for _c in range(1, 97):
     PLAUSIBLE_RANGES[f'cell_{_c:02d}'] = (0.50, 5.00)
 for _p in range(1, 17):
-    PLAUSIBLE_RANGES[f'temp_{_p:02d}'] = (-60.0, 250.0)
+    PLAUSIBLE_RANGES[f'temp_{_p:02d}'] = (-51.1, 121.1)
 del _c, _p
 
 

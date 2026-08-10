@@ -77,8 +77,19 @@ this is computed fresh every tick (not a sticky latch) — see the open re-arm q
 
 The per-cell overvoltage taper (`05-battery-management-safety.md`'s `ac_charge_taper` — split from
 `charge_target_taper` 2026-08-01, since `charge_target_taper` now governs only `charge_limit_kw`)
-still gets the final say over the ramped value every tick — it can reduce it further; it is never
-bypassed by this feature.
+still gets the final say over the ramped value every tick while a real charge session is active — it
+can reduce it further; it is never bypassed by this feature.
+
+**Charging and driving are two fully separate control paths for these two fields** (user directive,
+2026-08-07 — confirmed against `Refrance/Leaf_BMS_Emulator`'s bit-level-diff real-hardware notes:
+`LB_MAX_POWER_FOR_CHARGER` sits fixed at the 1023/92.3kW idle placeholder whenever not actually
+charging, never becoming a live per-cell-voltage-managed value outside a real charge session).
+`ac_charge_taper` — the taper reduction above AND its own `ac_emergency_v` hard cut — only runs
+while RZ450e's `charge_permission_input` interlock is actually granted; while just driving,
+`charger_limit_kw` is left completely untouched (whatever the Signal Mapping tab or the idle
+92.3kW placeholder already produced). Driving-mode overvoltage protection is entirely
+`charge_target_taper`'s job instead (the regen taper, unconditional by design — it drives the
+shared `charge_limit_kw` field for both regen-while-driving and charge-while-plugged-in).
 
 ## Two cutoff tiers (drives the battery-management design in `05-battery-management-safety.md`)
 
@@ -111,6 +122,27 @@ bypassed by this feature.
 
 Per user instruction (`05-battery-management-safety.md`): default to soft cut for routine
 protection, reserve hard cut for genuine emergencies and the staleness-watchdog fault.
+
+**All four of `relay_cut_request`, `interlock`, `capacity_empty`, and `full_charge_flag` are
+management-exclusive, not Signal Mapping targets (`bridge/leaf_signals.MANAGEMENT_EXCLUSIVE_KEYS`,
+fixed 2026-08-04, docs/13 item 16.3).** A stale code comment near `relay_cut_request`'s own
+definition previously claimed this was already true for that one field ("not itself in
+SLIDERS/CHECKS... never a direct mapping target") - it wasn't; `relay_cut_request` had been sitting
+in `SLIDERS`, fully user-mappable, the entire time, and `capacity_empty`/`full_charge_flag`/
+`interlock` were never excluded either. Since `ManagementEngine.apply()` only ever forced these
+fields *toward* their cut/latched state and never explicitly cleared them, a user-created (or
+hand-edited-profile) mapping tie targeting any of the four could hold it stuck asserted
+indefinitely, invisible to the Fault History window (a mapping-layer effect, not something
+`ManagementEngine`'s own fault_log ever sees). Fixed two ways together: these four keys are now
+excluded from `leaf_signals.OUTPUT_SIGNALS` (can't be selected as a mapping output at all), and
+`ManagementEngine.apply()` now explicitly clears `capacity_empty`/`relay_cut_request`/`interlock`
+back to their safe value every tick when no condition holds (not just conditionally setting the cut
+value) - `full_charge_flag` is deliberately excluded from that second half of the fix, since it's
+legitimately also set by `RealtimeEngine._apply_charge_ramp()` in a different module/moment; an
+unconditional clear inside `ManagementEngine.apply()` would race against and undo that. All four
+remain visible on the Dashboard - the three `CHECKS` fields via the "Flags" section, and
+`relay_cut_request` there too as of the same fix (previously only visible in the main per-signal bar
+list, under `SLIDERS`).
 
 ## Fields that are NOT mapping targets — internally generated, shown as send/don't-send checkboxes
 

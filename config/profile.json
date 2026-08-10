@@ -3,7 +3,9 @@
   "vehicle": {
     "car_gen": "ZE1",
     "battery_gen": "ZE1",
-    "battery_kwh": 40
+    "battery_kwh": 40,
+    "usable_capacity_kwh": 64.0,
+    "nameplate_capacity_ah": 201.0
   },
   "mappings": [
     {
@@ -85,10 +87,10 @@
       "combine": "linear",
       "output": "batt_temp_c",
       "params": {
-        "scale": 0.5555555555555556,
-        "offset": -17.77777777777778
+        "scale": 1.0,
+        "offset": 0.0
       },
-      "name": "temp_max (\u00b0F) -> batt_temp_c (\u00b0C)"
+      "name": "temp_max (\u00b0C) -> batt_temp_c (\u00b0C) (identity - both already \u00b0C as of 2026-08-09)"
     },
     {
       "inputs": [
@@ -108,8 +110,8 @@
       "combine": "linear",
       "output": "temp_segment_pct",
       "params": {
-        "scale": 0.9259259259259259,
-        "offset": -29.62962962962963
+        "scale": 1.6666666666666667,
+        "offset": 0.0
       },
       "name": "temp_max -> temp_segment_pct (PROVISIONAL, not hardware-confirmed - see docs/10)"
     }
@@ -124,26 +126,30 @@
     },
     "discharge_power_taper": {
       "enabled": true,
-      "taper_start_v": 3.0,
-      "taper_zero_v": 2.6,
-      "recovery_ramp_s": 3.0
+      "taper_start_v": 3.25,
+      "taper_zero_v": 3.0,
+      "recovery_ramp_s": 3.0,
+      "discharge_min_kw": 5.0,
+      "discharge_max_kw": 40.0
     },
     "charge_target_taper": {
       "enabled": true,
-      "regen_full_v": 4.0,
-      "regen_zero_v": 4.15,
+      "regen_full_v": 3.95,
+      "regen_zero_v": 4.1,
       "emergency_high_v": 4.2,
-      "recovery_ramp_s": 3.0
+      "recovery_ramp_s": 3.0,
+      "regen_min_kw": 0.0,
+      "regen_max_kw": 70.0
     },
     "over_temperature_derate": {
       "enabled": true,
-      "charge_derate_low_start_f": 50.0,
-      "charge_low_block_f": 32.0,
-      "charge_derate_start_f": 90.0,
-      "charge_hard_stop_f": 113.0,
-      "discharge_derate_start_f": 131.0,
-      "discharge_hard_stop_f": 140.0,
-      "emergency_temp_f": 141.8
+      "charge_derate_low_start_c": 10.0,
+      "charge_low_block_c": 0.0,
+      "charge_derate_start_c": 32.22222222222222,
+      "charge_hard_stop_c": 45.0,
+      "discharge_derate_start_c": 55.0,
+      "discharge_hard_stop_c": 60.0,
+      "emergency_temp_c": 61.0
     },
     "cell_imbalance_monitor": {
       "enabled": true,
@@ -163,6 +169,12 @@
     "cell_data_cross_check": {
       "enabled": true,
       "max_delta_v": 0.15,
+      "soft_cut_s": 60.0,
+      "hard_escalation_s": 5.0
+    },
+    "temp_data_cross_check": {
+      "enabled": true,
+      "max_delta_c": 5.555555555555555,
       "soft_cut_s": 60.0,
       "hard_escalation_s": 5.0
     },
@@ -190,9 +202,15 @@
     "charge_target_kw": 92.2,
     "chg_uprate_level": 7,
     "ac_full_v": 4.0,
-    "ac_zero_v": 4.15,
+    "ac_min_v": 4.1,
+    "ac_cutoff_v": 4.12,
     "ac_emergency_v": 4.2,
-    "daily_target_pct": 80.0,
+    "ac_min_kw": 1.0,
+    "ac_max_kw": 7.0,
+    "dc_min_kw": 5.0,
+    "dc_max_kw": 50.0,
+    "qc_max_soc_pct": 80.0,
+    "daily_target_pct": 41.0,
     "extended_target_pct": 100
   }
 }

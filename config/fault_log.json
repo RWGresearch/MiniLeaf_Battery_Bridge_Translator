@@ -27,7 +27,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "proactive regen taper factor=1.00 (worst cell 3.612V - full <= 3.9V, zero >= 4.1V)"
+    "last_detail": "proactive regen taper factor=1.00 (worst cell 3.606V - full <= 3.95V, zero >= 4.1V)"
   },
   "ac_overvoltage_emergency": {
     "label": "Cell overvoltage EMERGENCY hard cut - AC charger (per-cell)",
@@ -37,7 +37,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "AC charger taper factor=1.00 (worst cell 3.612V - full <= 4.0V, zero >= 4.15V)"
+    "last_detail": "AC charger taper factor=1.00 (worst cell 3.606V - full <= 4.0V, min >= 4.1V, floor 1kW)"
   },
   "over_temp_emergency": {
     "label": "Over-temperature EMERGENCY hard cut (hottest probe)",
@@ -47,7 +47,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 78.8F, hottest probe 80.6F)"
+    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 77.0F, hottest probe 78.8F)"
   },
   "charge_cold_block": {
     "label": "Charge/regen blocked - coldest probe at/below freezing",
@@ -57,7 +57,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 78.8F, hottest probe 80.6F)"
+    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 77.0F, hottest probe 78.8F)"
   },
   "discharge_temp_zero": {
     "label": "Discharge power at zero - over-temperature",
@@ -67,7 +67,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 78.8F, hottest probe 80.6F)"
+    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 77.0F, hottest probe 78.8F)"
   },
   "charge_temp_zero": {
     "label": "Charge/regen power at zero - over-temperature",
@@ -77,7 +77,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 78.8F, hottest probe 80.6F)"
+    "last_detail": "discharge_factor=1.00, charge_factor=1.00 (coldest probe 77.0F, hottest probe 78.8F)"
   },
   "cell_imbalance_warn": {
     "label": "Cell imbalance warning (spread)",
@@ -87,7 +87,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (spread 4mV)"
+    "last_detail": "ok (spread 5mV)"
   },
   "overcurrent_discharge_warn": {
     "label": "Overcurrent warning - discharge",
@@ -112,11 +112,11 @@
   "config_sanity": {
     "label": "Battery-management config has an inverted/nonsensical threshold ordering",
     "level": "warn",
-    "count": 0,
+    "count": 22,
     "active": false,
-    "first_triggered": null,
-    "last_triggered": null,
-    "last_cleared": null,
+    "first_triggered": 1786066624.0073993,
+    "last_triggered": 1786300630.181765,
+    "last_cleared": 1786300630.296046,
     "last_detail": "ok"
   },
   "input_validation_reject": {
@@ -137,7 +137,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (delta 0mV)"
+    "last_detail": "ok (delta 1mV)"
   },
   "cell_data_mismatch_hard": {
     "label": "Cell data cross-check mismatch - hard cut escalation",
@@ -147,46 +147,86 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (delta 0mV)"
+    "last_detail": "ok (delta 1mV)"
   },
   "staleness_soft": {
     "label": "Staleness watchdog - soft cut (stale data)",
     "level": "soft",
-    "count": 0,
+    "count": 1,
     "active": false,
-    "first_triggered": null,
-    "last_triggered": null,
+    "first_triggered": 1786208212.5499673,
+    "last_triggered": 1786208212.5499673,
     "last_cleared": null,
-    "last_detail": "ok (worst age 2.8s, counter:counter_5s)"
+    "last_detail": "ok (worst age 3.0s, counter:counter_5s)"
   },
   "staleness_hard": {
     "label": "Staleness watchdog - hard cut escalation",
     "level": "hard",
-    "count": 0,
+    "count": 1,
     "active": false,
-    "first_triggered": null,
-    "last_triggered": null,
+    "first_triggered": 1786208217.5508194,
+    "last_triggered": 1786208217.5508194,
     "last_cleared": null,
-    "last_detail": "ok (worst age 2.8s, counter:counter_5s)"
+    "last_detail": "ok (worst age 3.0s, counter:counter_5s)"
   },
   "hard_cut_latch": {
     "label": "Hard cut LATCHED (relay_cut_request/interlock still asserted)",
     "level": "hard",
-    "count": 0,
+    "count": 1,
     "active": false,
-    "first_triggered": null,
-    "last_triggered": null,
+    "first_triggered": 1786208217.5508215,
+    "last_triggered": 1786208217.5508215,
     "last_cleared": null,
     "last_detail": "not latched"
   },
   "clamp_qc_full_wh": {
     "label": "Output clamped: qc_full_wh",
     "level": "warn",
-    "count": 2,
+    "count": 6,
     "active": false,
     "first_triggered": 1785640788.7667143,
-    "last_triggered": 1785642792.6308026,
+    "last_triggered": 1786203606.0548515,
     "last_cleared": null,
-    "last_detail": "67459.62 -> 51100 (out of documented encodable range)"
+    "last_detail": "67849.56 -> 51100 (out of documented encodable range)"
+  },
+  "checksum_reject": {
+    "label": "Toyota checksum validation rejected a corrupt frame",
+    "level": "warn",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok"
+  },
+  "temp_data_mismatch": {
+    "label": "Temperature data cross-check mismatch (0x4A7 extremes vs 0x4AA per-probe)",
+    "level": "soft",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok (delta 0.0F)"
+  },
+  "temp_data_mismatch_hard": {
+    "label": "Temperature data cross-check mismatch - hard cut escalation",
+    "level": "hard",
+    "count": 0,
+    "active": false,
+    "first_triggered": null,
+    "last_triggered": null,
+    "last_cleared": null,
+    "last_detail": "ok (delta 0.0F)"
+  },
+  "ac_cutoff_stop": {
+    "label": "AC charger stop-charging cutoff reached (per-cell)",
+    "level": "warn",
+    "count": 34,
+    "active": false,
+    "first_triggered": 1786066624.0073786,
+    "last_triggered": 1786074496.6069584,
+    "last_cleared": 1786074421.908451,
+    "last_detail": "AC charger taper factor=1.00 (worst cell 3.606V - full <= 4.0V, min >= 4.1V, floor 1kW)"
   }
 }

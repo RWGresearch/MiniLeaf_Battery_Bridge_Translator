@@ -13,6 +13,12 @@ session's implementation pass, so they don't get lost. Two different kinds of it
 Nothing in this doc is a promise about *when* — it's a checklist to work through, same spirit as
 `13-review-checklist-2026-08-01.md`.
 
+**Real-hardware testing itself is organized in `15-real-hardware-test-checklist.md` (added
+2026-08-04)** — that doc is the step-by-step "how to actually run the test" companion, covering
+every safety feature one at a time against the real Leaf + real bench pack, not just the items
+below. Part 2 here stays as the flat list of what was flagged during the 2026-08 review pass;
+`docs/15` is the place new real-hardware test planning should go from here on.
+
 ## How to use this doc
 
 Check items off as they're written/run. For software-testable items, note the test file/function
@@ -178,6 +184,10 @@ Other real-hardware-only items, some carried over from `docs/10`:
       every charge-side safety feature was sized against AC-charger-scale current.
 - [ ] **docs/10 #13** - `temp_segment_pct`'s provisional mapping formula (added 2026-08-01) has
       never been checked against a real dash display, unlike `soc_correction`/`capacity_bars_raw`.
+      Note: the input (`temp_max` from `0x4A7`) is already cross-checked live against the actual
+      max of the 16 individual `0x4AA` probes (`temp_data_cross_check`, docs/13 item 16.2) - it's
+      specifically the 32-140°F -> 0-100% window that needs confirming against a real dash, not
+      which temperature source feeds it.
 - [ ] Fault latching's two re-arm triggers (`notify_session_start()`/`notify_charge_replug()|) need
       confirming against a REAL bus-wake/replug event, not just the software-level phase transition
       - does a genuine ignition cycle or charger replug on real hardware actually produce the

@@ -6,25 +6,12 @@ import tkinter as tk
 from tkinter import ttk
 
 from bridge import can_backend, leaf_signals, management_engine, rz450e_signals
-from bridge.mapping_engine import MappingTie, COMBINE_TYPES, explain_tie
+from bridge.mapping_engine import MappingTie, COMBINE_TYPES, explain_tie, VEHICLE_FIELD_BOUNDS
 from gui.info_popup import show_info_popup, help_btn
-from gui.theme import VScrollFrame, BASE_FONT, FG, FIELD, FG_DIM, ERR, OK
+from gui.theme import (VScrollFrame, MONO_FONT, FG, FIELD, FG_DIM, ERR, OK,
+                       configure_field_tags, write_field, write_section, no_wheel)
 
 REFRESH_MS = 400
-
-
-def _no_wheel(combo):
-    """Prevent mouse-wheel scrolling from silently changing a readonly
-    Combobox's selection (added 2026-08-01, user report: "when I'm
-    scrolling with the wheel I have accidentally changed the inputs/
-    outputs... this data should only be valid if selected with a mouse
-    pointer and click"). An instance-level binding fires before both the
-    Combobox's own class binding (which changes the value on wheel scroll)
-    and VScrollFrame's page-scroll bind_all handler (gui/theme.py) - so
-    returning "break" here stops both; only an explicit click can change
-    the selection now."""
-    for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
-        combo.bind(seq, lambda e: 'break')
 
 # ── Contextual help text, ported style from leaf_hvbat_emulator.py's HELP
 # dict / _help_btn pattern - every panel gets a '?' explaining what it does
@@ -77,13 +64,25 @@ VEHICLE_HELP = (
     "- 0x5EB only if Battery = ZE1.\n"
     "- 0x1ED (62kWh charger-limit message) only if Battery = ZE1 AND kWh = 62 - "
     "and that field is UNVERIFIED upstream (no real 62kWh capture exists yet), "
-    "see docs/10 open question #11."
+    "see docs/10 open question #11.\n\n"
+    "'Usable capacity (kWh)' / 'Nameplate capacity (Ah)' (added 2026-08-08, "
+    "docs/04/docs/16) are the RZ450e SOURCE-pack capacity spec feeding the "
+    "GIDS/QC capacity formula (0x5BC remaining capacity, 0x59E QC full/"
+    "remaining capacity) - a genuine pack spec, not Leaf-side generation "
+    "selection like the three fields above, but placed here since it's the "
+    "closest existing 'pack spec' surface. Formula: soh_fraction = measured "
+    "capacity_ah / nameplate_capacity_ah; usable energy at current SOH = "
+    "usable_capacity_kwh x soh_fraction; gids = (SoC% x usable energy) / "
+    "80Wh. Defaults (64.0kWh / 201.00Ah) are spec-sourced, not independently "
+    "bench-confirmed for this exact pack's buffer. The QC ceiling (how much "
+    "of that usable energy the display counts as 'full') is a separate "
+    "field, 'QC max SOC %' on the Charge Emulation tab, not here."
 )
 MAPPING_HELP = (
     "Signal Mapping (docs/04)\n\n"
     "Each card ties one or more RZ450e input signals to one Leaf output signal "
     "through a fixed preset combine function - linear (scale+offset), sum, "
-    "average, min, max, or the soh_percent formula. No generic scripting is "
+    "average, min, max, lookup (a step table), or the soh_percent formula. No generic scripting is "
     "supported by design (docs/05's philosophy), so every tie stays portable to "
     "a future STM32 firmware port.\n\n"
     "Every dropdown entry is prefixed with its source CAN ID or DID (e.g. "
@@ -114,7 +113,12 @@ CHARGE_EMULATION_HELP = (
     "and instead SNAPS from its 1023 idle placeholder to 0.0 kW, then ramps up to "
     "'Charger ramp target (kW)' at a rate set by 'Uprate level' - level 7 = 2.0 "
     "kW/s, each level down halves the rate. The uprate bits (0x1DC byte 4 bits "
-    "5-7) ride along with it, 0 -> level.\n\n"
+    "5-7) ride along with it, 0 -> level. The target itself is clamped into "
+    "'AC charge minimum/maximum power request (kW)' below (default 0.5-6.6kW, "
+    "6.6kW being the Leaf's real onboard AC charger ceiling) before ramping - "
+    "and, as of 2026-08-06, the ramp rate-limits a LOWERED target exactly the "
+    "same way it always has a raised one, for real fine (100W-scale) control "
+    "in either direction instead of an instant jump.\n\n"
     "If the Leaf is asking to charge but RZ450e has NOT granted permission, this "
     "forces an explicit charger STOP instead of falling back to a static value: "
     "full_charge_flag is set (the confirmed real-hardware 'instant charge stop + "
@@ -135,15 +139,38 @@ CHARGE_EMULATION_HELP = (
     "this feature existed."
 )
 AC_CHARGE_TAPER_HELP = (
-    "AC charger overvoltage taper (docs/05, added 2026-08-01)\n\n"
+    "AC charger overvoltage taper (docs/05, added 2026-08-01, reworked 2026-08-06)\n\n"
     "Split out of Battery Management's per-cell charge/regen taper (user "
     "directive: AC charging via the Leaf's onboard charger, ~19A/0.09C, is "
     "physically very different from regenerative braking, up to ~0.5C into "
     "the pack - so each gets its own independently-tunable curve instead of "
     "sharing one). Drives ONLY charger_limit_kw ('Max power for charger,' "
-    "docs/03) - full power at/below 'Full power below', ramping to zero at/"
-    "above 'Zero power at/above', with 'Emergency high V' as a second, more "
-    "extreme per-cell threshold that escalates to a HARD CUT.\n\n"
+    "docs/03) through FOUR tiers, in order: full power at/below 'Full power "
+    "below'; ramping down to, then HOLDING at, the 'AC charge minimum power "
+    "request (kW)' floor once voltage reaches 'Minimum power at/above' "
+    "(renamed from a true zero-power point 2026-08-06 - the vehicle no "
+    "longer has to react to a near-zero request to actually stop); crossing "
+    "'Stop-charging cutoff V' deliberately ENDS the session (full_charge_flag "
+    "+ charge/charger_limit_kw forced to their stop values), same as the "
+    "target-SoC-reached stop below; 'Emergency high V' is a second, more "
+    "extreme per-cell threshold above all of that, which escalates to a HARD "
+    "CUT instead.\n\n"
+    "Convergence toward that target is GENTLE, not instant (reworked "
+    "2026-08-06 after a real bench test showed this taper hunting - a "
+    "repeating full-cycle oscillation, not just a rough step - because "
+    "instant response in either direction is the wrong model for a CC-CV "
+    "charging control loop, unlike the discharge/regen tapers which "
+    "genuinely do need to react instantly to real cell sag under load): it "
+    "dynamically self-selects one of the existing 0-7 uprate levels based "
+    "on how far it still has to move - always starts at level 7 (fastest) "
+    "the moment it needs to converge, then downshifts (and upshifts back, "
+    "symmetrically) as the remaining distance narrows or grows, gentler "
+    "the closer it gets to the target. The level actually chosen is what's "
+    "transmitted in 0x1DC's own uprate bits while this is actively "
+    "converging (visible in this feature's live status text below, e.g. "
+    "'target=X.XXkW, applied=X.XXkW (level N)') - overriding the manual "
+    "'Uprate level' setting above only during that window, never outside "
+    "it.\n\n"
     "'Daily target %' / 'Extended target %' and full_charge_flag are a "
     "separate concern, gated on RZ450e's charge_permission_input (charging "
     "interlock) being active - only fires during an actual plugged-in charge "
@@ -169,6 +196,27 @@ REQUIRE_LIVE_DATA_HELP = (
     "sets full_charge_flag when it fires), not a separate/stricter timer. "
     "Per user directive: charging gets a different STARTUP requirement than "
     "driving, not different ongoing protection."
+)
+DC_QC_HELP = (
+    "DC fast-charge / QC capacity (added 2026-08-06, moved here + 'QC max SOC "
+    "%' added 2026-08-08)\n\n"
+    "'DC minimum/maximum power request (kW)' are a PLACEHOLDER ONLY - not "
+    "read by any active ramp/taper logic today (docs/10 open question #9: "
+    "the RZ450e pack is rated for real 150kW/~430A DC fast charging, "
+    "separate from the Leaf's 6.6kW onboard AC path this bridge actually "
+    "emulates - that support isn't built yet). These fields exist purely so "
+    "the config schema/GUI has a home for them ahead of DC charging support "
+    "actually being built.\n\n"
+    "'QC max SOC %' IS live, unlike the two placeholders above it - it caps "
+    "the GIDS/QC capacity formula (Vehicle panel, see its own '?') at this "
+    "percentage: qc_full_wh = usable energy at this SOC%, qc_remain_wh = "
+    "however much of that is still ahead of current SoC (0 once already "
+    "past it). Default 80% reflects that real DC fast charging only "
+    "usefully charges to roughly that point before CC-CV tapering makes the "
+    "rest pointless - PROVISIONAL, not yet tested against a real DC fast-"
+    "charge session (no DC testing has been done on this project at all "
+    "yet), same 'documented, not confirmed' status as the placeholder "
+    "fields above it and temp_segment_pct's own mapping tie."
 )
 MANAGEMENT_FEATURE_HELP = {
     'low_voltage_cutoff': (
@@ -215,7 +263,24 @@ MANAGEMENT_FEATURE_HELP = {
         "a slow ramp - but slow to recover back to full power once voltage "
         "comes back up ('Recovery ramp (s)' = seconds to go from 0% back to "
         "100%). This avoids the power limit hunting/oscillating if cell "
-        "voltage bounces near the threshold under intermittent acceleration."
+        "voltage bounces near the threshold under intermittent acceleration.\n\n"
+        "'Min discharge power (kW)' / 'Max discharge power (kW)' (added "
+        "2026-08-08) bound where the taper actually ramps between - default "
+        "0.0/110.0kW is an exact no-op (0.0 = the taper's pre-existing true-"
+        "zero floor, 110.0 matches the researched Leaf drive-power peak, "
+        "docs/12 section 6), same floor/ceiling pattern as the AC charger's "
+        "min/max kW request bounds on the Charge Emulation tab.\n\n"
+        "REAL-HARDWARE FINDING (2026-08-09, real ZE1 40kWh Leaf): the "
+        "vehicle itself visibly reacts to 'Max discharge power (kW)' - "
+        "around a 40kW setting the turtle (reduced-power) icon comes on the "
+        "dash, and below roughly 3kW the car starts turning off power "
+        "systems entirely. Both are the Leaf's OWN reaction to a low "
+        "discharge_limit_kw request, not a bug in this taper - treat ~40kW "
+        "as a practical ceiling before the dash starts warning the driver, "
+        "and keep 'Min discharge power (kW)' comfortably above ~3kW so the "
+        "taper's own floor never asks for a value the car reacts to that "
+        "badly. Not yet swept for the exact real thresholds - documented "
+        "starting point, not a confirmed number (docs/11)."
     ),
     'charge_target_taper': (
         "Per-cell REGEN power limit (docs/05, split 2026-08-01)\n\n"
@@ -243,7 +308,38 @@ MANAGEMENT_FEATURE_HELP = {
         "extended SoC target and full_charge_flag, are now on the 'Charge "
         "Emulation' tab instead - AC charging (~19A/0.09C) is physically very "
         "different from regen, so it gets its own independently-tunable curve "
-        "rather than sharing this one."
+        "rather than sharing this one.\n\n"
+        "'Min regen power (kW)' / 'Max regen power (kW)' (added 2026-08-08) "
+        "bound where the taper actually ramps between - default 0.0/70.0kW "
+        "is an exact no-op on rollout (0.0 = the taper's pre-existing true-"
+        "zero floor; 70.0 matches the pre-existing static default, NOT the "
+        "docs/12 section 6 researched ~0.5C/~36kW regen figure - kept "
+        "unchanged deliberately so this ships with no behavior change, tune "
+        "toward that research once ready). SAFETY: the emergency hard-cut "
+        "branch above always outputs literal 0.0, ignoring this floor "
+        "entirely - a floor must never keep feeding power into an "
+        "overvoltage emergency.\n\n"
+        "REAL-HARDWARE FINDING (2026-08-09): 'Min regen power (kW)' can be "
+        "set all the way down to 0kW without issue - regen genuinely goes "
+        "to zero cleanly. But 'Max regen power (kW)' only does something "
+        "once it's set BELOW whatever the real Leaf pack/VCM can actually "
+        "accept - on the project's real ZE1 40kWh test vehicle, changing "
+        "this setting anywhere between 70kW and 40kW makes no observable "
+        "difference at all, because the car's own regen ceiling sits around "
+        "40kW - that's a LEAF LIMIT, not a setting this bridge controls. "
+        "Peak regen capability varies a lot by Leaf generation/pack, so the "
+        "useful range of this setting depends on which car it's driving:\n"
+        "  - 1st-gen LEAF (24/30kWh): caps out around 20-30kW peak regen\n"
+        "  - 2nd-gen LEAF (40kWh, this project's real test vehicle): just "
+        "over 40kW peak regen\n"
+        "  - LEAF PLUS (62kWh): can hit peak bursts of roughly 60-80kW under "
+        "optimal conditions\n"
+        "Set 'Max regen power (kW)' at or below the actual car's real "
+        "ceiling for it to have any effect - anything above that ceiling is "
+        "a no-op, the vehicle simply never asks for more than it can take. "
+        "Not yet swept for the exact real ceiling on any specific car - "
+        "documented starting point from real-hardware observation, not a "
+        "confirmed number (docs/11)."
     ),
     'over_temperature_derate': (
         "Over-temperature derate (docs/05, restructured 2026-07-31 per docs/12 "
@@ -261,8 +357,8 @@ MANAGEMENT_FEATURE_HELP = {
         "even for the cold-side block, which meant charging into a partly-"
         "frozen pack stayed allowed as long as the warmest corner read above "
         "freezing - lithium plating happens in the COLDEST cells. Charging is "
-        "blocked entirely at/below 'Charge low block' °F and ramps up to full "
-        "acceptance by 'Charge cold-derate start' °F - added because plating "
+        "blocked entirely at/below 'Charge low block' °C and ramps up to full "
+        "acceptance by 'Charge cold-derate start' °C - added because plating "
         "risk rises well above the freezing line at meaningful charge "
         "current; our real exposure here is regen into a cold-soaked pack "
         "(~0.5C), not the Leaf's 0.09C AC charger.\n\n"
@@ -271,12 +367,14 @@ MANAGEMENT_FEATURE_HELP = {
         "CUT (relay_cut_request + interlock drop) - mirrors the two-tier "
         "soft/emergency structure the voltage features already have. "
         "Deliberately close above the soft stop: a cell with any plated "
-        "lithium can begin self-heating as low as ~60°C (140°F), so there's "
+        "lithium can begin self-heating as low as ~60°C, so there's "
         "very little real margin to work with.\n\n"
         "Defaults are researched general NMC/lithium-ion safety ranges "
         "cross-checked against this pack's own confirmed 3.6-4.2V/3.7V-nominal "
         "real-world range - not yet confirmed against a real thermal test on this "
-        "specific pack (see docs/11's verification checklist)."
+        "specific pack (see docs/11's verification checklist). All temperature "
+        "settings/readouts in this app are °C (converted from °F-primary "
+        "storage 2026-08-09 - same physical thresholds, no behavior change)."
     ),
     'cell_imbalance_monitor': (
         "Cell imbalance monitor (added 2026-07-31, docs/12 research pass "
@@ -352,6 +450,24 @@ MANAGEMENT_FEATURE_HELP = {
         "this is a data-integrity check, not a voltage-level protection "
         "feature (that's low_voltage_cutoff/charge_target_taper's job)."
     ),
+    'temp_data_cross_check': (
+        "Temperature data cross-check (docs/02, added 2026-08-04, docs/13 item 16.2)\n\n"
+        "Live redundancy check between the pack-level temperature extremes "
+        "(0x4A7's temp_max/temp_min) and the actual min/max of all 16 "
+        "individually-read temp probes (0x4AA) - the same pattern as the "
+        "cell data cross-check above, applied to temperature.\n\n"
+        "This matters because temp_min directly drives the cold-side charge-"
+        "block/derate logic that protects against lithium plating - a "
+        "decode or multiplexing fault could produce a temp_min/temp_max "
+        "reading that's individually plausible but physically inconsistent "
+        "with the 16 probes it's presumably derived from, with nothing else "
+        "in this project able to catch it.\n\n"
+        "If the pack-extremes summary disagrees with the individual probes "
+        "by 'Max delta' or more, continuously for 'Soft cut after' seconds, "
+        "triggers a SOFT CUT - same soft-then-hard escalation structure as "
+        "the cell data cross-check and staleness watchdog, independently "
+        "tunable from both."
+    ),
     'input_validation': (
         "Input plausibility validation (docs/13 item 15.14, added 2026-08-03)\n\n"
         "Every RZ450e-decoded value is checked against a generous physical-"
@@ -409,7 +525,7 @@ class ConnectionsPanel(ttk.Frame):
         self.channel_var = tk.StringVar(value=self.channels[0] if self.channels else '')
         self.channel_menu = ttk.Combobox(row, values=self.channels, textvariable=self.channel_var,
                                           width=20, state='readonly')
-        _no_wheel(self.channel_menu)
+        no_wheel(self.channel_menu)
         self.channel_menu.pack(side='left', padx=(0, 4))
         ttk.Button(row, text='Rescan', width=8, style='Small.TButton', command=self._rescan).pack(side='left', padx=2)
 
@@ -481,67 +597,76 @@ class LiveMonitorPanel(ttk.Frame):
     """Read-only, periodically-refreshed grouped value dump. Text-block
     style (matches the Leaf project's DashWindow 'informative' feel) rather
     than one live-bound widget per signal, since there are 100+ input
-    signals to display."""
+    signals to display.
 
-    def __init__(self, master, title, text_fn):
+    `write_fn(box)` populates the (already-cleared) Text widget directly,
+    using write_section()/write_field() (gui/theme.py) - each field is a
+    label, then its value flush against the box's own right edge (a real
+    Tk tab stop, re-measured on resize; see configure_field_tags())."""
+
+    def __init__(self, master, title, write_fn):
         super().__init__(master)
-        self.text_fn = text_fn
+        self.write_fn = write_fn
         ttk.Label(self, text=title, style='Header.TLabel').pack(anchor='w', padx=8, pady=(8, 2))
-        self.box = tk.Text(self, wrap='none', bg=FIELD, fg=FG, insertbackground=FG,
-                            relief='flat', state='disabled', font=BASE_FONT)
+        self.box = tk.Text(self, wrap='word', bg=FIELD, fg=FG, insertbackground=FG,
+                            relief='flat', state='disabled', font=MONO_FONT)
         self.box.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+        configure_field_tags(self.box)
         self._refresh()
 
     def _refresh(self):
         if not self.winfo_exists():
             return
-        text = self.text_fn()
-        yview = self.box.yview()
+        # Scroll position preserved by INDEX, not yview() fraction (fixed
+        # 2026-08-06, user report: "the live text slowely scrowl back to
+        # the top on its own") - yview_moveto(fraction) rounds to the
+        # nearest line internally, and re-deriving/reapplying that fraction
+        # every ~400ms is a lossy round-trip that drifted the visible
+        # position toward the top over many refreshes even though the
+        # field count never changes. '@0,0' is the exact character index
+        # under the widget's top-left corner; re-scrolling to that same
+        # index after the rewrite is exact, not a rounded approximation.
+        top_index = self.box.index('@0,0')
         self.box.configure(state='normal')
         self.box.delete('1.0', 'end')
-        self.box.insert('1.0', text)
+        self.write_fn(self.box)
         self.box.configure(state='disabled')
         try:
-            self.box.yview_moveto(yview[0])
+            self.box.yview(top_index)
         except Exception:
             pass
         self.after(REFRESH_MS, self._refresh)
 
 
-def input_monitor_text(state_model):
-    lines = []
+def write_input_monitor(box, state_model):
     groups = {}
     for sig in rz450e_signals.INPUT_SIGNALS:
         groups.setdefault(sig['group'], []).append(sig)
     for group, sigs in groups.items():
-        lines.append(f'-- {group} --')
+        write_section(box, group)
         for sig in sigs:
             key = sig['key']
             val = state_model.get_input(key)
-            age = state_model.age_of(key)
-            age_s = f'{age:4.1f}s' if age is not None else ' --  '
             if val is None:
-                lines.append(f'  {sig["label"]:<40} --')
-            else:
-                lines.append(f'  {sig["label"]:<40} {val:>10.3f} {sig["unit"]:<4} (age {age_s})')
-    return '\n'.join(lines)
+                write_field(box, sig['label'], '--')
+                continue
+            age = state_model.age_of(key)
+            age_s = f'{age:.1f}s' if age is not None else '--'
+            write_field(box, sig['label'], f'{val:.3f} {sig["unit"]} (age {age_s})')
 
 
-def leaf_tx_monitor_text(state_model):
-    lines = []
+def write_leaf_tx_monitor(box, state_model):
     tx = state_model.snapshot_leaf_tx()
     for group, sigs in leaf_signals.SLIDERS.items():
-        lines.append(f'-- {group} --')
+        write_section(box, group)
         for key, label, *_rest in sigs:
-            val = tx.get(key)
-            lines.append(f'  {label:<40} {val!r}')
-    lines.append('-- Flags --')
+            write_field(box, label, repr(tx.get(key)))
+    write_section(box, 'Flags')
     for key, label, _default in leaf_signals.CHECKS:
-        lines.append(f'  {label:<40} {tx.get(key)!r}')
-    lines.append('-- Management status --')
+        write_field(box, label, repr(tx.get(key)))
+    write_section(box, 'Management status')
     for feature, status in state_model.snapshot_management_status().items():
-        lines.append(f'  {feature:<30} {status}')
-    return '\n'.join(lines)
+        write_field(box, feature, status)
 
 
 class VehiclePanel(ttk.Frame):
@@ -562,17 +687,71 @@ class VehiclePanel(ttk.Frame):
         car_combo = ttk.Combobox(row, values=['AZE0', 'ZE1'], textvariable=self.car_gen, width=6, state='readonly')
         car_combo.pack(side='left', padx=4)
         car_combo.bind('<<ComboboxSelected>>', lambda e: state_model.set_vehicle_item('car_gen', self.car_gen.get()))
-        _no_wheel(car_combo)
+        no_wheel(car_combo)
         ttk.Label(row, text='Battery:').pack(side='left')
         batt_combo = ttk.Combobox(row, values=['AZE0', 'ZE1'], textvariable=self.batt_gen, width=6, state='readonly')
         batt_combo.pack(side='left', padx=4)
         batt_combo.bind('<<ComboboxSelected>>', lambda e: state_model.set_vehicle_item('battery_gen', self.batt_gen.get()))
-        _no_wheel(batt_combo)
+        no_wheel(batt_combo)
         ttk.Label(row, text='kWh:').pack(side='left')
         kwh_combo = ttk.Combobox(row, values=['30', '40', '62'], textvariable=self.batt_kwh, width=4, state='readonly')
         kwh_combo.pack(side='left', padx=4)
         kwh_combo.bind('<<ComboboxSelected>>', lambda e: state_model.set_vehicle_item('battery_kwh', int(self.batt_kwh.get())))
-        _no_wheel(kwh_combo)
+        no_wheel(kwh_combo)
+
+        # RZ450e SOURCE-pack capacity spec (added 2026-08-08, docs/16 audit,
+        # nameplate_capacity_ah split out same day per user follow-up) -
+        # feeds mapping_engine.derive_capacity_outputs()'s GIDS formula. A
+        # scope stretch for this panel (it's otherwise Leaf-side generation
+        # selection), but the closest existing "vehicle/pack spec" surface -
+        # see bridge/state.py's own comment on these vehicle dict keys.
+        # qc_max_soc_pct deliberately does NOT live here - moved to
+        # ChargeEmulationPanel (charging behavior, not a pack spec).
+        # Own row per field (2026-08-08, user report: "nameplate capacity
+        # words are off the screen" - this panel sits in the narrow right
+        # sidebar column, ~374px wide; a single row with both label+Entry
+        # pairs packed side-by-side overflowed it) - matches ManagementPanel's
+        # one-field-per-row layout instead.
+        cap_row = ttk.Frame(self)
+        cap_row.pack(fill='x', padx=8, pady=(0, 2))
+        ttk.Label(cap_row, text='Usable capacity (kWh):').pack(side='left')
+        self.usable_kwh_var = tk.StringVar(value=str(vehicle['usable_capacity_kwh']))
+        ttk.Entry(cap_row, textvariable=self.usable_kwh_var, width=8).pack(side='left', padx=4)
+        cap_flag = ttk.Label(cap_row, text='', foreground=ERR, width=9)
+        cap_flag.pack(side='left')
+        self.usable_kwh_var.trace_add(
+            'write', lambda *_a: self._set_vehicle_float('usable_capacity_kwh', self.usable_kwh_var, cap_flag))
+
+        nameplate_row = ttk.Frame(self)
+        nameplate_row.pack(fill='x', padx=8, pady=(0, 8))
+        ttk.Label(nameplate_row, text='Nameplate capacity (Ah):').pack(side='left')
+        self.nameplate_ah_var = tk.StringVar(value=str(vehicle['nameplate_capacity_ah']))
+        ttk.Entry(nameplate_row, textvariable=self.nameplate_ah_var, width=8).pack(side='left', padx=4)
+        nameplate_flag = ttk.Label(nameplate_row, text='', foreground=ERR, width=9)
+        nameplate_flag.pack(side='left')
+        self.nameplate_ah_var.trace_add(
+            'write', lambda *_a: self._set_vehicle_float(
+                'nameplate_capacity_ah', self.nameplate_ah_var, nameplate_flag))
+
+    def _set_vehicle_float(self, key, var, flag_lbl):
+        """Same clamp-on-edit pattern as ManagementPanel._set_float, adapted
+        to call state_model.set_vehicle_item() (the locked setter every other
+        vehicle-dict edit in this panel already uses) instead of mutating a
+        plain cfg dict directly."""
+        try:
+            raw = float(var.get())
+        except ValueError:
+            flag_lbl.configure(text='invalid')
+            return
+        lo, hi = VEHICLE_FIELD_BOUNDS[key]
+        value = raw
+        clamped = False
+        if value < lo:
+            value, clamped = lo, True
+        elif value > hi:
+            value, clamped = hi, True
+        self.state_model.set_vehicle_item(key, value)
+        flag_lbl.configure(text='clamped' if clamped else '')
 
 
 class MappingPanel(ttk.Frame):
@@ -682,7 +861,7 @@ class MappingPanel(ttk.Frame):
                                   state='readonly', style=style)
             combo.pack(side='left', padx=2)
             combo.bind('<<ComboboxSelected>>', lambda e, i=idx: self._update_tie(i))
-            _no_wheel(combo)
+            no_wheel(combo)
             vars_in.append(v)
             combos_in.append(combo)
         card._invars = vars_in
@@ -695,7 +874,7 @@ class MappingPanel(ttk.Frame):
         combine_combo = ttk.Combobox(line2, values=list(COMBINE_TYPES), textvariable=combine_var, width=12, state='readonly')
         combine_combo.pack(side='left', padx=2)
         combine_combo.bind('<<ComboboxSelected>>', lambda e, i=idx: self._update_tie(i))
-        _no_wheel(combine_combo)
+        no_wheel(combine_combo)
         card._combine_var = combine_var
 
         scale_var = tk.StringVar(value=str(tie.params.get('scale', 1.0)))
@@ -714,7 +893,7 @@ class MappingPanel(ttk.Frame):
                                   state='readonly', style=out_style)
         out_combo.pack(side='left', padx=2)
         out_combo.bind('<<ComboboxSelected>>', lambda e, i=idx: self._update_tie(i))
-        _no_wheel(out_combo)
+        no_wheel(out_combo)
         card._out_var = out_var
         card._out_combo = out_combo
 
@@ -773,7 +952,9 @@ class ManagementPanel(ttk.Frame):
                                 ('min_soc_pct', 'Min SoC % (backup check only, never acts alone)')],
         'discharge_power_taper': [('taper_start_v', 'Full power at/above (V/cell)'),
                                    ('taper_zero_v', 'Zero power at/below (V/cell)'),
-                                   ('recovery_ramp_s', 'Recovery ramp (s, slow release)')],
+                                   ('recovery_ramp_s', 'Recovery ramp (s, slow release)'),
+                                   ('discharge_min_kw', 'Min discharge power (kW)'),
+                                   ('discharge_max_kw', 'Max discharge power (kW)')],
         # REGEN ONLY as of 2026-08-01 (split from the old combined regen+AC
         # taper - user directive: regen and AC charging are physically very
         # different, ~0.5C vs ~0.09C). The AC-charger-specific taper and the
@@ -783,20 +964,24 @@ class ManagementPanel(ttk.Frame):
         'charge_target_taper': [('regen_full_v', 'Full regen below (V/cell)'),
                                  ('regen_zero_v', 'Zero regen at/above (V/cell)'),
                                  ('emergency_high_v', 'Emergency high V (hard, per-cell)'),
-                                 ('recovery_ramp_s', 'Recovery ramp (s, slow release)')],
-        'over_temperature_derate': [('charge_derate_low_start_f', 'Charge cold-derate start °F (coldest probe)'),
-                                     ('charge_low_block_f', 'Charge low block °F (coldest probe)'),
-                                     ('charge_derate_start_f', 'Charge derate start °F (hottest probe)'),
-                                     ('charge_hard_stop_f', 'Charge hard stop °F (hottest probe, soft ramp)'),
-                                     ('discharge_derate_start_f', 'Discharge derate start °F (hottest probe)'),
-                                     ('discharge_hard_stop_f', 'Discharge hard stop °F (hottest probe, soft ramp)'),
-                                     ('emergency_temp_f', 'Emergency temp °F (hard, hottest probe)')],
+                                 ('recovery_ramp_s', 'Recovery ramp (s, slow release)'),
+                                 ('regen_min_kw', 'Min regen power (kW)'),
+                                 ('regen_max_kw', 'Max regen power (kW)')],
+        'over_temperature_derate': [('charge_derate_low_start_c', 'Charge cold-derate start °C (coldest probe)'),
+                                     ('charge_low_block_c', 'Charge low block °C (coldest probe)'),
+                                     ('charge_derate_start_c', 'Charge derate start °C (hottest probe)'),
+                                     ('charge_hard_stop_c', 'Charge hard stop °C (hottest probe, soft ramp)'),
+                                     ('discharge_derate_start_c', 'Discharge derate start °C (hottest probe)'),
+                                     ('discharge_hard_stop_c', 'Discharge hard stop °C (hottest probe, soft ramp)'),
+                                     ('emergency_temp_c', 'Emergency temp °C (hard, hottest probe)')],
         'cell_imbalance_monitor': [('warn_delta_v', 'Warn spread (V, worst-high minus worst-low)')],
         'overcurrent_monitor': [('continuous_discharge_warn_a', 'Discharge warn (A)'),
                                  ('continuous_charge_warn_a', 'Charge/regen warn (A)'),
                                  ('persistence_s', 'Persistence before warning (s)')],
         'staleness_watchdog': [('soft_cut_s', 'Soft cut after (s)'), ('hard_escalation_s', 'Hard cut escalation (+s)')],
         'cell_data_cross_check': [('max_delta_v', 'Max delta vs 0x020 pack summary (V)'),
+                                   ('soft_cut_s', 'Soft cut after (s)'), ('hard_escalation_s', 'Hard cut escalation (+s)')],
+        'temp_data_cross_check': [('max_delta_c', 'Max delta vs 0x4A7 pack extremes (°C)'),
                                    ('soft_cut_s', 'Soft cut after (s)'), ('hard_escalation_s', 'Hard cut escalation (+s)')],
         # Both below: no threshold fields, just an enable checkbox - added
         # 2026-08-03 (docs/13 items 15.14/15.15, user directive: "we should
@@ -816,6 +1001,7 @@ class ManagementPanel(ttk.Frame):
         'overcurrent_monitor': 'Overcurrent monitor (warn only, no cutoff action)',
         'staleness_watchdog': 'Staleness watchdog (soft -> hard escalation)',
         'cell_data_cross_check': 'Cell data cross-check, per-cell vs 0x020 pack summary (soft -> hard escalation)',
+        'temp_data_cross_check': 'Temp data cross-check, 0x4A7 extremes vs 0x4AA per-probe (soft -> hard escalation)',
         'input_validation': 'Input plausibility validation (rejects implausible decoded values)',
         'checksum_validation': 'Toyota checksum validation (rejects corrupt frames)',
     }
@@ -957,12 +1143,21 @@ class ChargeEmulationPanel(ttk.Frame):
         self.engine = engine
         cfg = state_model.charge_emulation
 
-        head = ttk.Frame(self)
+        # Scrollable (added 2026-08-08, user report: "charge emulation needs
+        # a scroll" - the new DC fast-charge/QC section below pushed this
+        # tab's content past the visible tab area with no way to reach it).
+        # Same VScrollFrame pattern ManagementPanel already uses - put every
+        # child in self.scroll.inner, not self, from here on.
+        self.scroll = VScrollFrame(self)
+        self.scroll.pack(fill='both', expand=True)
+        inner = self.scroll.inner
+
+        head = ttk.Frame(inner)
         head.pack(fill='x', padx=4, pady=(4, 0))
         ttk.Label(head, text='Charge Emulation', style='Accent.TLabel').pack(side='left')
         help_btn(head, 'Charge Emulation', CHARGE_EMULATION_HELP).pack(side='left', padx=(6, 0))
 
-        box = ttk.Frame(self, relief='groove', borderwidth=1)
+        box = ttk.Frame(inner, relief='groove', borderwidth=1)
         box.pack(fill='x', pady=6, padx=6)
 
         enabled_var = tk.BooleanVar(value=cfg.get('charge_emulate', False))
@@ -980,16 +1175,40 @@ class ChargeEmulationPanel(ttk.Frame):
         ttk.Label(row1, text='Charger ramp target (kW)', width=32, anchor='w').pack(side='left')
         target_var = tk.StringVar(value=str(cfg.get('charge_target_kw', 0.0)))
         ttk.Entry(row1, textvariable=target_var, width=12).pack(side='left')
+        _tgt_flag = ttk.Label(row1, text='', foreground=ERR, width=9)
+        _tgt_flag.pack(side='left', padx=(4, 0))
         _tgt_lo, _tgt_hi = leaf_signals.CHARGE_EMULATION_BOUNDS['charge_target_kw']
-        target_var.trace_add('write', lambda *_a: self._set_float(cfg, 'charge_target_kw', target_var, _tgt_lo, _tgt_hi))
+        target_var.trace_add('write', lambda *_a: self._set_float(
+            cfg, 'charge_target_kw', target_var, _tgt_lo, _tgt_hi, _tgt_flag))
 
         row2 = ttk.Frame(grid)
         row2.pack(fill='x', pady=1)
         ttk.Label(row2, text='Uprate level / ramp rate (0-7)', width=32, anchor='w').pack(side='left')
         level_var = tk.StringVar(value=str(cfg.get('chg_uprate_level', 0)))
         ttk.Entry(row2, textvariable=level_var, width=12).pack(side='left')
+        _lvl_flag = ttk.Label(row2, text='', foreground=ERR, width=9)
+        _lvl_flag.pack(side='left', padx=(4, 0))
         _lvl_lo, _lvl_hi = leaf_signals.CHARGE_EMULATION_BOUNDS['chg_uprate_level']
-        level_var.trace_add('write', lambda *_a: self._set_int(cfg, 'chg_uprate_level', level_var, _lvl_lo, _lvl_hi))
+        level_var.trace_add('write', lambda *_a: self._set_int(
+            cfg, 'chg_uprate_level', level_var, _lvl_lo, _lvl_hi, _lvl_flag))
+
+        # AC charge power request bounds (added 2026-08-06, user directive:
+        # "the maximum AC charging is only 6.6 kilowatt for the leaf...
+        # make this configurable, min and max kW request for AC") - clamps
+        # both the ramp target above AND the AC taper's minimum-power floor
+        # (management_engine.py's ac_charge_taper) into this range.
+        for key, label in (('ac_min_kw', 'AC charge minimum power request (kW)'),
+                            ('ac_max_kw', 'AC charge maximum power request (kW)')):
+            row = ttk.Frame(grid)
+            row.pack(fill='x', pady=1)
+            ttk.Label(row, text=label, width=32, anchor='w').pack(side='left')
+            var = tk.StringVar(value=str(cfg.get(key, 0.0)))
+            ttk.Entry(row, textvariable=var, width=12).pack(side='left')
+            flag_lbl = ttk.Label(row, text='', foreground=ERR, width=9)
+            flag_lbl.pack(side='left', padx=(4, 0))
+            lo, hi = leaf_signals.CHARGE_EMULATION_BOUNDS[key]
+            var.trace_add('write', lambda *_a, k=key, v=var, lo=lo, hi=hi, fl=flag_lbl:
+                           self._set_float(cfg, k, v, lo, hi, fl))
 
         self.status_label = ttk.Label(box, text='status: --', foreground=FG_DIM)
         self.status_label.pack(anchor='w', padx=6, pady=(0, 6))
@@ -999,8 +1218,8 @@ class ChargeEmulationPanel(ttk.Frame):
         # "anything charger related should be there... regen and AC charging
         # is not the same"). Independently-tunable curve from the regen
         # taper still on the Battery Management tab (charge_limit_kw).
-        ttk.Separator(self, orient='horizontal').pack(fill='x', padx=6, pady=(4, 4))
-        ac_box = ttk.Frame(self, relief='groove', borderwidth=1)
+        ttk.Separator(inner, orient='horizontal').pack(fill='x', padx=6, pady=(4, 4))
+        ac_box = ttk.Frame(inner, relief='groove', borderwidth=1)
         ac_box.pack(fill='x', pady=(0, 6), padx=6)
 
         ac_top = ttk.Frame(ac_box)
@@ -1024,9 +1243,20 @@ class ChargeEmulationPanel(ttk.Frame):
         # docs/13 items 13.3/13.9) instead of hardcoded here, so this panel
         # and the profile-loading clamp in config_profile.py can never
         # silently diverge on what's an acceptable value for these fields.
+        # ac_zero_v renamed to ac_min_v, ac_cutoff_v added (2026-08-06) - see
+        # leaf_signals.py's CHARGE_SLIDERS comment for the full rationale
+        # (the taper now holds at a configurable minimum kW instead of
+        # driving to true zero, ac_cutoff_v is the new deliberate
+        # stop-charging voltage). The taper's convergence rate is no longer
+        # a GUI-configurable field at all - it dynamically self-selects one
+        # of the existing 0-7 uprate levels based on how close it is to the
+        # target (management_engine.py's _select_ac_uprate_level()),
+        # visible in this feature's own live status text below and in the
+        # real transmitted 0x1DC uprate bits, not a separate slider here.
         for key, label in (
                 ('ac_full_v', 'Full power below (V/cell)'),
-                ('ac_zero_v', 'Zero power at/above (V/cell)'),
+                ('ac_min_v', 'Minimum power at/above (V/cell) - holds, does not stop charging'),
+                ('ac_cutoff_v', 'Stop-charging cutoff V (per-cell, ends session)'),
                 ('ac_emergency_v', 'Emergency high V (hard, per-cell)'),
                 ('daily_target_pct', 'Daily target % (SoC stop point)'),
                 ('extended_target_pct', 'Extended target % (SoC stop point)')):
@@ -1035,8 +1265,11 @@ class ChargeEmulationPanel(ttk.Frame):
             ttk.Label(row, text=label, width=32, anchor='w').pack(side='left')
             var = tk.StringVar(value=str(cfg.get(key, 0.0)))
             ttk.Entry(row, textvariable=var, width=12).pack(side='left')
+            flag_lbl = ttk.Label(row, text='', foreground=ERR, width=9)
+            flag_lbl.pack(side='left', padx=(4, 0))
             lo, hi = leaf_signals.CHARGE_EMULATION_BOUNDS[key]
-            var.trace_add('write', lambda *_a, k=key, v=var, lo=lo, hi=hi: self._set_float(cfg, k, v, lo, hi))
+            var.trace_add('write', lambda *_a, k=key, v=var, lo=lo, hi=hi, fl=flag_lbl:
+                           self._set_float(cfg, k, v, lo, hi, fl))
 
         ext_var = tk.BooleanVar(value=cfg.get('extended_mode', False))
 
@@ -1054,8 +1287,8 @@ class ChargeEmulationPanel(ttk.Frame):
         # is the same general watchdog driving gets, on the Battery
         # Management tab, not a second timer here). Lives in the main
         # charge box, not the AC sub-box, since it gates the ramp generally.
-        ttk.Separator(self, orient='horizontal').pack(fill='x', padx=6, pady=(4, 4))
-        data_box = ttk.Frame(self, relief='groove', borderwidth=1)
+        ttk.Separator(inner, orient='horizontal').pack(fill='x', padx=6, pady=(4, 4))
+        data_box = ttk.Frame(inner, relief='groove', borderwidth=1)
         data_box.pack(fill='x', pady=(0, 6), padx=6)
         req_var = tk.BooleanVar(value=cfg.get('require_live_data_to_charge', True))
 
@@ -1071,21 +1304,85 @@ class ChargeEmulationPanel(ttk.Frame):
                         variable=req_var, command=_on_req_toggle).pack(side='left')
         help_btn(req_top, 'Require live data to charge', REQUIRE_LIVE_DATA_HELP).pack(side='left', padx=(6, 0))
 
+        # DC fast-charge / QC capacity fields (moved here 2026-08-08 from the
+        # "Future Placeholder" tab, user directive: "move all three [qc_max_
+        # soc_pct + dc_min_kw + dc_max_kw] to the main Charge Emulation tab" -
+        # same theme as the AC fields above, not a separate future-work
+        # concern). dc_min_kw/dc_max_kw are still a PLACEHOLDER - not read by
+        # any active ramp/taper logic (docs/10-open-questions.md #9, DC fast
+        # charging support isn't built yet). qc_max_soc_pct IS live - it
+        # caps mapping_engine.derive_capacity_outputs()'s QC capacity display
+        # fields (0x59E) - PROVISIONAL, no DC fast-charge testing done yet.
+        ttk.Separator(inner, orient='horizontal').pack(fill='x', padx=6, pady=(4, 4))
+        dc_box = ttk.Frame(inner, relief='groove', borderwidth=1)
+        dc_box.pack(fill='x', pady=(0, 6), padx=6)
+        dc_top = ttk.Frame(dc_box)
+        dc_top.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Label(dc_top, text='DC fast-charge / QC capacity', style='Header.TLabel').pack(side='left')
+        help_btn(dc_top, 'DC fast-charge / QC capacity', DC_QC_HELP).pack(side='left', padx=(6, 0))
+        dc_grid = ttk.Frame(dc_box)
+        dc_grid.pack(fill='x', padx=28, pady=(2, 6))
+        for key, label in (
+                ('dc_min_kw', 'DC minimum power request (kW) - PLACEHOLDER, not yet wired to any logic'),
+                ('dc_max_kw', 'DC maximum power request (kW) - PLACEHOLDER, not yet wired to any logic'),
+                ('qc_max_soc_pct', 'QC max SOC % - GIDS/QC capacity ceiling (PROVISIONAL, untested)')):
+            row = ttk.Frame(dc_grid)
+            row.pack(fill='x', pady=1)
+            ttk.Label(row, text=label, width=60, anchor='w').pack(side='left')
+            var = tk.StringVar(value=str(cfg.get(key, 0.0)))
+            ttk.Entry(row, textvariable=var, width=12).pack(side='left')
+            flag_lbl = ttk.Label(row, text='', foreground=ERR, width=9)
+            flag_lbl.pack(side='left', padx=(4, 0))
+            lo, hi = leaf_signals.CHARGE_EMULATION_BOUNDS[key]
+            var.trace_add('write', lambda *_a, k=key, v=var, lo=lo, hi=hi, fl=flag_lbl:
+                           self._set_float(cfg, k, v, lo, hi, fl))
+
         self._schedule_status_refresh()
 
     @staticmethod
-    def _set_float(cfg, key, var, lo, hi):
+    def _set_float(cfg, key, var, lo, hi, flag_lbl=None):
+        """Visual invalid/clamped feedback (added 2026-08-06, user report:
+        "check that we can't enter a non valid value in the charger inputs
+        - I was able to enter nothing and also outside safe limits" with no
+        feedback either way) - ports ManagementPanel._set_float's exact
+        pattern into this panel instead of the previous silent
+        swallow-on-ValueError / silent-clamp-with-no-indication behavior.
+        `flag_lbl` optional so any caller not yet updated keeps working."""
         try:
-            cfg[key] = max(lo, min(hi, float(var.get())))
+            raw = float(var.get())
         except ValueError:
-            pass
+            if flag_lbl is not None:
+                flag_lbl.configure(text='invalid')
+            return
+        value = raw
+        clamped = False
+        if value < lo:
+            value, clamped = lo, True
+        elif value > hi:
+            value, clamped = hi, True
+        cfg[key] = value
+        if flag_lbl is not None:
+            flag_lbl.configure(text='clamped' if clamped else '')
 
     @staticmethod
-    def _set_int(cfg, key, var, lo, hi):
+    def _set_int(cfg, key, var, lo, hi, flag_lbl=None):
+        """See _set_float's docstring - same invalid/clamped feedback,
+        int-typed fields (chg_uprate_level)."""
         try:
-            cfg[key] = max(lo, min(hi, int(float(var.get()))))
+            raw = int(float(var.get()))
         except ValueError:
-            pass
+            if flag_lbl is not None:
+                flag_lbl.configure(text='invalid')
+            return
+        value = raw
+        clamped = False
+        if value < lo:
+            value, clamped = lo, True
+        elif value > hi:
+            value, clamped = hi, True
+        cfg[key] = value
+        if flag_lbl is not None:
+            flag_lbl.configure(text='clamped' if clamped else '')
 
     def _schedule_status_refresh(self):
         if not self.winfo_exists():
@@ -1113,9 +1410,16 @@ class ChargeEmulationPanel(ttk.Frame):
 class FuturePlaceholderPanel(ttk.Frame):
     """Disabled placeholder for future Leaf-to-battery PID/DID requests
     (VCM querying the battery) - built per docs/08, explicitly NOT
-    implemented in this milestone."""
+    implemented in this milestone.
 
-    def __init__(self, master):
+    Previously also hosted the DC fast-charge min/max kW request bounds -
+    MOVED to ChargeEmulationPanel 2026-08-08 (user directive: "move all
+    three [qc_max_soc_pct + dc_min_kw + dc_max_kw] to the main Charge
+    Emulation tab") - same theme as the AC fields there, not a future-work
+    concern. `state_model` param kept (unused) for call-site compatibility
+    with gui/app.py."""
+
+    def __init__(self, master, state_model=None):
         super().__init__(master)
         ttk.Label(self, text='Leaf -> Battery requests (future work)',
                   style='Header.TLabel', foreground='#6a6a70').pack(anchor='w', padx=8, pady=(8, 2))

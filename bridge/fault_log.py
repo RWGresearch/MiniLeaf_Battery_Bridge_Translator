@@ -52,6 +52,8 @@ FAULT_DEFINITIONS = [
     ('checksum_reject', 'Toyota checksum validation rejected a corrupt frame', 'warn'),
     ('cell_data_mismatch', 'Cell data cross-check mismatch (per-cell vs 0x020 pack summary)', 'soft'),
     ('cell_data_mismatch_hard', 'Cell data cross-check mismatch - hard cut escalation', 'hard'),
+    ('temp_data_mismatch', 'Temperature data cross-check mismatch (0x4A7 extremes vs 0x4AA per-probe)', 'soft'),
+    ('temp_data_mismatch_hard', 'Temperature data cross-check mismatch - hard cut escalation', 'hard'),
     ('config_sanity', 'Battery-management config has an inverted/nonsensical threshold ordering', 'warn'),
     ('hard_cut_latch', 'Hard cut LATCHED (relay_cut_request/interlock still asserted)', 'hard'),
 ]

@@ -142,6 +142,24 @@ stale for 65+ seconds, wind down via `relay_cut_request` regardless of what the 
 triggers are doing. This is specific to the bridge context (the original Leaf emulator never had
 an upstream "battery" data source that could itself go stale).
 
+### Sixth trigger (bridge-specific, defensive)
+
+Added 2026-08-06, after a real bench test (`logs/minileaf_20260805_200831_Charging to xx% the
+restart.trc`) showed the bridge transmitting continuously for 100+ seconds with no wind-down, in a
+case that couldn't be fully root-caused from the captured traffic alone (see `docs/10-open-
+questions.md`). **Not** a ported/confirmed real-Leaf behavior like triggers 1-4 above, and not
+positioned as a fix for that specific unexplained case — it's a defensive fallback for the general
+structural gap: a bench rig with no ignition wiring can only ever wind down via triggers 2/3/4
+(all charge-session-based); if a real run ever lands in a state where none of those resolve, for
+any reason, there was previously no way out short of Stop Bridge.
+
+**Bus silence timeout** — if the Leaf bus goes completely silent (no frame of any ID, not just
+ignition/charge IDs) for `leaf_signals.BUS_SILENCE_TIMEOUT_S` (30.0s, deliberately well above every
+other trigger's own timeout so it never preempts a legitimate slower condition) while in `startup`
+or `running`, wind down. Implemented in `ShutdownSequencer._should_wind_down()`, reusing the
+already-tracked `last_leaf_rx_t` field (no new state). **Documented, not yet confirmed** against a
+re-test — see `docs/11-manual-verification-checklist.md`.
+
 ### Bridge/mirror auto-stop
 
 Not directly applicable in the same form as the original Leaf project (which bridged a real Leaf

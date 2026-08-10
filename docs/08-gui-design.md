@@ -109,7 +109,11 @@ project's own analyzer app already supports. See `docs/02-source-signals-rz450e.
 - **Live data monitor**: grouped by CAN message (`0x020`, `0x023`, `0x4A9`/`0x4C0` cell voltages,
   `0x4AA` temps, DID/PID values with their own slow-poll cadence indicator), latest decoded value
   per signal, with signal age shown — same informative-text-block pattern as the Leaf app's
-  `DashWindow`.
+  `DashWindow`. **Alignment reworked 2026-08-06** — see "`LiveMonitorPanel` alignment: three
+  attempts" under the Dashboard section below; this panel (`gui/panels.py`'s
+  `write_input_monitor()`) and the Leaf-side "Live TX monitor" below share the same
+  `write_field()`/`configure_field_tags()` helpers (`gui/theme.py`) the Dashboard's own live-data
+  panel settled on.
 
 ## Middle panel — mapping & management (the configurator)
 
@@ -219,14 +223,31 @@ been — it hadn't yet at the time. One block, same visual pattern as a `Managem
   Toggling it logs an ENABLED/DISABLED line, same as every other Charge Emulation control.
 - **New 2026-08-01 — "AC charger overvoltage taper" section**, split out of Battery Management's
   `charge_target_taper` (user directive: AC charging and regen are physically different enough to
-  need independently-tunable curves). Own enable checkbox (`ac_taper_enabled`, default on), its own
-  full-power/zero-power/emergency-high per-cell voltage fields (`ac_full_v`/`ac_zero_v`/
-  `ac_emergency_v`, same taper shape as the regen feature but drives `charger_limit_kw` instead of
-  `charge_limit_kw`), and its own live status label. Also moved here: "Daily target %"/"Extended
-  target %" (the AC SoC stop point) and the "Extended mode active" checkbox — both only ever
-  mattered while actually plugged in and charging (gated on `charge_permission_input`), so they
+  need independently-tunable curves). Own enable checkbox (`ac_taper_enabled`, default on), a
+  four-tier per-cell voltage structure — full power (`ac_full_v`) → minimum power, holds
+  (`ac_min_v`, renamed from `ac_zero_v` 2026-08-06) → deliberate stop-charging cutoff (`ac_cutoff_v`,
+  new 2026-08-06) → emergency hard cut (`ac_emergency_v`, unchanged) — and its own live status label.
+  Convergence between tiers is gentle, not instant (reworked 2026-08-06, twice the same day - a
+  fixed-time-constant hysteresis field was tried first and removed hours later once real-log analysis
+  showed a repeating hunt, not just a rough jump): the taper dynamically self-selects one of the
+  existing 0-7 uprate levels based on remaining distance to target, so there's **no separate GUI
+  field for this at all** - it's visible in the live status text instead (e.g. `target=X.XXkW,
+  applied=X.XXkW (level N)`), and while actively converging it's also what's transmitted in 0x1DC's
+  own uprate bits (see `06-realtime-engine-and-watchdog.md`). Also moved here: "Daily target %"/
+  "Extended target %" (the AC SoC stop point) and the "Extended mode active" checkbox — both only
+  ever mattered while actually plugged in and charging (gated on `charge_permission_input`), so they
   belong with the rest of the charger-specific controls rather than on the always-active Battery
   Management tab.
+- **New 2026-08-06 — AC/DC power request bounds.** `ac_min_kw`/`ac_max_kw` (default 0.5/6.6kW, the
+  6.6kW ceiling matching the Leaf's real onboard AC charger max) sit in the main charge box near the
+  ramp target — they clamp both the manual "Charger ramp target (kW)" field and the AC taper's own
+  `ac_min_v`-floor value. `dc_min_kw`/`dc_max_kw` are a **placeholder only** (no active DC
+  fast-charge logic exists yet — `docs/10-open-questions.md` #9), surfaced on the Future placeholder
+  tab below instead of here, so they aren't mistaken for something currently wired to anything.
+- **New 2026-08-06 — invalid/clamped input feedback.** Every numeric field on this tab now shows a
+  small "invalid" (empty/non-numeric entry, value unchanged) or "clamped" (out-of-bounds entry,
+  value clamped) flag next to it, same pattern `ManagementPanel`'s Battery Management fields already
+  had — previously this tab silently swallowed both cases with no visual indication.
 
 See the Dashboard section below for the *other* place this feature's live state is surfaced — a
 dedicated right-column section, since the two triggers driving it (the Leaf's own `0x1F2` request
@@ -263,7 +284,8 @@ traffic` / `running` / `winding down` / `stopped`) and a "?" explaining the beha
 - **Vehicle/battery generation selector**: AZE0/ZE1 car generation × battery generation/capacity
   (30/40/62kWh), mirroring `Core.set_vehicle()` from the Leaf project.
 - **Live TX monitor**: grouped by CAN message, showing what's actually being transmitted right now
-  (post-mapping, post-management-layer).
+  (post-mapping, post-management-layer). Same 2026-08-06 alignment rework as the left panel's Live
+  data monitor — see the Dashboard section below.
 
 ## Log panel (bottom, full width)
 
@@ -277,6 +299,33 @@ see *why* the bridge is behaving a certain way without digging through the live-
 **Briefly narrowed, then reverted (2026-07-31, same day)**: Fault History initially lived beside the
 Log in a horizontal `tk.PanedWindow` here, but the user asked for it to move into the Dashboard
 window instead (see below) — the Log panel is back to its original full-width layout.
+
+**Start Log / Stop Log button row, above the Log text box (added 2026-08-01)** — captures every
+RX/TX CAN frame on both buses into a PCAN-Explorer-compatible `.trc` file (`bridge/trc_log.py`,
+`TrcLogger`), independent of whether the Log *text* panel above is showing anything relevant; this
+is the bulk data-confirmation mechanism `docs/15-real-hardware-test-checklist.md` Part A is built
+around. Pressing the button opens a save dialog (defaults into `logs/`, filename
+`minileaf_<timestamp>.trc`); pressing it again (now labeled "Stop Log") closes the file.
+
+**`<name>_log_output.txt` companion file, added 2026-08-08 (`gui/app.py`'s `_start_log_output`/
+`_stop_log_output`, `main.py` Rev 63)** — opened alongside the `.trc` file the moment Start Log is
+pressed, named identically except for a `_log_output` tag before the `.txt` extension (e.g.
+`minileaf_20260808_143000.trc` → `minileaf_20260808_143000_log_output.txt`), and closed when Stop
+Log is pressed (or the app closes while still logging). **The `.trc` file's own format/content is
+never touched by this** — this is a separate, plain-text file. It contains two things: (1) a
+one-time full settings snapshot at the moment logging starts — vehicle spec, every mapping tie,
+every management-feature threshold, generated-signal flags, charge-emulation config — the exact
+same shape as a saved profile (`config_profile.build_profile_dict()`, factored out of
+`save_profile()` for this purpose), and (2) from that point on, a live mirror of every line that
+appears in the Log text panel above, timestamped the same way, appended as it happens. **This means
+any future request to "look at a log" from a real-hardware test session should check BOTH files
+together**: the `.trc` for the actual CAN traffic, and this file for what the app's settings were
+and what it logged (connection events, sequencer phase transitions, cut/warning assertions,
+on-the-fly setting-toggle changes — anything that already went through `self.log()`) during that
+same session — the two are correlated by timestamp and by having been started/stopped together.
+Slider-style numeric edits (as opposed to enable/disable toggles) don't currently produce their own
+log line, so they won't appear in the companion file unless something else also logs around the
+same time — a known, accepted gap per user directive, not an oversight.
 
 ## Dashboard window (separate, large, resizable)
 
@@ -371,12 +420,15 @@ maximizing")**:
 **Two-column layout, added 2026-07-31 (second review pass)** — the window is split left/right by a
 `ttk.Separator`:
 - **Left** (scrollable, fills remaining width): the main per-signal bar-gauge list, grouped by CAN
-  message.
-- **Right** (fixed-width): Flags (soft/hard cut, permissions, as ON/OFF rows), Generated Signals
-  (send/off status), **Charge emulation (ramp)** (added 2026-07-31, see below), and Battery
-  Management status — moved here from the *bottom of the same long scrolling list* per user
-  feedback, so they're visible at a glance without scrolling past 20+ signal rows, and clearly set
-  apart from the main data by the divider.
+  message, plus (added 2026-08-06) the three cell-voltage/temp-probe bar charts at the bottom — see
+  "Per-cell / per-probe / pack-extreme bar charts" below.
+- **Right** (fixed-width): Flags (soft/hard cut, permissions), Generated Signals (send/off status),
+  **Charge emulation (ramp)** (added 2026-07-31, see below), and Battery Management status — moved
+  here from the *bottom of the same long scrolling list* per user feedback, so they're visible at a
+  glance without scrolling past 20+ signal rows, and clearly set apart from the main data by the
+  divider. **Rebuilt as a single scrolling live-text block 2026-08-06** — was a grid of individually-
+  updated `ttk.Label` widgets (Flags as ON/OFF rows, etc.); see "`LiveMonitorPanel` alignment: three
+  attempts" below for what replaced it and why.
 
 **"Charge emulation (ramp)" section, added 2026-07-31** — user follow-up after the charger-request
 ramp feature shipped ("we need some data on charging and ramp setting etc on the dashboard"). Shows,
@@ -394,6 +446,102 @@ live:
   "STOPPED - Leaf wants to charge but RZ450e permission not granted (full_charge_flag set)" /
   "ramping/active - both triggers present" — the same four states `ChargeEmulationPanel`'s own
   status line reports, so either window tells a consistent story.
+
+### Right column: no-scroll bug, then `LiveMonitorPanel` alignment (three attempts, 2026-08-06)
+
+The right column's original per-`ttk.Label`-widget grid (Flags/Generated Signals/Charge
+emulation/Battery Management status, described above) had **no scrollbar at all** — user report:
+"there is no scrowl so i cant see whats on the botom" (the Battery Management status block grows
+with however many features are active, and could run past the bottom of the fixed-height window).
+That single bug turned into a small redesign arc, in order:
+
+1. **Own `VScrollFrame` (first fix)** — wrapped the right column in the same `VScrollFrame`
+   (`gui/theme.py`) the left list already used, independent mouse-wheel scroll. This genuinely fixed
+   the "can't reach the bottom" bug, but the user then asked to go further: "the data in the main
+   screen for live data works well... lets use that for the data in the right side of the
+   dashboard... i like the way that works. its cleener."
+2. **Reused `LiveMonitorPanel`, then a custom two-line layout** — first pass literally reused
+   `gui/panels.py`'s `LiveMonitorPanel` (the same auto-refreshing `tk.Text` box behind "Live decoded
+   values"/"Live transmitted values"), which also fixed the scroll bug for free (a plain `tk.Text`
+   scrolls natively). But `LiveMonitorPanel`'s usual `label:value` **space-padded single line**
+   doesn't actually align in a proportional font (`BASE_FONT` = Segoe UI) — user: "the data is not
+   as clean... can we get the data alighned... if we need to use 2 lines to get the dat ato be up
+   agnest the right side of the frame." Rebuilt as two lines per field (label, then value
+   right-justified via a Text tag) to satisfy that literally.
+3. **Single line again, but via a real Tk tab stop (settled design)** — once the box was on a
+   genuinely monospace font, the user preferred one line per field again ("lets put all those items
+   on the same line. only a few of them need a roll over to a new line"), but a follow-up caught
+   that character-count padding still didn't hold up ("the data boxes look close... its still
+   wraping incorectly"): the padding assumed a specific box width in *characters*, and a real box
+   narrower or wider than that guess broke alignment either way. **Final fix**: `gui/theme.py` grew
+   `MONO_FONT = ('Consolas', 8)` (used only by these label:value boxes, not general prose) plus three
+   shared helpers used by both this panel and the main window's `LiveMonitorPanel` —
+   `configure_field_tags(box)` (binds `<Configure>` to keep a right-aligned **Tk tab stop** matched
+   to the box's own live `winfo_width()`), `write_section(box, title)`, and `write_field(box, label,
+   value)` (writes `f'{label}\t{value}\n'` — the tab jumps to that stop, so the value lands flush
+   against the box's actual right edge regardless of label length or font metrics; a line only wraps
+   when the label itself is genuinely too long for the real box width, never as a guessed-width
+   artifact). Confirmed directly: of the right column's 24 fields, exactly the 5 genuinely long ones
+   wrap to a second display row (via `dlineinfo()`), the rest sit flush on one line.
+
+`DashboardWindow._write_right_column()` (`gui/dashboard.py`) also preserves the box's scroll
+position across each ~300ms rewrite by anchoring to `box.index('@0,0')` (the exact character under
+the top-left corner) and restoring via `box.yview(that_index)` — **not** `yview_moveto(fraction)`,
+which was found to drift the visible position slowly back toward the top over time (user report:
+"the live text slowely scrowl back to the top on its own"). Root cause: a wrapped, variable-length
+box's total *display*-line count shifts tick to tick even though the *logical* field count never
+does, and repeatedly round-tripping through a lossy fraction accumulates drift; an isolated
+before/after test showed the old approach drifting 12 lines over 39 refresh cycles while the
+index-based fix held at zero.
+
+### Per-cell / per-probe / pack-extreme bar charts (added 2026-08-06)
+
+Three vertical-bar `_MultiVBar` charts (`gui/dashboard.py`) at the bottom of the main per-signal
+list on the **left** — user: "i want all 96 cells to be shown on a bar type graph right below the
+live data on the dashboard... i also want all 16 temp probes on a different spot next to that,"
+corrected the same day to "the temp bar's are supose to be in the left under the history data" then
+"cell voltages are also supose to be on the left. side by side" (both charts started in the narrow
+right column, which only gave each bar a few px of width; the left list's full width, split three
+ways, gives each chart meaningfully more room). Side by side, left to right:
+
+1. **Cell voltages (96)** — `rz450e_signals.cell_voltage_keys()`.
+2. **Temp probes (16)** — `rz450e_signals.temp_probe_keys()`.
+3. **Pack temp extremes (2)** — `temp_max`/`temp_min` (Max/Min pack temperature, `0x4A7`), added in
+   the same follow-up ("lets add a third data graph that shows the other temps we arr reciving from
+   the battery in the same wrow") — distinct from the 16 individual `0x4AA` probe readings chart 2
+   shows.
+
+**Scaling went through three iterations before settling**, same "how much headroom is really
+there" question that came up in the right-column rework:
+1. *Pure live min/max* — the tallest/shortest bar always touched the chart's top/bottom edge no
+   matter how tight the real spread was, giving no sense of headroom ("the min max cant be the full
+   scale, we need more below and above").
+2. *Hard fixed range* (2.5–4.3V cells, 0–160F temps, the user's own numbers at the time) — gave up
+   any live-tracking of the pack's actual operating window entirely.
+3. **Settled design: user-adjustable auto-pad, expand-only, grid-snapped.** Each chart's title has a
+   readonly `ttk.Combobox` (`no_wheel()`-protected — see below) picking either a fixed margin added
+   below/above the live min/max, or "Full scale" (a hard range reusing `rz450e_signals`' own
+   documented per-cell/per-probe registry ranges, 2.5–5.0V / -40–160F, rather than inventing new
+   numbers). Cell voltage options: ±0.01V–±1V (default **±0.05V**); temp options (shared by both temp
+   charts — the user referred to "the temperature" as one category, not two independent controls):
+   ±0.1F–±5F (default ±1F). The **displayed** range only ever *expands*, never shrinks, once real
+   data is flowing, and — after a first cut still visibly wobbled under ordinary CAN-noise-level
+   jitter, caught by a smoke test feeding ±0.2mV noise — each expansion snaps out to the next
+   grid line (a quarter of the selected pad, tightened from a full pad-step per "add slight less
+   buffer to the top and bottom") rather than the exact amount needed, so small readings within that
+   slack don't retrigger another expansion. Resets to unset the next time a chart has no live data
+   at all (a disconnect) or the dropdown selection changes. A value outside the current displayed
+   range still draws — clamped to the full bar — but in `ERR` red, same convention as `_BarGauge`'s
+   existing out-of-range coloring elsewhere in this window. The min/max/spread readout label above
+   each chart is always the **real** live numbers, independent of whatever display range is
+   currently selected — that label, not the bar heights, is the one to read for anything
+   safety-related (same "bar ranges are display estimates only" caveat as `docs/10`).
+
+Sizing: 100px tall (shortened from an initial 150px), each chart's own `ttk.Combobox` bound with
+`no_wheel()` (moved 2026-08-06 from a `gui/panels.py`-private `_no_wheel()` to a shared
+`gui/theme.py:no_wheel()`, since these Comboboxes — like several others already in this app — sit
+inside a `VScrollFrame` and would otherwise have their selection silently changed by a page-scroll
+mouse-wheel event instead of scrolling).
 
 This keeps the whole picture (inputs, conversions, outputs, generated signals, and management
 status) visible in one large window without needing horizontal scrolling. A **"Fault History"**

@@ -13,11 +13,19 @@
    be cleared by simply toggling the bridge's own Stop/Start button with the car never actually
    losing power). See `05-battery-management-safety.md`'s "`full_charge_flag` re-arm" section for
    full current behavior.
-2. **Exact staleness-watchdog behavior when only some source groups go stale.** The watchdog
-   (`06-realtime-engine-and-watchdog.md`) is specified per source-group (fast raw-CAN vs. DID/PID),
-   but the interaction when, say, only the DID/PID group goes stale while raw-CAN stays fresh
-   hasn't been fully specified — likely fine (raw-CAN covers voltage/current/temp, the safety-
-   critical fast-response quantities) but worth confirming once implemented.
+2. **RESOLVED 2026-08-01 — Exact staleness-watchdog behavior when only some source groups go
+   stale.** This question's own premise turned out to be wrong once checked against the
+   implementation (`docs/13` Part 10, item #2): the watchdog does not track a per-source-group
+   "worst group" at all. Per `06-realtime-engine-and-watchdog.md` section 3 (docs/13 item 1.1), it
+   tracks freshness of **every registered input signal individually** — all 96 per-cell voltages,
+   all 16 temp probes, every fast/slow scalar, plus the keep-alive counters — and takes the single
+   worst age across all of them (`ManagementEngine.apply()`'s `staleness_watchdog` block,
+   `rz_state.ages_of(rz450e_signals.INPUT_SIGNAL_KEYS)`). So there is no "only the DID/PID group
+   goes stale while raw-CAN stays fresh" case to specify a special interaction for — any single
+   signal going stale, regardless of which group it belongs to, drives `worst_age` past the same
+   60s soft-cut/65s hard-cut schedule described in that section. This is a *stricter* answer than
+   the original question assumed ("raw-CAN covers the safety-critical quantities" is no longer the
+   reasoning — every signal is now watched, not just that subset).
 3. **GIDS threshold interaction.** The Leaf project found real thresholds (GIDS≈49 = low-battery
    warning, GIDS≈5 = turtle mode) baked into the VCM itself. This project's derived GIDS formula
    (`04-signal-mapping.md`) needs to be checked against these once real numbers are flowing, to
@@ -28,6 +36,13 @@
    state before its own protection features would have acted. Since both are now voltage-driven
    rather than SoC-driven, this is really a question of whether the *voltage* defaults
    (3.00V/2.60V) map to a GIDS range comfortably above 49/5, not a SoC-floor question anymore.
+   **Still open as of the 2026-08-08 GIDS formula fix** (`04-signal-mapping.md` - usable-capacity-
+   based, not gross-capacity-based): re-checked with the new formula (back-of-envelope,
+   `usable_capacity_kwh`=64.0, 94% SOH → 752 GIDs at 100% SOC, linear in SoC%) - GIDS≈49 now falls
+   at ~6.5% SoC, GIDS≈5 at ~0.66% SoC, both close to where the OLD formula already put them
+   (~6.0%/~0.6%), so the fix doesn't meaningfully change the picture. This is still an SoC%-based
+   sanity check, not the voltage-based one this item actually wants - remains open until real GIDS
+   values are flowing and can be cross-checked against actual per-cell voltage at that point.
 4. **RESOLVED 2026-08-01 — Whether the `charge_permission_input` interlock (`0x358`) needs a "no
    interlock present" default behavior.** This question is specifically about ONE signal
    (`charge_permission_input`) being physically absent/unwired entirely (e.g. an earlier hardware
@@ -49,16 +64,15 @@
    promoted to an explicit project policy rather than an incidental side effect: **a missing/unwired
    `charge_permission_input` signal must always be treated as "charging not authorized," by design,
    not by accident.**
-5. **Single combined RZ450e adapter — needs hardware confirmation, not just a software assumption.**
-   Collapsing bus1/bus2 onto one PCAN connection (per the user's 2026-07-31 correction) assumes
-   both logical buses are visible on the same physical CAN wire pair from the adapter's vantage
-   point. If the battery's two internal buses are actually electrically isolated networks (not
-   just an address-space split on a shared line), one adapter genuinely can't see both and this
-   would need to revert to two connections. Confirm against the real bench pack before relying on
-   this for anything beyond the current software's assumption.
+5. **RESOLVED 2026-08-04 — Single combined RZ450e adapter.** Collapsing bus1/bus2 onto one PCAN
+   connection (per the user's 2026-07-31 correction) assumed both logical buses are visible on the
+   same physical CAN wire pair from the adapter's vantage point — unconfirmed until now because it
+   depended on whether the battery's two internal buses are electrically isolated networks or just
+   an address-space split on a shared line. **User-confirmed on the real bench pack: one CAN
+   channel sees both buses.** No revert to two connections needed.
 6. **Dashboard bar-gauge display ranges are estimates, not confirmed safety limits.** The `range`
    metadata added to `02-source-signals-rz450e.md`'s signal registry (e.g. cell voltage 2.5-5.0V,
-   temp -40..160°F) is only there to scale the dashboard's bar gauges sensibly — it is a separate,
+   temp -40..71°C) is only there to scale the dashboard's bar gauges sensibly — it is a separate,
    looser number from the actual researched/confirmed thresholds in `05-battery-management-
    safety.md`. Don't confuse "the bar looks full" with "this is at a safety-relevant limit" — the
    management panel's status text is the authoritative source for that, not the dashboard bar
@@ -97,14 +111,88 @@
    sized against AC-charger-scale current (~19A), not DC-fast-charge-scale current (~430A). If DC
    fast charging is ever brought into this bridge's scope, every charge-side feature needs
    re-evaluating against that much higher current, not assumed to already cover it.
+   **Not to be confused with the 2026-08-08 QC-capacity-display fix** (`04-signal-mapping.md`,
+   `qc_full_wh`/`qc_remain_wh` now capped at `charge_emulation.qc_max_soc_pct`, default 80%) - that's a
+   passive telemetry/dash-display formula fix, not active DC charging power-delivery logic; this
+   item (active DC fast-charge support) remains completely unaddressed.
 13. **`temp_segment_pct` (0x5BC "Dash temperature segment (%)") has no real-hardware-confirmed
     formula.** Added 2026-08-01 as part of a full audit of every Leaf output signal for whether it
     has a live driver at all (`docs/13-review-checklist-2026-08-01.md`) - this field previously
     sat on its static `DEFAULTS` value forever, with no mapping tie targeting it. Shipped a
     provisional linear tie (`bridge/mapping_engine.py`'s `default_ties()`: `temp_max` scaled over a
-    32-140°F window to 0-100%) so it has *some* live driver, but unlike `soc_correction`/
+    0-60°C window to 0-100%, was 32-140°F before the 2026-08-09 Celsius conversion, same physical
+    window) so it has *some* live driver, but unlike `soc_correction`/
     `capacity_bars_raw` this has not been checked against a real dash display. Needs the same
     real-hardware confirmation pass those two got before being trusted.
+    **Note (2026-08-04): the input signal itself is already effectively "max of the 16 probes,"
+    not a separate question.** `temp_max` comes from `0x4A7`'s pack-level extremes field, and as of
+    docs/13 item 16.2 that value is now live-cross-checked every tick against the actual min/max of
+    all 16 individually-read `0x4AA` probes (`temp_data_cross_check` in `management_engine.py`) - a
+    mismatch soft/hard-cuts. So there's no open "should we derive max from the 16 probes instead"
+    sub-question; that's already effectively what happens, with a safety net if the two disagree.
+    What remains unconfirmed is narrower: whether the 0-60°C -> 0-100% *window/formula* matches
+    what a real Leaf dash actually shows for this field. Tracked as a to-do in
+    `docs/14-validation-test-plan.md`.
+14. **Insulation/isolation-resistance monitoring (HV+/HV- to chassis ground) - researched
+    2026-08-04, docs/13 item 16.4, not currently readable by this project, but plausibly real.**
+    A degrading isolation fault (HV cabling insulation rubbed through, a leaking/ruptured cell) is a
+    standard, often regulatorily-required EV HV-pack safety function (ISO 6469-1, UL 2580) -
+    generic OBD-II DTC **P0AA6** ("HV Isolation Fault") is used across the industry for exactly this,
+    confirmed via web research to apply to both Toyota/Lexus and Nissan EVs specifically, not just a
+    hypothetical. It's plausible the RZ450e pack's own ECU maintains an isolation-fault DTC
+    internally, independent of anything this bridge currently reads. **Concretely why this project
+    can't see it yet, not just "hasn't looked":** every confirmed RZ450e diagnostic signal this
+    project uses (`docs/02`) goes through UDS **ReadDataByIdentifier (service `0x22`)** - DTC-style
+    isolation-fault codes are read via a *different* UDS service, **ReadDTCInformation (`0x19`)**,
+    which neither this project nor `Refrance/RZ450e_battery_can_decode_Project` has ever attempted
+    against the RZ450e (checked: not in that project's confirmed signal lists either). **Concrete next
+    step if pursued**: attempt a UDS `0x19` request against the same confirmed diagnostic addressing
+    already used for service `0x22` (`0x747` tester → `0x74F` BMS response, `docs/02`) and see whether
+    it returns a DTC list at all - not yet attempted by either project, so genuinely unknown whether
+    this pack even responds to that service. Out of scope for milestone 1 until that capture happens;
+    this is a real, well-defined next step, not a vague "look into it someday."
+15. **Contactor/relay commanded-vs-actual-state (weld) detection - researched 2026-08-04, docs/13
+    item 16.4, architecturally out of scope, not a TODO.** This bridge asserts
+    `relay_cut_request`/`interlock` as open-loop *requests* to the Leaf's own VCM; it has no way to
+    confirm the real contactors actually opened. Research confirms why this can't be fixed by reading
+    more RZ450e signals: weld detection is fundamentally a **VCM/inverter-side electromechanical
+    check** (did a commanded contactor-open actually produce a real disconnect, verified via the
+    vehicle's own contactor-drive/F/S-relay feedback lines) - it has no representation on either CAN
+    bus this project taps into, battery or Leaf side, and it isn't something the *battery* reports at
+    all in any EV architecture. The Leaf's own unmodified VCM (which this bridge feeds periodic HVBAT
+    frames, per `docs/07`'s "no request/response handshake") presumably still runs its own
+    weld-detection logic entirely independently, using vehicle-side signals this project never sees
+    regardless of what data the "battery" sends. **Unlike item 14 above, there is no plausible signal
+    path to go looking for here** - this stays permanently out of scope, included so a future session
+    doesn't re-investigate something that's structurally unreachable from this bridge's position in
+    the system.
+
+16. **Unexplained ~110s of continuous transmission with no wind-down, third charge cycle of a real
+    bench test (2026-08-05, `logs/minileaf_20260805_200831_Charging to xx% the restart.trc`).** The
+    first two charge cycles in that log wound down and re-armed correctly - confirmed by replaying
+    the actual captured Leaf-bus RX traffic through the real `ShutdownSequencer` class
+    (`tests/check_shutdown_sequencer_replay.py`), which reproduces both real wind-down timings
+    almost exactly. The third cycle did not: the real log shows continuous Leaf-bus TX for another
+    ~110s past the point every wind-down trigger's own timer should have fired (the replay predicts
+    wind-down ~3s after the last `0x1F2` frame, regardless of what `charge_permission_input` was
+    doing at the time - checked both ways). Root cause not identified from the capture alone - every
+    trigger's own inputs (Leaf-side `0x1F2`/ignition IDs, RZ450e-side `charge_permission_input`)
+    look, in the replay, like they should have resolved normally. Possible explanations not yet
+    ruled out: a real difference in RZ450e-side `0x358` behavior during that specific window not
+    fully captured by the replay's simplified event-driven charge_permission_input tracking, a
+    timing/threading interaction only reproducible in the live app (not in an offline replay driven
+    by a static log), or something in the live GUI state not visible in the .trc capture at all
+    (which only records CAN frames, not GUI/internal engine state). The 2026-08-06 sixth wind-down
+    trigger (`docs/07-startup-shutdown-plan.md`'s "Sixth trigger" section, `leaf_signals.
+    BUS_SILENCE_TIMEOUT_S`) is a defensive fallback for the general structural gap this exposed, not
+    a fix for this specific case - it should prevent an indefinite stay-awake in the future, but does
+    not explain what actually happened here. Needs a re-test with the Log panel's timestamps
+    cross-referenced against a fresh .trc capture to actually catch this in the act.
+    **Note (2026-08-08): the `<name>_log_output.txt` companion file (`docs/08-gui-design.md`'s Log
+    panel section, `main.py` Rev 63) now produces exactly this Log-panel/.trc pairing automatically**
+    - any future re-test attempt should start from that file (timestamped Log-panel lines plus the
+    session's actual settings snapshot) alongside the .trc capture, rather than manually
+    cross-referencing the two by hand.
 
 ## Inherited from `Refrance/RZ450e_battery_can_decode_Project/`
 

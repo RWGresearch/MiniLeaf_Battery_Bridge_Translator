@@ -1,4 +1,4 @@
-# REVISION: 39
+# REVISION: 63
 """MiniLeaf Battery Bridge Translator - entry point.
 
 Bridges a Lexus RZ450e HV battery to a Nissan Leaf's CAN bus: a configurable
@@ -13,8 +13,8 @@ GUI is plain tkinter/ttk (stdlib, no extra GUI dependency) - see gui/theme.py.
 """
 from gui.app import App
 
-REVISION = 39
-REV_DATE = '2026-08-03'
+REVISION = 64
+REV_DATE = '2026-08-09'
 
 # Rev 1: initial milestone-1 app - adapters, signal registries, mapping
 # engine, battery-management engine with researched defaults, real-time
@@ -1492,6 +1492,875 @@ REV_DATE = '2026-08-03'
 #   except the two already-acknowledged non-actionable ones (3.2/12.4's
 #   exact reconnect-race sub-case, and 5.4's shared-state locking, both
 #   pending real-hardware/architecture decisions not yet made).
+
+# Rev 40: implemented the user's item-by-item response pass over
+#   docs/13-review-checklist-2026-08-01.md's new Part 16 (a fresh full
+#   safety re-audit against docs/memory/checklist + NMC-BMS industry
+#   research, 4 new findings, 0 code regressions found in that pass itself).
+#   All four items resolved per explicit user direction:
+#   (1) Item 16.1 (background-thread fault containment) - user asked
+#       whether a Python try/except fix would carry over to the future
+#       STM32 port; answered directly (the mechanism doesn't, the safety
+#       principle does, and is actually stronger in firmware via a hardware
+#       watchdog - see docs/09's new note) then implemented since the
+#       answer was yes. `RealtimeEngine._tx_loop()`/`_ingest_rz_bus()`/
+#       `_did_poll_loop()` now catch an unexpected exception, log it
+#       (rate-limited to 1/s), and continue instead of the thread dying
+#       permanently and silently. `_tx_loop`'s heartbeat stamp
+#       (`last_tick_monotonic`) was deliberately moved to only update on a
+#       SUCCESSFUL tick, not unconditionally - a one-off failure now
+#       self-heals invisibly, but a PERSISTENT failure still correctly
+#       trips "Bridge: NOT RESPONDING" exactly as before; catch-and-continue
+#       must never mask an ongoing problem as "fine" - bridge/
+#       realtime_engine.py.
+#   (2) Item 16.2 (temp_min/temp_max plausibility gap) - user directive:
+#       cross-check the 0x4A7 pack-extremes summary against the actual
+#       min/max of the 16 individual 0x4AA probes, not just a fixed
+#       temp_min<=temp_max check. New `temp_data_cross_check` feature,
+#       mirroring `cell_data_cross_check`'s soft->hard escalation structure
+#       exactly (10°F max delta / 60s soft / +5s hard, documented starting
+#       point) - protects the cold-side lithium-plating-prevention logic
+#       (keyed on temp_min) from a decode/mux fault that individually
+#       passes PLAUSIBLE_RANGES but is physically inconsistent with the 16
+#       probes it's presumably derived from - bridge/management_engine.py
+#       (config, apply() logic, FEATURE_FIELD_BOUNDS), bridge/fault_log.py
+#       (2 new FAULT_DEFINITIONS entries), gui/panels.py (fields/label/help
+#       text), 3 new tests in tests/test_management_engine.py, docs/05,
+#       docs/09, docs/11 updated.
+#   (3) Item 16.3 (capacity_empty/full_charge_flag/interlock/
+#       relay_cut_request exposed as ordinary mapping targets) - user
+#       directive: fix it, and make sure all four stay visible on the
+#       Dashboard. Found a real bug while tracing the fix: a code comment
+#       claiming relay_cut_request was already excluded from mapping
+#       targets was WRONG - it had been sitting in SLIDERS, fully
+#       user-mappable, the whole time. Fixed properly: new
+#       leaf_signals.MANAGEMENT_EXCLUSIVE_KEYS excludes all four from
+#       OUTPUT_SIGNALS (can't be picked as a Signal Mapping tie's output
+#       anymore) while they stay in SLIDERS/CHECKS/DEFAULTS/RANGES for
+#       everything else; ManagementEngine.apply() now also explicitly
+#       clears capacity_empty/relay_cut_request/interlock back to their
+#       safe value every tick when no condition holds (not just
+#       conditionally forcing the cut value) - full_charge_flag deliberately
+#       excluded from that second half since RealtimeEngine._apply_
+#       charge_ramp() legitimately also sets it from a different module, and
+#       a centralized clear would race against and undo that. Added
+#       relay_cut_request to the Dashboard's Flags section (previously only
+#       in the main per-signal bar list) so all four safety flags are
+#       grouped together - bridge/leaf_signals.py, bridge/
+#       management_engine.py, gui/dashboard.py, 2 new tests
+#       (tests/test_mapping_engine.py, tests/test_management_engine.py),
+#       docs/03 corrected.
+#   (4) Item 16.4 (isolation monitoring / weld detection, undocumented NMC-
+#       BMS industry practices) - user asked to research online whether the
+#       RZ450e has DTCs for either. Researched: isolation monitoring is
+#       real and plausible (generic OBD-II P0AA6, confirmed applicable to
+#       both Toyota/Lexus and Nissan EVs) but not currently reachable - this
+#       project only implements UDS ReadDataByIdentifier (service 0x22);
+#       DTC-style isolation faults need ReadDTCInformation (service 0x19),
+#       never attempted against the RZ450e by this project or the reference
+#       project. Weld detection confirmed to be a VCM/inverter-side
+#       electromechanical check with no representation on either CAN bus
+#       this project taps into - structurally unreachable, not just
+#       unimplemented, matching the user's own guess that it comes from the
+#       VCM/Leaf side, not the battery. Both added as new, fully-reasoned
+#       docs/10 open questions (#14/#15) with concrete next steps (or the
+#       lack thereof) spelled out - no code change, doc-only per the actual
+#       nature of the finding.
+#   config/profile.json resaved to pick up temp_data_cross_check's new
+#   defaults - confirmed 0 drift via tests/check_profile_drift.py
+#   afterward. All 10 test files pass (6 new test functions added across
+#   this session). docs/13's Part 16 items all have real outcome notes now,
+#   same discipline as every prior round.
+#
+# Rev 41: response pass over two real bench-hardware test logs (logs/
+#   minileaf_20260805_200831..., logs/minileaf_20260805_202221...) - wrote
+#   two new diagnostic scripts (tests/check_charge_ramp_log.py, tests/
+#   check_shutdown_sequencer_replay.py) to decode the actual captured CAN
+#   traffic and replay it through the real ShutdownSequencer class rather
+#   than guessing at root causes. 4 items:
+#   (1) Log save location - Start Log's save dialog now defaults into a new
+#       logs/ folder (sibling of config/) instead of config/ itself, per
+#       user request. New config_profile.LOGS_DIR/_ensure_logs_dir() -
+#       bridge/config_profile.py, gui/app.py. logs/ added to .gitignore
+#       (per-session capture artifacts, not a deliberate tracked backup
+#       like config/*.json).
+#   (2) Bridge staying awake indefinitely after a charger unplug - decoded
+#       the "restart" log: 2 of 3 charge cycles wound down/slept correctly
+#       (confirmed by replaying the real captured Leaf-bus traffic through
+#       the actual ShutdownSequencer class - reproduces both real
+#       wind-downs almost exactly), but the 3rd cycle transmitted
+#       continuously for ~110s past where every trigger's own timer should
+#       have fired. Root cause NOT fully identified from the capture alone -
+#       documented honestly as an open question (docs/10 #16), not swept
+#       under the rug. Added a 6th, bridge-specific defensive wind-down
+#       trigger regardless: if the Leaf bus goes completely silent (any ID)
+#       for leaf_signals.BUS_SILENCE_TIMEOUT_S (30.0s), wind down - a bench
+#       rig with no ignition wiring can only ever rely on the
+#       charge-session triggers, and this closes the "none of them ever
+#       resolve, for any reason" gap - bridge/leaf_signals.py, bridge/
+#       realtime_engine.py (ShutdownSequencer._should_wind_down()), docs/07,
+#       docs/10, docs/11.
+#   (3) AC charger taper "jumps around" during a ramp-down test - decoded
+#       the cutoff-test log: charger_limit_kw genuinely oscillating
+#       (5.20->5.00->5.10->...kW) while cell voltage sat inside a tight
+#       3.62/3.64V test band the user had configured. Root cause: this
+#       taper was deliberately built with ZERO hysteresis (a 2026-08-03
+#       decision, docs/13) - a pure function of noisy instantaneous
+#       per-cell voltage. REVERSED that decision based on this new
+#       real-hardware evidence: added the same fast-attack/slow-release
+#       hysteresis the sibling regen/discharge tapers already have, via new
+#       configurable ac_recovery_ramp_s. Also, per user directive:
+#       renamed ac_zero_v -> ac_min_v and changed the taper's floor from a
+#       literal 0kW to a configurable ac_min_kw (holds there instead of
+#       driving to true zero); added a new, separate ac_cutoff_v
+#       ("minimum value" vs. an explicit "stop charging" voltage, working
+#       together) that deliberately ends the session (full_charge_flag) once
+#       crossed, instead of relying on the vehicle reacting to a near-zero
+#       power request; added configurable ac_min_kw/ac_max_kw AC power
+#       request bounds (6.6kW default ceiling = the Leaf's real onboard AC
+#       charger max) that clamp both this taper's floor and the manual
+#       charge_target_kw ramp target; added dc_min_kw/dc_max_kw as a
+#       PLACEHOLDER ONLY (confirmed scope - no active DC logic yet),
+#       surfaced on the Future tab. Also fixed, found while reading the
+#       ramp code (not from this specific log): RealtimeEngine.
+#       _apply_charge_ramp()'s target tracking only rate-limited an
+#       INCREASING target (min(current+rate*dt, target)) - a DECREASING
+#       target (e.g. live user edit, or the new min/max kW clamp) snapped
+#       instantly with no rate limit at all, the actual mechanism behind
+#       the observed oscillation; now rate-limited symmetrically in both
+#       directions for real fine (100W-scale) precision either way -
+#       bridge/leaf_signals.py (CHARGE_SLIDERS), bridge/management_engine.py
+#       (ac_charge_taper rewrite, updated sanity checks), bridge/
+#       realtime_engine.py (_apply_charge_ramp), bridge/config_profile.py
+#       (one-time ac_zero_v -> ac_min_v migration for older saved
+#       profiles), gui/panels.py, docs/05, docs/09, docs/11.
+#   (4) Charge Emulation tab number entries silently swallowed invalid
+#       input (empty string, out-of-range) with zero visual feedback,
+#       unlike the Battery Management tab - user confirmed being able to
+#       enter nothing or an out-of-range value with no indication either
+#       way. Ported ManagementPanel's exact invalid/clamped flag_lbl
+#       pattern into every Entry on the Charge Emulation tab (and the new
+#       DC placeholder fields) - gui/panels.py.
+#   config/profile.json NOT resaved this pass (leaf_signals.py/
+#   management_engine.py default changes only affect NEW/never-set fields
+#   plus the ac_zero_v->ac_min_v migration path) - run tests/
+#   check_profile_drift.py before relying on that assumption.
+#
+# Rev 42: same-day follow-up to Rev 41 item 3, after the user pushed back on
+#   the fixed-time-constant hysteresis fix ("it was jumping from 4.4kw to 0
+#   ... it should ramp down slowly... the closer it gets to its set point,
+#   the gentler it needs to adjust") and proposed reusing the existing 0-7
+#   ramp-rate levels to self-adjust instead of a fixed ramp time. Diagnosed
+#   correctly, with a real physics explanation: this is a CC-CV charging
+#   control loop, not a danger-response cutoff - an instant downward step
+#   (even with Rev 41's slow release afterward) lets voltage sag more than
+#   necessary, the taper reads that as safe and lets power back up,
+#   overshoots, and hunts. Fast-attack-on-a-dip is right for the discharge/
+#   regen tapers (arresting real cell sag under load, unchanged) but wrong
+#   for a charger converging to a steady-state setpoint.
+#   Implemented per the user's own architecture, confirmed via discussion:
+#   ac_charge_taper now dynamically self-selects one of the existing 0-7
+#   chg_uprate_level rates (2.0kW/s at level 7, halving per level down -
+#   same real-hardware-confirmed table _apply_charge_ramp already uses)
+#   based on remaining distance to target, always starting at level 7 the
+#   moment convergence begins, downshifting/upshifting symmetrically (with
+#   hysteresis on the LEVEL SWITCH itself via new _AC_LEVEL_DOWNSHIFT_KW/
+#   _AC_LEVEL_HYSTERESIS_MULT, so the selected level doesn't flap right at a
+#   boundary - verified directly with a scripted oscillation staying locked
+#   at one level instead of flapping) as the gap narrows or grows. Each step
+#   is clamped to land exactly on target, never overshoots. Per explicit
+#   user clarification ("the 0-7# is a driven number that gets sent out on
+#   the bus... needs to kinda represent what's going on with the request"),
+#   the dynamically-selected level is now what's actually TRANSMITTED in
+#   0x1DC's own uprate bits while genuinely converging (new
+#   ManagementEngine.ac_uprate_level, read by RealtimeEngine.
+#   _compose_leaf_state()) - overriding the manually-configured
+#   chg_uprate_level only during that window. ac_recovery_ramp_s (Rev 41's
+#   fixed-time-constant field) removed cleanly - never reached a saved
+#   profile, no migration needed - bridge/management_engine.py
+#   (_select_ac_uprate_level(), ac_charge_taper rewrite), bridge/
+#   realtime_engine.py (_compose_leaf_state() override), bridge/
+#   leaf_signals.py (field removal), gui/panels.py (field removal,
+#   AC_CHARGE_TAPER_HELP/CHARGE_EMULATION_HELP rewritten).
+#   IMPORTANT CORRECTION found while writing this fix's test coverage: the
+#   2026-08-05 log originally cited as evidence for Rev 41 item 3's AC-taper
+#   diagnosis was re-checked and the taper was NEVER actually engaged during
+#   that capture - cell voltage stayed 3.616-3.640V the entire session,
+#   never reaching the 4.00V ac_full_v floor (_ramp_factor() evaluates to
+#   exactly 0.0 there), so instant_factor was a constant 1.0 (untapered) in
+#   both the old and new code. That log's real oscillation is far more
+#   likely explained by _apply_charge_ramp()'s own asymmetric rate-limiting
+#   bug (also fixed in Rev 41, independently) reacting to a live-adjusted
+#   ramp target - not by this taper's hysteresis at all. This rework is
+#   still a sound, real fix for when the taper genuinely IS engaged (the
+#   user's CC-CV physics reasoning is correct and general) but is NOT
+#   confirmed to be what fixed that specific log's evidence - docs/13 items
+#   17.3/17.5, docs/11, docs/15 all corrected to reflect this distinction
+#   rather than silently deleting the earlier (wrong) claim.
+#   8 new/replaced tests in tests/test_management_engine.py (level-7 start,
+#   progressive downshift, no-overshoot-under-huge-dt, level-switch
+#   hysteresis via direct unit test, None outside the convergence window,
+#   and a synthetic noisy-voltage-inside-the-window regression scenario -
+#   explicitly NOT a replay of the 2026-08-05 log, which never entered the
+#   taper's window at all); 1 pre-existing test in tests/test_charge_ramp.py
+#   fixed for the new gentle-convergence behavior (was asserting an instant
+#   halving). All test files pass. docs/05, docs/08, docs/09, docs/11,
+#   docs/13, docs/15 updated.
+#
+# Rev 43: Rev 42's "correction" (the claim that the 2026-08-05 log never
+#   entered ac_charge_taper's window at all) was ITSELF WRONG - user
+#   directly corrected it: "you were correct. i set the values to 3.62 and
+#   3.64 for testing." The correction had checked cell voltage against the
+#   CODE DEFAULT ac_full_v/ac_min_v (4.00V/4.15V) instead of the actual
+#   bracketed test values the user had configured (3.62V/3.64V, this
+#   project's own "bracket the threshold, not the battery" technique,
+#   docs/15) - the log's real voltage (3.616-3.640V) sits squarely inside
+#   THAT window, just not the default one.
+#   Re-verified numerically: the OLD zero-hysteresis formula
+#   (ramped_kw * ac_factor, ramped_kw=92.3) reproduces the log's real
+#   observed charger_limit_kw values to within encoding rounding at every
+#   sample checked (50.07~50.00, 44.44~44.40, 27.54~27.50, 21.90 exact,
+#   16.27~16.30, 5.00 exact, 0.00 exact) - airtight confirmation of the
+#   ORIGINAL diagnosis from Rev 41.
+#   Retested the NEW code per the user's explicit request ("you can retest
+#   with those values if you want"): new tests/check_ac_taper_log_replay.py
+#   replays the REAL captured cell-voltage trace from the log through the
+#   actual current ManagementEngine.apply() (real elapsed time between
+#   calls) at the real ac_full_v=3.62/ac_min_v=3.64 configuration - worst
+#   single-call jump across the entire ~1780-second real replay is
+#   0.819kW, vs. the original log's real multi-kW same-tick jumps. Strong
+#   real-data confirmation the Rev 42 fix genuinely resolves the exact
+#   scenario captured in this log - still a software replay of captured
+#   data, not a live bench retest, so docs/11 stays at "Documented," not
+#   promoted to "Confirmed" (that's the user's manual sign-off step).
+#   docs/13 (new item 17.6, plus a retraction note appended directly to the
+#   wrong Rev 42 correction rather than deleting it - keeps the mistake-and-
+#   correction trail visible), docs/05, docs/11, docs/15 all corrected back.
+#   Also added project memory capturing the methodology lesson: when
+#   diagnosing a bug from a real .trc capture, check the ACTUAL session-
+#   configured threshold values, not code defaults - this project's
+#   bracketing-test technique means a real test often deliberately runs
+#   with non-default thresholds, so assuming defaults were in effect is not
+#   a safe shortcut. All test files still pass (unchanged from Rev 42 - no
+#   code logic changed this revision, only a new diagnostic script and doc/
+#   memory corrections).
+#
+# Rev 44: user report on the Dashboard window: "there is no scrowl so i cant
+#   see whats on the botom" - the right-hand column (Flags, Generated
+#   Signals, Charge Emulation, Battery Management status) was a fixed-height
+#   ttk.Frame with pack_propagate(False); Battery Management status grows
+#   with however many features are active and had nothing to scroll to once
+#   it ran past the bottom of the window. gui/dashboard.py: right column now
+#   built inside the same VScrollFrame already used for the left per-signal
+#   list, with its own independent mouse-wheel scroll; updated the in-app
+#   help text that previously claimed the column was "sized so everything
+#   fits without scrolling."
+#
+# Rev 45: same-day follow-up - user preferred the main window's existing
+#   'Live transmitted values' style over Rev 44's VScrollFrame-of-widgets
+#   fix: "the data in the main screen for live data works well... lets use
+#   that for the data in the right side of the dashboard... i like the way
+#   that works. its cleener." gui/dashboard.py: right column rebuilt to
+#   reuse gui/panels.py's LiveMonitorPanel (the same read-only, auto-
+#   refreshing tk.Text widget gui/app.py's own 'Live transmitted values'
+#   panel uses) instead of one ttk.Label per field - a plain tk.Text widget
+#   scrolls natively with the mouse wheel, so this also satisfies Rev 44's
+#   original scroll request more simply, without the VScrollFrame/Canvas
+#   wrapper. New DashboardWindow._right_column_text() formats the Flags/
+#   Generated-signals/Charge-emulation/Battery-management data as one text
+#   block in the same "-- Group --" style as panels.leaf_tx_monitor_text
+#   (kept separate from that function rather than sharing it, since this
+#   version needs the relay_cut_request row, the two Dashboard-only
+#   sections, and `engine.charge_status_summary()`). Trade-off: per-field
+#   color-coding (OK/ERR/dim for stale, granted/not-granted, etc.) is gone -
+#   matches the main screen's own monochrome live-text convention, which
+#   already has no per-field color tags anywhere in this codebase.
+#
+# Rev 46: same-day follow-up - user looked at Rev 45's result: "the data is
+#   not as cleen... can we get the data alighned. if we need to use 2 lines
+#   to get the dat ato be up agnest the right side of the frame." Root
+#   cause: leaf_tx_monitor_text's/LiveMonitorPanel's usual label:value
+#   space-padding trick (f'{label:<40} {value}') only lines up in a
+#   monospace font - the Dashboard's Text widget uses DASH_FONT (Segoe UI,
+#   proportional), so padded columns never actually aligned on screen.
+#   gui/dashboard.py: dropped the plain-string _right_column_text() from
+#   Rev 45 in favor of _write_right_column(), which writes directly into
+#   self.right_box using a Text tag ('val', justify='right') - each field
+#   is now its own label line followed by its value on the next line,
+#   right-justified flush against the column's edge regardless of label
+#   length or font metrics, exactly the two-line layout the user asked
+#   for. Still refreshed from the existing _tick() loop; still a plain
+#   read-only tk.Text (scrolls natively), so Rev 44/45's scroll fix is
+#   unaffected. Confirmed via a smoke script driving a real App/
+#   DashboardWindow through several ticks - 19 correctly right-justified
+#   value lines, no exceptions.
+#
+# Rev 47: user request: "lets do the same formating to the live data in the
+#   main window" - the Rev 46 label/right-justified-value two-line layout
+#   only reached the Dashboard's right column; the main window's own two
+#   LiveMonitorPanel instances ('Live decoded values' on the left,
+#   'Live transmitted values' on the right - gui/app.py) still used the
+#   original label:value single-line, space-padded format, which has the
+#   exact same proportional-font misalignment Rev 46 fixed.
+#   Extracted the write pattern into shared helpers instead of copying it a
+#   third time: gui/theme.py gained configure_field_tags(box)/
+#   write_section(box, title)/write_field(box, label, value) (the 'hdr'/
+#   'val' tag setup and two-line-per-field write, factored out of Rev 46's
+#   dashboard-only version). gui/panels.py: LiveMonitorPanel now takes a
+#   write_fn(box) that writes directly into the (pre-cleared) Text widget
+#   via those helpers, instead of a text_fn() returning a plain string;
+#   input_monitor_text()/leaf_tx_monitor_text() became
+#   write_input_monitor(box, state_model)/write_leaf_tx_monitor(box,
+#   state_model); box wrap changed 'none' -> 'word' to match the
+#   Dashboard's. gui/app.py's two LiveMonitorPanel(...) call sites updated
+#   to the new write_fn signature. gui/dashboard.py's right column also
+#   switched from its own local section()/field() closures to the same
+#   shared helpers (no behavior change there, just de-duplication).
+#   Verified with a smoke script driving a real App: both main-window
+#   Text widgets and the Dashboard's right column all populate correctly
+#   (127 and 26 right-justified value lines respectively) across several
+#   refresh ticks with no exceptions; all 9 tests/test_*.py scripts still
+#   pass (none touch the GUI layer, but confirm the underlying data these
+#   panels read was untouched).
+#
+# Rev 48: two more user requests in one pass. (1) "lets put all those items
+#   on the same line. only a few of them need a roll over to a new line" -
+#   reverted Rev 46/47's two-line label/right-justified-value layout back
+#   to one line per field, but fixed the ROOT CAUSE this time instead of
+#   working around it: the space-padding alignment trick never worked
+#   because these Text widgets used BASE_FONT/DASH_FONT (Segoe UI,
+#   proportional). gui/theme.py: new MONO_FONT = ('Consolas', 8), used only
+#   by gui/panels.py's LiveMonitorPanel box and gui/dashboard.py's
+#   right_box; write_field(box, label, value, label_w=40, value_w=12) now
+#   writes one space-padded line (real alignment, since the font is
+#   actually monospace now) instead of two tagged lines - nothing is
+#   truncated, so the handful of genuinely long labels (the two ~60-char
+#   SOFT CUT flag descriptions) just word-wrap, exactly the "few" the user
+#   expected. configure_field_tags() dropped the now-unused 'val' tag.
+#   (2) "i want all 96 cells to be shown on a bar type graph right below
+#   the live data on the dashboard. 96 vertical bar's. i also want all 16
+#   temp probes on a different spot next to that. lets scale from min to
+#   max ranges for those items. dont resize the window, it will fit down
+#   there below the history data." gui/dashboard.py: new _MultiVBar class
+#   (one Canvas, N independently-scaled vertical bars) - unlike every
+#   other bar in this window, set_values() scales to the LIVE min/max of
+#   just that call's data instead of rz450e_signals' fixed (lo, hi); real
+#   cell-to-cell spread is only tens of millivolts, invisible against the
+#   registry's full 2.5-5.0V range, so live min/max scaling is what
+#   actually makes imbalance visible. Two instances added directly below
+#   right_box in the same `right` column, using the already-existing
+#   rz450e_signals.cell_voltage_keys()/temp_probe_keys() (96 and 16 keys) -
+#   packed side='top' after right_box (which keeps expand=True/fill='both'
+#   above them), so Tk reserves their fixed height first and right_box
+#   absorbs whatever's left; DashboardWindow's own geometry is untouched
+#   (still 1430x950). Each chart has its own live min/max/spread readout
+#   label above it, since the auto-scaled bar heights alone can't be read
+#   as absolute values. Verified with two smoke scripts against a real
+#   App/DashboardWindow: fields render single-line and correctly (a long-
+#   label line spot-checked directly), fake cell/temp data produces
+#   correct live min/max/spread text, and a winfo_y()/winfo_height() probe
+#   confirmed the temp-probe chart's bottom edge (774px) lands inside the
+#   right column's allocated height (778px) with the window still exactly
+#   950px tall - nothing clipped, nothing resized. All 10 tests/test_*.py
+#   scripts still pass.
+#
+# Rev 49: two user corrections to Rev 48. (1) "the temp bar's are supose to
+#   be in the left under the history data" - the 16-probe temp chart was
+#   originally placed in the narrow right column alongside the 96-cell
+#   chart, giving each bar only ~18px. gui/dashboard.py: moved it into
+#   `scroll` (left_outer's VScrollFrame inner frame), appended right after
+#   the SLIDERS loop that builds the main per-signal list - now spans that
+#   list's full width (1001px, computed from the same SIGNAL_COL_W/
+#   IN_COL_W/CONV_COL_W/OUT_COL_W/RANGE_COL_W column-width constants the
+#   header row uses) instead of RIGHT_COL_W-16. The 96-cell chart stays in
+#   the right column per the original request ("right below the live
+#   data"), unchanged. (2) "the live text slowely scrowl back to the top
+#   on its own" - both live-data Text widgets (gui/panels.py's
+#   LiveMonitorPanel._refresh(), gui/dashboard.py's _write_right_column())
+#   preserved scroll position across each delete+rewrite via
+#   yview_moveto(fraction_before). Root cause: yview_moveto() rounds to
+#   the nearest line, and with wrap='word' boxes whose field VALUES change
+#   length tick to tick (a status string, "None" vs a number, etc.), the
+#   number of wrapped DISPLAY lines shifts between refreshes even though
+#   the logical field count never does - repeatedly round-tripping through
+#   a fraction is lossy and drifted the visible position toward the top
+#   over many refresh cycles. Fixed by anchoring to box.index('@0,0') (the
+#   exact character index at the top-left corner) before the rewrite and
+#   restoring via box.yview(that_index) after, instead of a fraction -
+#   exact, not a rounded approximation. Isolated before/after test (a
+#   throwaway Text widget with wrap='word' and per-cycle varying-length
+#   content, mimicking the real panels): the OLD fraction approach drifted
+#   -12 lines over 39 refresh cycles (i.e. crept back toward the top,
+#   exactly the reported symptom); the NEW index approach held at 0 drift
+#   every cycle. Re-verified the full app + Dashboard lifecycle and all 10
+#   tests/test_*.py scripts still pass.
+#
+# Rev 50: two more corrections to Rev 49. (1) "cell voltages are also
+#   supose to be on the left. side by side" - the 96-cell chart was still
+#   in the right column; moved it into `scroll` (the left list) next to
+#   the 16-probe chart, both inside a new `charts_row` Frame so they pack
+#   side='left' next to each other instead of stacked - cell chart gets
+#   717px, temp chart 260px (computed from the same left-list-width
+#   constants as before, split so 96 bars still get meaningfully more room
+#   than 16). The right column now has no bar charts left in it at all.
+#   (2) "the data boxes look close. can we add all output data to the
+#   rigth and all descriptions to the left of each window? its still
+#   wraping incorectly. some data output is wraping" - root-caused this
+#   time instead of guessing at wider constants again: Rev 48's
+#   write_field(label_w=40, value_w=12) space-padding assumed a FIXED
+#   character-count box width; whenever the real box (in actual pixels,
+#   via MONO_FONT's real glyph width) was narrower than that guess, lines
+#   that should fit were wrapping anyway, and when wider, label/value sat
+#   closer together than the padding implied. gui/theme.py:
+#   configure_field_tags(box) now also binds <Configure> to set a REAL Tk
+#   right-aligned tab stop (`box.configure(tabs=f'{box.winfo_width()-10}
+#   right')`), re-measured on every resize; write_field(box, label, value)
+#   dropped label_w/value_w and just writes 'label\tvalue\n' - the value
+#   is pixel-flush against the box's actual current right edge, and a line
+#   only wraps when the label itself is genuinely too long for the real
+#   box width, never as an artifact of a wrong guessed character count.
+#   Confirmed a right-tab-stop actually behaves this way in this Tk build
+#   via an isolated dlineinfo() probe (short/medium labels stayed on one
+#   display row with the value flush right; only a deliberately very long
+#   label wrapped) before wiring it in, then verified against the real
+#   Dashboard: right_box's `tabs` option came back correctly measured
+#   ((288, 'right') at its actual ~298px width), the main window's two
+#   LiveMonitorPanel boxes each got their OWN independently-measured tab
+#   stop matching their own pane width, and a dlineinfo() sweep of all 24
+#   right-column fields found exactly 5 that wrap to a second display
+#   row - all 5 are the genuinely long ones (the two ~60-char SOFT CUT
+#   labels, two long Generated-signal labels, and the long charge-status
+#   sentence), none of the normal ~19 short/medium fields. All 10
+#   tests/test_*.py scripts still pass.
+#
+# Rev 51: user follow-up on the cell/temp bar charts: "lets scale the
+#   battery and temp to be slightly more 'bar' in the scale so its bettery
+#   bar graph" - both charts' height bumped 90 -> 150px in
+#   DashboardWindow._build() (gui/dashboard.py) for a more pronounced
+#   bar-graph look; temp probe chart's gap between bars also widened
+#   1 -> 3px (16 bars in 260px has plenty of room to spare, unlike the 96
+#   cell bars in 717px where widening the gap would eat noticeably into
+#   each bar's width). Confirmed via smoke script against a real
+#   App/DashboardWindow that both _MultiVBar instances report height=150
+#   and render/scale correctly with fake live data; all 10
+#   tests/test_*.py scripts still pass.
+#
+# Rev 52: user follow-up: "the hight was fine, but the min max cant be the
+#   full scale, we need more below and above. lets say scale the battery
+#   from 2.5-4.3 and scale the temp from 0 deg - max." Rev 48/51's
+#   auto-scale-to-live-min/max design meant the tallest and shortest bar
+#   ALWAYS touched the top/bottom of the chart, no matter how tight the
+#   real spread was - no visual headroom to judge against, which is what
+#   the user was pointing at. gui/dashboard.py: _MultiVBar gained a
+#   scale=(lo, hi) param - a FIXED display range (same idea as _BarGauge's
+#   own (lo, hi)) used for bar HEIGHT, while set_values() still returns
+#   the actual LIVE (lo, hi) present that call so the readout label above
+#   each chart keeps reporting real numbers, not the fixed scale. Wired up
+#   as CELL_SCALE=(2.5, 4.3) (the user's own explicit numbers) and
+#   TEMP_SCALE=(0.0, 160.0) (0F per the user's explicit floor; 160F reuses
+#   rz450e_signals' OWN existing temp_01..temp_16 registry range rather
+#   than inventing a new ceiling). A value outside its chart's fixed range
+#   now clamps to full bar height in ERR red instead of silently rescaling
+#   past it - same out-of-range convention _BarGauge already uses
+#   elsewhere in this window. Both chart header labels now show the
+#   configured scale text (e.g. "2.5-4.3V") instead of "live min/max
+#   scaled". Verified with a smoke script against a real
+#   App/DashboardWindow: fed a tight real-world cell-voltage spread
+#   (3.600-3.618V) plus one deliberately out-of-range cell (4.5V) -
+#   confirmed the readout label still shows the correct live max (4.500V),
+#   a normal cell's bar height matches the fixed-scale math exactly
+#   (91.9px for 3.603V against the 2.5-4.3V/150px scale, computed
+#   independently and matched to within float rounding), and the
+#   out-of-range cell draws at full height in ERR red (#ff6b6b). All 10
+#   tests/test_*.py scripts still pass.
+#
+# Rev 53: user walked back Rev 52's hard-fixed cell/temp chart scale:
+#   "lets auto scale to .5V below and .5V above the min max. but dont
+#   jumparound to scale... same for the temps lets do 5 above and 5
+#   below. then lets add a third data graph that shows the other temps we
+#   arr reciving from the battery in the same wrow."
+#   gui/dashboard.py: _MultiVBar's fixed `scale=` param replaced with
+#   `auto_pad=` - the displayed range is now live min/max +/- a fixed
+#   margin (CELL_PAD=0.5V, TEMP_PAD=5F, the user's own numbers), but
+#   STICKY: it only ever expands, never shrinks, once real data is
+#   flowing, and (after a first attempt still jittered under ordinary
+#   CAN-noise-level fluctuation - caught by a smoke test that fed +/-0.2mV
+#   noise and found the displayed edge still crept) each expansion snaps
+#   OUT to the next multiple of auto_pad beyond what's needed rather than
+#   the exact figure, which is what actually stops small readings from
+#   re-triggering another expansion. Resets to unset the next time a
+#   chart has no live data at all (a disconnect), so a fresh session
+#   doesn't inherit a stale expanded range. Added a third chart in the
+#   same charts_row: self.other_temp_bars, showing the 0x4A7 'Temp
+#   extremes' message's pack-level temp_max/temp_min (Max/Min pack
+#   temperature) - distinct from the 16 individual 0x4AA probe readings
+#   the middle chart already shows, and the most literal read of "the
+#   other temps we are receiving from the battery." Refactored the
+#   per-tick refresh into one shared _refresh_bar_chart() helper (cell/
+#   temp-probe/pack-temp-extremes all called it) instead of copying the
+#   same read-state/format-label logic a third time. Verified via smoke
+#   script against a real App/DashboardWindow: the display scale held
+#   exactly steady (3.0-4.5V) across 10 same-data ticks AND 10 ticks of
+#   +/-0.2mV noise, correctly expanded (to 3.0-6.0V, grid-snapped) only
+#   when a value (5.2V) actually landed outside the current range, and
+#   correctly reset to unset when fed all-stale data. All 10
+#   tests/test_*.py scripts still pass.
+#
+# Rev 54: user request: "lets go ahead and make the scale adjustable with
+#   a drop down. The voltage can be point one up to one volt or full
+#   scale, and the temperature can be point one degree up to five degree
+#   or full scale" (defaults corrected mid-request to 0.1V/1F, down from
+#   the numbers used to size Rev 53's hardcoded CELL_PAD/TEMP_PAD).
+#   gui/dashboard.py: _MultiVBar gained fixed_range= (a hard (lo, hi)
+#   override, same mechanic as Rev 52's since-removed scale= param) and a
+#   set_scale(auto_pad=, fixed_range=) method that also clears the sticky
+#   auto-pad window so switching modes doesn't inherit a stale range from
+#   whichever mode was active before. Each of the three charts got a
+#   readonly ttk.Combobox next to its title: "Cell voltages" offers
+#   ±0.1/±0.2/±0.5/±1.0V + Full Scale; "Temp probes" offers ±0.1/±0.5/±1/
+#   ±2/±5F + Full Scale and drives BOTH temp charts (probes and pack
+#   extremes) at once, since the user referred to "the temperature" as
+#   one category. "Full scale" reuses rz450e_signals' own existing
+#   per-cell/per-probe registry ranges (2.5-5.0V, -40 to 160F) rather than
+#   inventing new numbers. Every Combobox got no_wheel() (gui/theme.py) -
+#   they live inside the same VScrollFrame-scrolled left list as
+#   everything else, so without it a mouse-wheel scroll over one would
+#   silently change its selection instead of scrolling the page.
+#   Also moved gui/panels.py's private _no_wheel() helper to gui/theme.py
+#   as public no_wheel() (renamed all 7 existing call sites in panels.py)
+#   so dashboard.py's new Comboboxes could reuse it instead of duplicating
+#   the same handful of lines a second time.
+#   Verified via smoke script against a real App/DashboardWindow: default
+#   selections/pads matched (±0.1V, ±1F), switching the cell dropdown to
+#   "Full scale" produced the exact expected bar height against the
+#   2.5-5.0V range, switching it back to a pad value correctly cleared
+#   fixed_range, and switching the temp dropdown to "Full scale" applied
+#   to BOTH temp_bars and other_temp_bars in one action. All 10
+#   tests/test_*.py scripts still pass.
+#
+# Rev 55: user request: "lets make the voltage scalibal down to .01" -
+#   gui/dashboard.py's VOLT_PAD_OPTIONS extended from [0.1, 0.2, 0.5, 1.0]
+#   to [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0] (added the finer steps
+#   between 0.01 and 0.1 too, not just the single new endpoint, so the
+#   dropdown has a sensible progression rather than a big jump from 0.01
+#   straight to 0.1); default selection unchanged (±0.1V). Temp dropdown
+#   untouched - only "the voltage" was asked for. Verified via smoke
+#   script: selecting ±0.01V against a deliberately tight fake cell
+#   spread (3.600-3.6035V) produced a correspondingly tight ~0.03V
+#   displayed scale (3.59-3.62V), vs. the much wider range the default
+#   ±0.1V pad would give the same data. All 10 tests/test_*.py scripts
+#   still pass.
+#
+# Rev 56: user follow-up: "lets defualt to .01 and add slight less buffer
+#   to the top and bottom." gui/dashboard.py: DEFAULT_CELL_PAD changed
+#   0.1 -> 0.01 (default Combobox selection is now '±0.01V'; temp default
+#   untouched at ±1F, only "the voltage" was mentioned again). Separately,
+#   _MultiVBar.set_values()'s grid-snap expansion (Rev 53's fix for
+#   scale-jitter-under-noise) was snapping to a grid the size of the FULL
+#   auto_pad, which could add up to another whole pad of extra headroom on
+#   top of what was actually requested (worst case ~2x pad total) - that
+#   excess is exactly what "add slight less buffer" was pointing at.
+#   Tightened the grid to auto_pad/4, capping the excess at ~25% of pad
+#   (~1.25x pad total) instead, while keeping it comfortably above
+#   realistic CAN-noise-level jitter for every pad size offered (smallest
+#   is 0.01V -> grid=0.0025V, still ~12x the +/-0.2mV noise level the
+#   original stability smoke test used). Verified via smoke script: fed a
+#   tight fake cell spread (3.600-3.603V), confirmed the default selection
+#   is now '±0.01V', and measured the actual buffer on both edges landing
+#   between 1.0x and 1.25x the requested 0.01V pad (was up to 2x before) -
+#   then re-ran the +/-0.2mV noise-stability check against the new
+#   tighter grid and confirmed the displayed range still didn't move.
+#   All 10 tests/test_*.py scripts still pass.
+#
+# Rev 57: user follow-up: "lets make each bar graph less tall. then give
+#   even less padding. lets give it .05V to th etop and botom."
+#   gui/dashboard.py: all three chart heights 150 -> 100px (new
+#   CHART_HEIGHT constant, one place instead of three separate literals);
+#   charts_row's own top/bottom margin trimmed (14,4) -> (10,2), and the
+#   pady after each chart's min/max label dropped entirely so the bar
+#   canvas packs directly under it. DEFAULT_CELL_PAD changed 0.01 -> 0.05
+#   (temp default untouched at ±1F - only voltage numbers were given
+#   again). Verified via smoke script: all three _MultiVBar instances
+#   report height=100, the default cell-scale selection is now '±0.05V'
+#   with auto_pad=0.05, the measured buffer on both edges of a fake tight
+#   cell spread landed within the expected 1.0x-1.25x*0.05V range, and the
+#   Dashboard window's actual on-screen height is still exactly 950px
+#   (nothing forced a resize). All 10 tests/test_*.py scripts still pass.
+#
+# Rev 58: real bench log finding (minileaf_20260806_182106-charge-test-with-
+#   low-set-points-on-v.trc, ac_cutoff_v bracketed to 3.64V per docs/15 B20):
+#   "when the stop charging cutoff was triggered, it actually didn't stop...
+#   it just barely triggered it then reset for charging again." Decoding
+#   every real 0x1DB frame's full_charge_flag bit confirmed the bug: the
+#   flag pulsed on/off 29 times over the session, ~0.6s per pulse, instead of
+#   ever actually stopping the session. Root cause - bridge/
+#   management_engine.py's AC stop-charging cutoff (both the ac_cutoff_v
+#   per-cell trigger and the SoC-target-reached stop) recomputed full_charge_
+#   flag fresh every tick with no memory: the instant charger_limit_kw hit 0,
+#   the triggering cell's voltage sagged back under ac_cutoff_v within a tick
+#   or two, and the flag fell back to 0, re-offering power - a repeating hunt
+#   that never gave the real Leaf VCM time to actually react and end the
+#   session. Fixed by latching the stop once triggered (new
+#   ManagementEngine._ac_charge_stop_latched, same mechanism as the existing
+#   _hard_latched): once either trigger fires, full_charge_flag/charge_limit_
+#   kw=0/charger_limit_kw=-10 stay asserted on every subsequent tick
+#   regardless of the triggering reading recovering, cleared only via
+#   notify_session_start()/notify_charge_replug() - i.e. the car must
+#   genuinely shut down and the plug be reinserted before charging can
+#   resume, per user directive. New regression test (tests/
+#   test_management_engine.py: test_ac_stop_charging_cutoff_latches_once_
+#   triggered) replays the exact recover-then-hunt sequence and confirms the
+#   latch holds across 20+ subsequent ticks at a fully-recovered voltage,
+#   clearing only on notify_charge_replug(). All tests/test_*.py scripts
+#   still pass.
+#
+# Rev 59: user question following up on Rev 58 - "we split the charger and
+#   drive mode for what controls the max power for charger. i do beleave in
+#   the refrance project, that pramiter was controlled diffrently when in
+#   drive mode... 2 different ways of controlling the output. one under
+#   driving and one under charging, those are handeld diffrently by
+#   diffrent algarithoms... Per-cell regen power liment for driving and AC
+#   charger overvoltage taper for ac charging. thats a difrent control
+#   means all togther." Confirmed against Refrance/Leaf_BMS_Emulator's
+#   bit-level-diff-confirmed real-hardware notes: LB_MAX_POWER_FOR_CHARGER
+#   sits fixed at the 1023/92.3kW idle placeholder whenever not actually
+#   charging - it never becomes a live, per-cell-voltage-managed value
+#   outside a real charge session. bridge/management_engine.py's
+#   ac_charge_taper block (both the ac_full_v/ac_min_v/ac_min_kw taper AND
+#   its own ac_emergency_v hard cut) previously ran every tick regardless of
+#   charging_active (RZ450e's charge_permission_input) - only the
+#   ac_cutoff_v stop-charging/full_charge_flag portion was gated. Fixed:
+#   the whole block is now gated on charging_active - while not charging,
+#   charger_limit_kw is left completely untouched (whatever mapping/idle
+#   value was already there), and driving-mode overvoltage protection is
+#   entirely charge_target_taper's job (the regen taper, unconditional by
+#   design - drives the shared charge_limit_kw field for both regen-while-
+#   driving and charge-while-plugged-in, per docs/03). Also relaxed
+#   _CHARGE_EMULATION_SANITY_CHECKS' ac_min_v/ac_cutoff_v pair from strict
+#   `<` to `<=` (user: "i wanted to trigger full charge cutoff at the same
+#   time we reached min charger taper. thats why i had them set the same
+#   value" - a deliberate valid config, not an inverted ordering; the
+#   `config_sanity` warning was a false positive for this setup). New
+#   regression tests: tests/test_management_engine.py
+#   test_ac_taper_leaves_charger_limit_kw_untouched_while_driving (new);
+#   tests/test_charge_ramp.py's two "applies even without the interlock"
+#   tests renamed/reversed to test_charger_limit_kw_untouched_by_ac_taper_*
+#   (they asserted the OLD, now-removed behavior). Six existing AC-taper
+#   convergence tests in test_management_engine.py updated to explicitly set
+#   charge_permission_input=1 (now required precondition), with three of
+#   them moved off cell_v=4.18 (collides with the ac_cutoff_v=4.18 default,
+#   which now correctly fires once charging_active is set) to 4.16. All
+#   tests/test_*.py scripts still pass.
+#
+# Rev 60: docs/16 parameter-clamping audit follow-up - two fixes.
+#   (1) discharge_min_kw/discharge_max_kw (discharge_power_taper) and
+#   regen_min_kw/regen_max_kw (charge_target_taper) - user directive: "both
+#   need min and max settings by the user", same pattern as charger_limit_kw's
+#   existing ac_min_kw/ac_max_kw. Formula changed from `baseline * factor`
+#   (true zero floor, unbounded ceiling) to `floor + (ceiling - floor) *
+#   factor` where `ceiling = max(floor, min(baseline, max_kw))` (the max()
+#   guard protects against a misconfigured max_kw < min_kw or a baseline
+#   naturally below the floor). Defaults (0.0/110.0, 0.0/70.0) are exact
+#   backward-compat no-ops. discharge_max_kw=110.0 is grounded in
+#   docs/12-nmc-bms-design-research.md §6's researched "Leaf drive power
+#   80-110 kW peak" figure; regen_max_kw=70.0 is explicitly NOT grounded in
+#   that same section's "~0.5C/a few tens of kW" regen figure (~36kW) - kept
+#   at the pre-existing static default deliberately (user directive: ship
+#   with no behavior change first, tune down later). SAFETY-CRITICAL DETAIL:
+#   charge_target_taper's emergency branch (worst cell >= emergency_high_v)
+#   still outputs literal 0.0, bypassing regen_min_kw entirely - a floor must
+#   never keep feeding power into an overvoltage emergency, matching
+#   ac_charge_taper's own emergency branch (which likewise bypasses
+#   ac_min_kw). New tests: test_discharge_power_taper_respects_configured_
+#   floor_and_ceiling, test_charge_target_taper_regen_respects_configured_
+#   floor_and_ceiling, test_charge_target_taper_emergency_bypasses_regen_min_
+#   kw_floor, test_discharge_regen_min_max_sanity_checks (all in
+#   tests/test_management_engine.py).
+#   (2) GIDS/QC capacity formula fix (mapping_engine.derive_capacity_
+#   outputs()) - the OLD formula computed gids/qc_full_wh/qc_remain_wh from
+#   GROSS pack capacity (capacity_ah x live pack_v), conflating it with
+#   USABLE capacity - overstated GIDs ~12.5% for a real pack with a top/
+#   bottom reserve buffer (this project's bench pack: ~72kWh gross/~64kWh
+#   usable). New state.vehicle fields usable_capacity_kwh (default 64.0,
+#   spec-sourced, matches docs/12 §6's "documented pack figure ~71.4 kWh")
+#   and qc_max_soc_pct (default 80.0, PROVISIONAL - no DC fast-charge
+#   testing done at all yet) now drive the formula: gids = usable_wh/80
+#   where usable_wh = soc_pct% x (usable_capacity_kwh x soh_fraction);
+#   qc_full_wh capped at qc_max_soc_pct% of that usable capacity (real DC
+#   fast charging only usefully charges to ~80% before CC-CV tapering makes
+#   the rest pointless); qc_remain_wh = max(0, qc_full_wh - usable_wh).
+#   pack_v dropped from the formula entirely (no longer used). Reproduces
+#   the user's own by-hand worked example EXACTLY: 64kWh usable x 94% SOH =
+#   60.16kWh = 752 GIDs at 100% SOC (tests/test_mapping_engine.py:
+#   test_gids_qc_capacity_uses_usable_capacity_not_gross). Both new fields
+#   validated on profile load via new mapping_engine.VEHICLE_FIELD_BOUNDS +
+#   config_profile._apply_vehicle() (closes a real pre-existing gap -
+#   state.vehicle previously had ZERO profile-load validation at all) and
+#   editable in gui/panels.py's VehiclePanel (new Entry+bounds-clamp rows,
+#   same pattern ManagementPanel already uses). New tests:
+#   test_gids_qc_capacity_uses_usable_capacity_not_gross,
+#   test_gids_qc_capacity_defaults_without_explicit_vehicle_config,
+#   test_gids_qc_capacity_missing_inputs_returns_empty
+#   (tests/test_mapping_engine.py); test_vehicle_profile_load_* (4 tests,
+#   tests/test_config_profile.py). docs/10-open-questions.md #3 (GIDS
+#   VCM-threshold interaction) re-checked against the new formula
+#   (back-of-envelope: GIDS~=49/5 now fall at ~6.5%/~0.66% SoC, close to the
+#   old formula's ~6.0%/~0.6% - not meaningfully changed) - remains open,
+#   still needs a real voltage-based check, not just this SoC%-based sanity
+#   pass. All tests/test_*.py scripts still pass; GUI smoke-tested (App()
+#   builds with no exceptions, new fields render).
+#
+# Rev 61: same-day follow-up to Rev 60 - user asked "where is the GIDs, is
+#   that a mapping or a hardcoded value... we should have that as a map or
+#   configurable setting," then "soh_fraction could be configured" and "the
+#   80% QC needs to be on the charge emulation and so does the DC fast
+#   charge power request placeholder." Two changes:
+#   (1) `mapping_engine.NAMEPLATE_CAPACITY_AH` (201.00 Ah, the divisor behind
+#   the GIDS formula's SOH fraction) was a hardcoded module constant - now
+#   also a live, user-configurable `state.vehicle['nameplate_capacity_ah']`
+#   (new field, same default, editable on the Vehicle panel next to
+#   usable_capacity_kwh). The constant remains as the fallback default and is
+#   still what the separate `soh_pct` mapping tie's own `nameplate_ah`
+#   tie-param bakes in at tie-creation time - deliberately NOT unified with
+#   this new live value (two independently-tunable "nameplate capacity"
+#   numbers for now; unifying them would mean plumbing live state access into
+#   evaluate_combine()'s pure-function signature, out of scope). GIDS itself
+#   stays a fixed named derivation (mapping_engine.derive_capacity_outputs()),
+#   not a generic Signal Mapping tie - matches this project's "curated
+#   features, no generic scripting" rule; every real number feeding the
+#   formula is configurable even though the formula shape itself isn't.
+#   (2) `qc_max_soc_pct` moved OUT of `state.vehicle` (where it briefly lived
+#   for about a day, Rev 60) INTO `state.charge_emulation`
+#   (leaf_signals.CHARGE_SLIDERS) - it's charging behavior, not a pack spec.
+#   GUI-wise, also moved further: `dc_min_kw`/`dc_max_kw` previously rendered
+#   on the separate "Future Placeholder" tab (not the actual Charge Emulation
+#   tab) even though their data already lived in charge_emulation - user
+#   directive: move all three (qc_max_soc_pct + both DC fields) onto the real
+#   Charge Emulation tab, in a new "DC fast-charge / QC capacity" section.
+#   FuturePlaceholderPanel simplified back to just the disabled PID/DID
+#   placeholder it originally was. New one-time migration in
+#   config_profile.apply_profile() (same pattern as the pre-existing
+#   ac_zero_v -> ac_min_v migration) carries a legacy vehicle.qc_max_soc_pct
+#   value across into charge_emulation.qc_max_soc_pct on load, so a profile
+#   saved during the brief Rev-60 window doesn't silently lose a real tuned
+#   value. New/updated tests: test_nameplate_capacity_ah_is_configurable,
+#   test_qc_max_soc_pct_lives_in_charge_emulation_and_is_configurable
+#   (tests/test_mapping_engine.py); test_qc_max_soc_pct_profile_load_clamps_
+#   out_of_bounds, test_qc_max_soc_pct_migrates_from_old_vehicle_section,
+#   test_qc_max_soc_pct_migration_does_not_override_an_explicit_new_value,
+#   plus the existing vehicle round-trip/clamp tests updated for the field
+#   rename (tests/test_config_profile.py). All tests/test_*.py scripts still
+#   pass; GUI smoke-tested (App() builds with no exceptions).
+#
+# Rev 62: two GUI polish fixes from real usage, same day as Rev 61's new
+#   fields. (1) User report: "charge emulation needs a scroll" - the new
+#   'DC fast-charge / QC capacity' section (Rev 61) pushed the Charge
+#   Emulation tab's content past the visible tab area with no way to reach
+#   it (confirmed: 591px of content in a 265px-tall visible area in a smoke
+#   test). ChargeEmulationPanel now wraps its content in the same
+#   VScrollFrame ManagementPanel already uses (gui/theme.py) - every child
+#   widget reparented from `self` to `self.scroll.inner`. (2) User report:
+#   "name plate capacity words are off the screen" - VehiclePanel sits in
+#   the ~374px-wide right sidebar; the new 'Usable capacity'/'Nameplate
+#   capacity' fields (Rev 61) were packed into ONE horizontal row (label +
+#   Entry + flag x2), overflowing well past that width (confirmed
+#   reqwidth dropped from overflowing to 296px after the fix). Split into
+#   two separate rows, matching ManagementPanel's one-field-per-row layout.
+#   Also, per user request ("update the ? for the new added items"): the
+#   '?' help popups for discharge_power_taper/charge_target_taper
+#   (Battery Management tab) now document their new min/max kW fields
+#   (citing docs/12 section 6's researched discharge/regen power figures
+#   and the regen emergency-bypasses-the-floor safety detail); VEHICLE_HELP
+#   documents usable_capacity_kwh/nameplate_capacity_ah and the GIDS
+#   formula; a new DC_QC_HELP + '?' button was added to the (previously
+#   unexplained) 'DC fast-charge / QC capacity' section itself. All
+#   tests/test_*.py scripts still pass; GUI smoke-tested (App() builds with
+#   no exceptions, VehiclePanel/ChargeEmulationPanel widget dimensions
+#   verified directly via winfo_reqwidth/reqheight).
+
+# Rev 63: two fixes from a full audit of every '?' help popup and every
+#   docs/10-open-questions.md item against the current code, plus one new
+#   feature. (1) docs/10 item 9's parenthetical still said "vehicle.
+#   qc_max_soc_pct" - that field moved to state.charge_emulation the same
+#   day (docs/04's own note, mapping_engine.py:217) so the reference was
+#   stale; corrected. (2) gui/panels.py's MAPPING_HELP enumerated the
+#   Signal Mapping tab's combine-function dropdown as "linear, sum, average,
+#   min, max, or soh_percent" but mapping_engine.COMBINE_TYPES has always
+#   included a 7th, real, selectable option, 'lookup' (a step table,
+#   evaluate_combine()) - the help text just never mentioned it; added.
+#   (3) New feature (user request): Start Log now also opens a
+#   '<name>_log_output.txt' companion text file next to the .trc capture
+#   (gui/app.py's _start_log_output/_stop_log_output, wired into
+#   _toggle_trc_log/_on_close) - never modifies the .trc file/format itself.
+#   Written once at start: a full settings snapshot, same shape as a saved
+#   profile (bridge/config_profile.py's new build_profile_dict(), factored
+#   out of save_profile() so this doesn't also overwrite config/profile.json
+#   on disk). From then on, _drain_log mirrors every Log-panel line into it
+#   live (line-buffered) until Stop Log/app close - on-the-fly setting
+#   changes already produce a log_fn line (ManagementPanel/
+#   ChargeEmulationPanel), so those show up for free, per user directive,
+#   with no separate change-tracking needed.
+#
+# Rev 64: two unrelated changes, same session (user request).
+#   (1) Documentation-only: logged two real-hardware findings from the real
+#   ZE1 40kWh Leaf test vehicle, no code/default changes. Discharge
+#   (discharge_max_kw/discharge_min_kw): the real dash turtle (reduced-power)
+#   icon comes on around a 40kW discharge_max_kw setting, and the car starts
+#   turning off power systems below roughly 3kW discharge_min_kw - matches
+#   why the user's own saved config/profile.json already runs 40.0/5.0kW
+#   instead of the 110.0/0.0kW code default. Regen (regen_max_kw): the real
+#   car's own regen ceiling sits around 40kW on this test vehicle, so any
+#   regen_max_kw setting between the 70.0kW default and ~40kW is a no-op -
+#   a Leaf limit, not a bridge setting; peak regen varies by Leaf generation
+#   (1st-gen 24/30kWh ~20-30kW, 2nd-gen 40kWh just over 40kW, LEAF PLUS
+#   62kWh ~60-80kW). Logged in docs/05's default-value table, docs/15 B7/B8,
+#   docs/16 A2/A3, and both features' help text (gui/panels.py).
+#   (2) Celsius conversion (user request: "make sure our system uses celcius
+#   for all settings and readouts"). This project stored/displayed every
+#   temperature in °F internally (bridge/rz450e_signals.py's decode_temp_
+#   msg()/decode_temp_minmax() converted raw°C to °F on ingest; every
+#   over_temperature_derate/temp_data_cross_check config field had an _f
+#   suffix and an °F default value) despite every other doc already
+#   presenting °C as the primary unit. Same physical thresholds throughout -
+#   no safety-relevant number actually changed, only the unit/storage
+#   representation:
+#     - bridge/rz450e_signals.py: decode functions now emit raw°C directly
+#       (no ×9/5+32 conversion); registry 'unit'/'range' and
+#       PLAUSIBLE_RANGES converted to °C (-51.1..121.1°C, was -60..250°F).
+#     - bridge/management_engine.py: every over_temperature_derate field
+#       renamed _f->_c with its default re-expressed in °C (e.g.
+#       emergency_temp_f=141.8 -> emergency_temp_c=61.0, exact - this is why
+#       141.8°F was originally chosen, it's precisely 61°C); temp_data_
+#       cross_check's max_delta_f=10.0 -> max_delta_c=5.6 (a DELTA converts
+#       via ×5/9, no +/-32 offset, unlike an absolute reading).
+#       FEATURE_FIELD_BOUNDS/_CONFIG_SANITY_CHECKS updated to match.
+#       ManagementEngine.from_dict() migrates an old _f-keyed saved profile
+#       to its new _c key with a real unit conversion (not just a rename),
+#       same "translate, don't drop" discipline as config_profile.py's
+#       existing ac_zero_v->ac_min_v migration - verified directly against
+#       the real saved config/profile.json.
+#     - bridge/mapping_engine.py: the temp_max(°F)->batt_temp_c(°C) default
+#       tie is now an identity (temp_max already arrives in °C); temp_
+#       segment_pct's window changed from 32-140°F to the equivalent 0-60°C.
+#       config_profile.py migrates a saved profile's mapping-tie params too
+#       (matched by fingerprint against the old formula) - this one was a
+#       genuine correctness risk, not just cosmetic: an unmigrated old tie
+#       would have applied an °F->°C-shaped formula a SECOND time to a value
+#       already in °C, silently producing garbage.
+#     - gui/panels.py: over_temperature_derate/temp_data_cross_check field
+#       labels and help text now say °C throughout.
+#     - gui/dashboard.py: temp bar-chart units/full-range/pad-option labels
+#       now °C (TEMP_FULL_RANGE -40..71.1°C, was -40..160°F).
+#     - tests/test_management_engine.py, tests/test_charge_ramp.py, tests/
+#       check_ac_taper_log_replay.py: every hardcoded °F temp literal
+#       converted to its °C equivalent (full suite re-verified passing,
+#       except two pre-existing test_charge_ramp.py failures unrelated to
+#       this change - see docs/05's 2026-08-07 ac_charge_taper driving-vs-
+#       charging gating note, those two tests assert the OLD pre-2026-08-07
+#       behavior and were already stale before this session).
+#     - docs/05, 09, 10, 12 updated (field names/values); docs/13/14 left
+#       as accurate historical record of what was true when written, same
+#       discipline as every other past field rename in this project.
 
 if __name__ == '__main__':
     app = App()

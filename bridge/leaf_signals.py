@@ -102,6 +102,31 @@ CHECKS = [  # (key, label, default) - soft/hard cut and permission flags
     ('ir_malfunction',  'IR sensor malfunction (0x55B)',    0),
     ('capacity_empty',  'Capacity empty flag (0x55B) - SOFT CUT: instant contactor cutoff', 0),
 ]
+
+# Management-layer-exclusive fields (docs/13 item 16.3, fixed 2026-08-04) -
+# these are excluded from OUTPUT_SIGNALS below (_build_output_registry()),
+# i.e. NOT selectable in the Signal Mapping tab's output dropdown, even
+# though they stay in SLIDERS/CHECKS/DEFAULTS/RANGES for everything else
+# (dashboard display, output clamping, DEFAULTS seeding). A prior code
+# comment near relay_cut_request's own definition below claimed it was
+# "not itself in SLIDERS/CHECKS... never a direct mapping target" - that
+# claim was WRONG (relay_cut_request has been sitting in SLIDERS the whole
+# time, fully mappable) and this fix makes the comment true instead of
+# fixing the comment to match the bug. Root problem: ManagementEngine.
+# apply() only ever forces these toward their cut/latched state
+# (out['capacity_empty']=1, out['relay_cut_request']=3, etc.) - none of them
+# had a corresponding unconditional "else: clear it" until this same fix
+# (see apply()'s own comment) - so a user-created mapping tie targeting one
+# of these could hold it stuck asserted indefinitely, invisible to the
+# Fault History window (a mapping-layer effect, not something
+# ManagementEngine's own fault_log ever sees). full_charge_flag is
+# deliberately included here too even though ManagementEngine.apply() does
+# NOT explicitly clear it (see that function's own comment for why an
+# unconditional clear there would be wrong) - removing it as a mapping
+# target closes the actual vulnerability (a user tie holding it non-zero)
+# without needing the unsafe centralized-clear fix.
+MANAGEMENT_EXCLUSIVE_KEYS = {'relay_cut_request', 'capacity_empty', 'full_charge_flag', 'interlock'}
+
 # 'voltage_latch' removed as a mapping target (2026-08-01, item 12.5, user
 # decision): build_1db() never read s['voltage_latch'] at all, so mapping
 # anything to it in the GUI had zero effect - the real toggle-bit gating it
@@ -144,7 +169,14 @@ CHARGE_CHECKS = [
      'Require genuinely live (not cached/default) battery data before the charge ramp can start', 1),
 ]
 CHARGE_SLIDERS = [
-    ('charge_target_kw', 'Charger ramp target (kW)', 0, 92.2, 0.1, 92.2),
+    # Default 92.2->6.6kW (changed 2026-08-06) - 6.6kW is the Leaf's actual
+    # onboard AC charger ceiling (user-specified), now also the default
+    # ac_max_kw below; the ramp target is clamped into [ac_min_kw, ac_max_kw]
+    # at apply time (RealtimeEngine._apply_charge_ramp()) regardless of what
+    # this slider's own GUI bounds allow, so defaulting it to a real
+    # in-range AC value instead of an arbitrary-looking 92.2 matches what
+    # actually happens once the clamp runs.
+    ('charge_target_kw', 'Charger ramp target (kW)', 0, 92.2, 0.1, 6.6),
     ('chg_uprate_level', 'Uprate level / ramp rate (0-7)', 0, 7, 1, 7),
     # AC-charger-specific per-cell overvoltage taper (added 2026-08-01,
     # split from management_engine.py's charge_target_taper - user
@@ -153,11 +185,75 @@ CHARGE_SLIDERS = [
     # Defaulted to the same starting values as the regen taper - not yet
     # independently tuned, just no longer forced to share one curve.
     ('ac_full_v', 'AC charge full power below (V/cell)', 0, 5.0, 0.01, 4.00),
-    ('ac_zero_v', 'AC charge zero power at/above (V/cell)', 0, 5.0, 0.01, 4.15),
+    # Renamed ac_zero_v -> ac_min_v (2026-08-06, user directive after a real
+    # bench test - see management_engine.py's ac_charge_taper comment for
+    # the full rationale): this is no longer a true zero-power point. The
+    # taper now holds at ac_min_kw (below) instead of driving to 0kW - the
+    # vehicle no longer has to react to a literal 0kW request to actually
+    # stop; ac_cutoff_v (below) is the deliberate, explicit stop instead.
+    ('ac_min_v', 'AC charge minimum power at/above (V/cell) - holds at AC min kW, does not stop charging',
+     0, 5.0, 0.01, 4.15),
+    # New (2026-08-06, user directive: "rename zero power to minimum value
+    # and make a new value called cutoff or stop charging for a set
+    # voltage"): the taper ramps down to ac_min_kw as cell voltage climbs
+    # from ac_full_v to ac_min_v, HOLDS there, and only actually stops the
+    # session (full_charge_flag) once cell voltage reaches this separate,
+    # more extreme cutoff point. Deliberately an interior point of the
+    # already-researched safe envelope (below ac_emergency_v's 4.20V NMC
+    # ceiling), not a new external safety number.
+    ('ac_cutoff_v', 'AC charge stop-charging voltage (V/cell) - ends session (full_charge_flag)',
+     0, 5.0, 0.01, 4.18),
     # ac_emergency_v 4.30->4.20V (user edit, 2026-08-03, docs/13 item 15.4) -
     # matches charge_target_taper's regen-side emergency_high_v, set to the
     # standard NMC charge ceiling exactly (docs/05's researched 4.20V).
     ('ac_emergency_v', 'AC charge emergency high V (hard cut)', 0, 5.0, 0.01, 4.20),
+    # ac_recovery_ramp_s (fixed-time-constant hysteresis) added 2026-08-06,
+    # REMOVED the same day - superseded by ManagementEngine's dynamically-
+    # selected 0-7 uprate-level convergence rate (see
+    # bridge/management_engine.py's ac_charge_taper block and
+    # _select_ac_uprate_level()). A fixed time constant gave the taper
+    # uniform hysteresis regardless of how far it still had to move; a
+    # deeper look at the real bench log that prompted ac_recovery_ramp_s
+    # found the taper hunting in a full repeating cycle (not just a single
+    # jump), because "instant response, either direction" is the wrong
+    # control model for a CC-CV charging loop - the fix needed to be
+    # gentler the CLOSER it gets to the target, not a flat ramp time. Never
+    # reached a saved profile (confirmed via check_profile_drift.py), so no
+    # migration was needed for this removal.
+    # AC charge power request bounds (added 2026-08-06, user directive:
+    # "the maximum AC charging is only 6.6 kilowatt for the leaf... this
+    # needs to be configurable, min and max kW request for AC"). Clamps both
+    # the manual charge_target_kw ramp target AND the AC taper's floor -
+    # see RealtimeEngine._apply_charge_ramp() and management_engine.py's
+    # ac_charge_taper. 6.6kW is the Leaf's actual onboard AC charger ceiling
+    # (user-specified); 0.5kW is a low but nonzero default floor.
+    ('ac_min_kw', 'AC charge minimum power request (kW)', 0, 92.2, 0.1, 0.5),
+    ('ac_max_kw', 'AC charge maximum power request (kW)', 0, 92.2, 0.1, 6.6),
+    # DC fast-charge power request bounds - PLACEHOLDER ONLY (added
+    # 2026-08-06, user directive, confirmed scope: "DC is a placeholder only
+    # - no active DC charging logic exists yet"). Not read by any active
+    # ramp/taper logic today (docs/10-open-questions.md #9: DC fast charging
+    # is a real pack capability, ~150kW/430A, not addressed anywhere in this
+    # project yet) - these fields exist so the config schema/GUI has a home
+    # for them when DC charging support is actually built, matching this
+    # project's "curated, named features" convention rather than adding a
+    # generic escape hatch later.
+    ('dc_min_kw', 'DC fast-charge minimum power request (kW) - PLACEHOLDER, not yet wired to any logic',
+     0, 250.0, 1.0, 5.0),
+    ('dc_max_kw', 'DC fast-charge maximum power request (kW) - PLACEHOLDER, not yet wired to any logic',
+     0, 250.0, 1.0, 50.0),
+    # QC (DC fast-charge) max SOC % ceiling for the GIDS/QC capacity display
+    # fields (moved here from state.vehicle 2026-08-08, user directive: "the
+    # 80% QC needs to be on the charge emulation" - alongside the DC
+    # placeholder fields above, since it's charging behavior, not a pack
+    # spec). Feeds mapping_engine.derive_capacity_outputs() - qc_full_wh/
+    # qc_remain_wh (0x59E) are capped here since real DC fast charging only
+    # usefully charges to roughly this point before CC-CV tapering makes the
+    # rest pointless. PROVISIONAL - no DC fast-charge testing done at all
+    # yet, same "documented, not confirmed" status as the DC placeholder
+    # fields above.
+    ('qc_max_soc_pct', 'QC (DC fast-charge) max SOC % - GIDS/QC capacity ceiling',
+     0, 100, 1, 80.0),
     # Moved here from management_engine.py's charge_target_taper
     # (2026-08-01 split) - the AC daily/extended SoC target only ever
     # mattered while actually plugged in (gated on charge_permission_input).
@@ -244,15 +340,23 @@ def clamp_state(s):
 
 # ── Flattened output registry (for the mapping GUI's output dropdown and the
 # dashboard) - 'source' is the CAN ID this signal is carried on, so it's easy
-# to tell which message a given output stands for (docs/08). ───────────────
+# to tell which message a given output stands for (docs/08). Skips
+# MANAGEMENT_EXCLUSIVE_KEYS (docs/13 item 16.3, fixed 2026-08-04) - these
+# stay in SLIDERS/CHECKS themselves (so DEFAULTS/RANGES/dashboard display
+# keep working), just excluded from this flattened mapping-target list, so
+# they can never be picked as a Signal Mapping tie's output. ───────────────
 def _build_output_registry():
     reg = []
     for group, sigs in SLIDERS.items():
         source = group.split(' ')[0]
         for key, label, lo, hi, step, default in sigs:
+            if key in MANAGEMENT_EXCLUSIVE_KEYS:
+                continue
             reg.append({'key': key, 'label': label, 'lo': lo, 'hi': hi, 'step': step,
                         'default': default, 'source': source, 'group': group})
     for key, label, default in CHECKS:
+        if key in MANAGEMENT_EXCLUSIVE_KEYS:
+            continue
         m = re.search(r'\((0x[0-9A-Fa-f]+)', label)
         source = m.group(1) if m else '?'
         reg.append({'key': key, 'label': label, 'lo': 0, 'hi': 1, 'step': 1,
@@ -261,11 +365,6 @@ def _build_output_registry():
 
 
 OUTPUT_SIGNALS = _build_output_registry()
-
-# Two-tier hard-cut relay signal, not itself in SLIDERS/CHECKS above since it's
-# driven exclusively by the battery-management layer, never a direct mapping
-# target: relay_cut_request (0x1DB) doubles as the HARD CUT signal when set
-# non-zero by an emergency-tier protection feature (docs/05).
 
 # ── Opaque generated tables/counters - never mapping targets, GUI checkbox
 # controls whether each is actually sent (default checked). ────────────────
@@ -370,6 +469,25 @@ CHG_END_STOP_S = 3.0
 CHG_STALL_TIMEOUT_S = 15.0
 CHG_CMD_IDLE = 100
 CHG_CMD_FRESH_S = 0.5
+
+# Sixth wind-down trigger, bridge-specific defensive addition (docs/07,
+# added 2026-08-06) - NOT a ported/confirmed real-Leaf value like the four
+# triggers above it, same category as the staleness watchdog's "fifth
+# trigger". Added after a real bench test ("Charging to xx% the restart"
+# log, 2026-08-05) showed the bridge staying awake and transmitting for
+# 100+ seconds straight with no explanation found in the captured traffic -
+# root cause not fully identified (docs/10 open question), but structurally
+# a bench rig with no ignition wiring can only ever rely on the
+# charge-session triggers (2/3/4 above) to ever wind down at all; if a real
+# run ever lands in a state where none of those resolve, there is currently
+# no fallback and the bridge would stay awake forever. This is that
+# fallback: if the Leaf bus has been COMPLETELY silent (no frame of any ID)
+# for this long, wind down regardless of any other trigger's state. Set
+# well above every other trigger's own timeout (CHG_STALL_TIMEOUT_S=15s) so
+# it never preempts a legitimate slower real condition - it can only fire
+# once every other trigger has already had time to act and traffic still
+# never resumed. Documented, NOT yet confirmed against a re-test (docs/11).
+BUS_SILENCE_TIMEOUT_S = 30.0
 
 
 # ── Frame builders (byte-verified against real captures, ported verbatim) ──

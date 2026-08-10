@@ -54,7 +54,25 @@ class SharedState:
         self.generated_enabled = {key: default for key, _, default in leaf_signals.GENERATED_SIGNALS}
 
         # Vehicle/battery generation selection.
-        self.vehicle = {'car_gen': 'ZE1', 'battery_gen': 'ZE1', 'battery_kwh': 40}
+        # usable_capacity_kwh/nameplate_capacity_ah (added 2026-08-08, docs/16
+        # parameter-clamping audit, nameplate split out same day per user
+        # follow-up) - RZ450e SOURCE-pack capacity spec used by
+        # mapping_engine.derive_capacity_outputs() (GIDS/QC capacity fields),
+        # not Leaf-side generation selection like the three keys above, but
+        # this dict is the closest existing "vehicle/pack spec" config
+        # surface. 64.0kWh usable / 72kWh gross is the user's own real pack
+        # number (also matches the publicly documented RZ450e/bZ4X spec, see
+        # docs/12 §6's "documented pack figure ~71.4 kWh / ~200 Ah nominal" -
+        # not yet independently bench-confirmed for THIS pack's actual
+        # buffer). nameplate_capacity_ah=201.00 matches mapping_engine.
+        # NAMEPLATE_CAPACITY_AH's own confirmed 100%-SOH baseline (docs/02) -
+        # was a hardcoded module constant until this same follow-up made it
+        # configurable (feeds the SOH fraction inside the GIDS formula).
+        # qc_max_soc_pct moved OUT of here the same day into
+        # state.charge_emulation (leaf_signals.CHARGE_SLIDERS) instead - it's
+        # charging behavior, not a pack spec, per user directive.
+        self.vehicle = {'car_gen': 'ZE1', 'battery_gen': 'ZE1', 'battery_kwh': 40,
+                         'usable_capacity_kwh': 64.0, 'nameplate_capacity_ah': 201.00}
 
         # Charger-request ramp emulation controls (docs/06), added
         # 2026-07-31 - user-adjustable, not RZ450e-driven, so (like

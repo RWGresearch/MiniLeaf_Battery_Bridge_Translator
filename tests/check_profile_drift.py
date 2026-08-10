@@ -53,7 +53,8 @@ def _generated_signals_defaults():
     return {k: v for k, _, v in leaf_signals.GENERATED_SIGNALS}
 
 
-VEHICLE_DEFAULTS = {'car_gen': 'ZE1', 'battery_gen': 'ZE1', 'battery_kwh': 40}
+VEHICLE_DEFAULTS = {'car_gen': 'ZE1', 'battery_gen': 'ZE1', 'battery_kwh': 40,
+                     'usable_capacity_kwh': 64.0, 'nameplate_capacity_ah': 201.00}
 
 
 def _diff_flat(label, profile_dict, default_dict, lines):

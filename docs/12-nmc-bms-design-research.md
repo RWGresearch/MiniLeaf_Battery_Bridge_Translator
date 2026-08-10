@@ -162,6 +162,14 @@ The sequence is consistent across the review literature (each stage's heat feeds
     protect against, anywhere near the pack's real current range — a materially bigger gap than
     "our envelope is gentle" originally suggested.
 
+**Addendum (2026-08-08, docs/16 parameter-clamping audit):** `discharge_power_taper`/
+`charge_target_taper` gained real configurable ceiling/floor fields (`discharge_min_kw`/
+`discharge_max_kw`, `regen_min_kw`/`regen_max_kw`) using the figures researched above.
+`discharge_max_kw` defaults to 110.0kW, matching the "80-110 kW peak" Leaf drive-power figure
+directly. `regen_max_kw` does **not** yet match the "~0.5C ≈ a few tens of kW" regen figure above —
+it ships at 70.0kW (the pre-existing static default) deliberately, to avoid a silent behavior change
+on rollout (user directive) — tune it down toward this section's own ~36kW estimate once ready.
+
 ## 7. Cell imbalance and balancing
 
 - Series cells drift apart (manufacturing spread, temperature gradients, self-discharge
@@ -233,7 +241,7 @@ still hold, just against the retuned numbers, called out inline below.
 ### Findings
 
 **F1 — Cold-charge block tested the WRONG temperature probe (bug-level). ✅ FIXED 2026-07-31.**
-`bridge/management_engine.py` used to block charging when `temp_max <= charge_low_block_f` — i.e.
+`bridge/management_engine.py` used to block charging when `temp_max <= charge_low_block_c` — i.e.
 charging was only blocked once the *hottest* probe was at/below 0°C. Research (§3) is unambiguous:
 cold-side decisions must use the **coldest** probe, because plating happens in the coldest cells.
 As written, a pack whose coldest corner was below freezing kept accepting charge/regen as long as
@@ -267,10 +275,11 @@ freezing line — and the 100×-cycle-life-collapse data point shows cold chargi
 well above 0°C at rates far below "fast charge." Our mitigating factor: 0.09C AC charging is
 negligible-risk at any above-freezing temperature. Our exposure: **regen into a cold-soaked pack**
 (up to ~0.5C, §6), which is exactly the scenario production EVs limit regen for. Added
-`charge_derate_low_start_f` (10°C/50°F default) — charge/regen acceptance now ramps from 0% at the
+`charge_derate_low_start_c` (10°C default) — charge/regen acceptance now ramps from 0% at the
 existing 0°C block up to 100% at this new point, reusing the same `_ramp_factor` mechanism the
-hot-side derate already uses, keyed on `temp_min` per F1. Unit-tested at the midpoint (41°F →
-~50% factor) and above the window (60°F → full power).
+hot-side derate already uses, keyed on `temp_min` per F1. Unit-tested at the midpoint (5°C →
+~50% factor) and above the window (15.6°C → full power). (Field renamed from `charge_derate_low_
+start_f` and re-stored in °C, 2026-08-09 - same physical thresholds, no behavior change.)
 
 **F4 — No cell-spread (ΔV) monitoring/alert. ✅ IMPLEMENTED 2026-07-31, monitor-only by design.**
 We watch worst-cell extremes but never watched the *spread* itself (§7). We can't balance, but a
@@ -300,14 +309,16 @@ ceiling was doing double duty as the hard-cut trigger. ✅ FIXED 2026-07-31.** T
 existed in `05`'s table ("Emergency over/under-voltage **or over-temp** → hard cut") but the
 researched-defaults table only ever defined emergency defaults for voltage (2.80 V / 4.30 V) — no
 emergency temperature number existed, and the code asserted a hard cut directly at
-`discharge_hard_stop_f`/`charge_hard_stop_f` (the soft ramp's own ceiling), contradicting this
+`discharge_hard_stop_c`/`charge_hard_stop_c` (the soft ramp's own ceiling), contradicting this
 feature's "Soft (ramp)" tier label. Fixed: both hard-stop values are now pure soft ramp-to-zero
-points; a new `emergency_temp_f` (65°C/149°F default, **tightened 2026-08-01 to 61°C/141.8°F**) is
+points; a new `emergency_temp_c` (65°C default, **tightened 2026-08-01 to 61°C**) is
 the actual hard-cut trigger, mirroring
 the two-tier soft/emergency structure the voltage features already have. Deliberately close above
 the 60°C soft stop — self-heating onset for a cell with plated lithium can begin as low as ~60°C
-(§5), leaving very little real margin. Unit-tested: at exactly 140°F (the old combined threshold),
-discharge power now reaches zero WITHOUT a hard cut; at 150°F, a hard cut correctly fires. **Not
+(§5), leaving very little real margin. Unit-tested: at exactly 60°C (the old combined threshold),
+discharge power now reaches zero WITHOUT a hard cut; at 65.6°C, a hard cut correctly fires. (Fields
+renamed from `_f` to `_c`/re-stored in °C, 2026-08-09 - same physical thresholds, no behavior
+change.) **Not
 implemented**: dT/dt (rate-of-rise) + unexplained-voltage-drop as a recognized early runaway
 signature (§5) — still a candidate monitor/warn-tier feature, not built this pass.
 

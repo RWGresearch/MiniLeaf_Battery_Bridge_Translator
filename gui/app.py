@@ -6,6 +6,8 @@ canvas-based widgets made the app noticeably slower to load than the
 reference apps' plain-tkinter style, which is what the user actually wants
 back - see gui/theme.py)."""
 import collections
+import json
+import os
 import queue
 import time
 import tkinter as tk
@@ -24,7 +26,7 @@ from gui.info_popup import help_btn
 from gui.theme import apply_style, ACC, BASE_FONT, BG, ERR, FG_DIM, FIELD, FG, OK
 from gui.panels import (ConnectionsPanel, LiveMonitorPanel, MappingPanel, ManagementPanel,
                          GeneratedSignalsPanel, ChargeEmulationPanel, FuturePlaceholderPanel, VehiclePanel,
-                         input_monitor_text, leaf_tx_monitor_text,
+                         write_input_monitor, write_leaf_tx_monitor,
                          RZ450E_CONN_HELP, LEAF_CONN_HELP, BRIDGE_CONTROL_HELP)
 
 BRIDGE_STATUS_STYLE = {
@@ -67,6 +69,15 @@ class App(tk.Tk):
         self.dashboard = None
         self.fault_window = None
         self.trc_logger = TrcLogger()
+        # Companion "<name>_log_output.txt" file (added 2026-08-08, user
+        # request) - opened/closed alongside the .trc capture, never written
+        # into the .trc file itself. Holds a one-time settings snapshot at
+        # Start Log time plus a live mirror of every Log-panel line from that
+        # point on (see _drain_log) - on-the-fly setting changes already log
+        # a line there (ManagementPanel/ChargeEmulationPanel's log_fn calls),
+        # so no separate change-tracking is needed for those, per user
+        # directive.
+        self._log_output_fh = None
 
         self.state_model = SharedState()
         profile = config_profile.load_profile()
@@ -138,6 +149,8 @@ class App(tk.Tk):
             self.logbox.insert('end', formatted)
             self.logbox.see('end')
             self.logbox.configure(state='disabled')
+            if self._log_output_fh:
+                self._log_output_fh.write(formatted)
         self.after(200, self._drain_log)
 
     def _build_log_panel(self):
@@ -170,13 +183,15 @@ class App(tk.Tk):
             self.rz_bus.trc_logger = None
             self.leaf_bus.trc_logger = None
             self.engine.trc_logger = None
+            self._stop_log_output()
             self.trc_log_btn.configure(text='Start Log')
             self.trc_log_status.configure(text='not logging', foreground=FG_DIM)
             self.log('TRC capture stopped.')
             return
         ts = time.strftime('%Y%m%d_%H%M%S')
+        config_profile._ensure_logs_dir()
         path = filedialog.asksaveasfilename(
-            defaultextension='.trc', initialdir=config_profile.CONFIG_DIR,
+            defaultextension='.trc', initialdir=config_profile.LOGS_DIR,
             filetypes=[('PCAN Trace', '*.trc'), ('All', '*.*')],
             initialfile=f'minileaf_{ts}.trc')
         if not path:
@@ -185,9 +200,38 @@ class App(tk.Tk):
         self.rz_bus.trc_logger = self.trc_logger
         self.leaf_bus.trc_logger = self.trc_logger
         self.engine.trc_logger = self.trc_logger
+        self._start_log_output(path)
         self.trc_log_btn.configure(text='Stop Log')
         self.trc_log_status.configure(text=f'logging: {path}', foreground=OK)
         self.log(f'TRC capture started: {path}')
+
+    def _log_output_path(self, trc_path):
+        base, _ext = os.path.splitext(trc_path)
+        return base + '_log_output.txt'
+
+    def _start_log_output(self, trc_path):
+        """Opens the '<name>_log_output.txt' companion file next to the .trc
+        capture (user request 2026-08-08) - never touches the .trc file
+        itself. Writes a one-time settings snapshot (same dict shape as a
+        saved profile, config_profile.build_profile_dict) up front, then
+        _drain_log appends every Log-panel line from this point on, line-
+        buffered so a line is actually on disk shortly after it's logged
+        rather than sitting in a buffer until Stop Log/app close."""
+        out_path = self._log_output_path(trc_path)
+        fh = open(out_path, 'w', buffering=1)
+        fh.write(f'MiniLeaf Battery Bridge Translator - log output for {os.path.basename(trc_path)}\n')
+        fh.write(f'Started: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+        fh.write('\n--- Settings snapshot at log start ---\n')
+        profile = config_profile.build_profile_dict(self.state_model, self.mapping, self.management)
+        fh.write(json.dumps(profile, indent=2))
+        fh.write('\n\n--- Live log (mirrors the Log panel from this point forward) ---\n')
+        self._log_output_fh = fh
+        self.log(f'Log output started: {out_path}')
+
+    def _stop_log_output(self):
+        fh, self._log_output_fh = self._log_output_fh, None
+        if fh:
+            fh.close()
 
     # ── Left: RZ450e battery (inputs) ───────────────────────────────────
     def _build_left(self):
@@ -216,7 +260,7 @@ class App(tk.Tk):
                           help_text=RZ450E_CONN_HELP
                           ).grid(row=1, column=0, sticky='ew', padx=4, pady=2)
 
-        LiveMonitorPanel(left, 'Live decoded values', lambda: input_monitor_text(self.state_model)
+        LiveMonitorPanel(left, 'Live decoded values', lambda box: write_input_monitor(box, self.state_model)
                           ).grid(row=2, column=0, sticky='nsew', padx=4, pady=4)
 
     # ── Middle: mapping & management (the configurator) ────────────────
@@ -277,7 +321,7 @@ class App(tk.Tk):
         ManagementPanel(t_mgmt, self.state_model, self.management, log_fn=self.log).pack(fill='both', expand=True)
         GeneratedSignalsPanel(t_gen, self.state_model).pack(fill='both', expand=True)
         ChargeEmulationPanel(t_charge, self.state_model, log_fn=self.log, engine=self.engine).pack(fill='both', expand=True)
-        FuturePlaceholderPanel(t_future).pack(fill='both', expand=True)
+        FuturePlaceholderPanel(t_future, self.state_model).pack(fill='both', expand=True)
 
     # ── Right: Leaf emulator (outputs) ──────────────────────────────────
     def _build_right(self):
@@ -292,7 +336,7 @@ class App(tk.Tk):
                           allow_listen_only=False, help_text=LEAF_CONN_HELP
                           ).grid(row=1, column=0, sticky='ew', padx=4, pady=2)
         VehiclePanel(right, self.state_model).grid(row=2, column=0, sticky='ew', padx=4, pady=2)
-        LiveMonitorPanel(right, 'Live transmitted values', lambda: leaf_tx_monitor_text(self.state_model)
+        LiveMonitorPanel(right, 'Live transmitted values', lambda box: write_leaf_tx_monitor(box, self.state_model)
                           ).grid(row=3, column=0, sticky='nsew', padx=4, pady=4)
 
     # ── Dashboard ────────────────────────────────────────────────────────
@@ -368,6 +412,7 @@ class App(tk.Tk):
     def _on_close(self):
         if self.trc_logger.active:
             self.trc_logger.stop()
+            self._stop_log_output()
         self.engine.stop()
         # Cleanly disconnect both CAN adapters (added 2026-08-01) - the
         # engine's RX/TX worker threads are daemon threads, so previously

@@ -110,6 +110,121 @@ def test_charge_emulation_profile_load_clamps_out_of_bounds():
           state.charge_emulation['ac_full_v'] == hi, f"got {state.charge_emulation['ac_full_v']}")
 
 
+# ── vehicle profile-load validation (added 2026-08-08, docs/16 audit): the
+# two capacity-formula fields (usable_capacity_kwh/nameplate_capacity_ah) get
+# the same bounds-clamp treatment every other profile-loaded numeric field
+# already has - previously state.vehicle had ZERO profile-load validation
+# at all (a real, pre-existing gap this change also closes). qc_max_soc_pct
+# moved OUT of state.vehicle the same day (user directive: "the 80% QC needs
+# to be on the charge emulation") into state.charge_emulation instead - it
+# gets the pre-existing _apply_charge_emulation()/CHARGE_EMULATION_BOUNDS
+# clamp path automatically, tested separately below. ───────────────────────
+def test_vehicle_profile_load_clamps_out_of_bounds_capacity_fields():
+    from bridge.mapping_engine import VEHICLE_FIELD_BOUNDS
+    state = SharedState()
+    config_profile._apply_vehicle(state, {'usable_capacity_kwh': 9999.0, 'nameplate_capacity_ah': -5.0})
+    check('a wildly out-of-bounds usable_capacity_kwh from profile.json is clamped to its max',
+          state.vehicle['usable_capacity_kwh'] == VEHICLE_FIELD_BOUNDS['usable_capacity_kwh'][1],
+          f"got {state.vehicle['usable_capacity_kwh']}")
+    check('a negative nameplate_capacity_ah from profile.json is clamped to its min (0.0)',
+          state.vehicle['nameplate_capacity_ah'] == VEHICLE_FIELD_BOUNDS['nameplate_capacity_ah'][0],
+          f"got {state.vehicle['nameplate_capacity_ah']}")
+
+
+def test_vehicle_profile_load_keeps_a_valid_in_range_edit():
+    state = SharedState()
+    config_profile._apply_vehicle(state, {'usable_capacity_kwh': 60.0, 'nameplate_capacity_ah': 195.0})
+    check('a legitimate, in-range usable_capacity_kwh edit is NOT altered by the clamp',
+          state.vehicle['usable_capacity_kwh'] == 60.0, f"got {state.vehicle['usable_capacity_kwh']}")
+    check('a legitimate, in-range nameplate_capacity_ah edit is NOT altered by the clamp',
+          state.vehicle['nameplate_capacity_ah'] == 195.0, f"got {state.vehicle['nameplate_capacity_ah']}")
+
+
+def test_vehicle_profile_load_survives_non_numeric_corruption():
+    state = SharedState()
+    default = dict(state.vehicle)
+    config_profile._apply_vehicle(state, {'usable_capacity_kwh': 'not-a-number'})
+    check('a non-numeric corrupted usable_capacity_kwh falls back to the safe default, not garbage',
+          state.vehicle['usable_capacity_kwh'] == default['usable_capacity_kwh'],
+          f"got {state.vehicle['usable_capacity_kwh']}")
+
+
+def test_vehicle_profile_load_car_gen_fields_unclamped():
+    # car_gen/battery_gen/battery_kwh are enum-like/int selections, not
+    # continuous values - they deliberately keep the original unclamped
+    # dict.update() path (no VEHICLE_FIELD_BOUNDS entry for them at all).
+    state = SharedState()
+    config_profile._apply_vehicle(state, {'car_gen': 'AZE0', 'battery_kwh': 62})
+    check('car_gen still applies via the unclamped path', state.vehicle['car_gen'] == 'AZE0')
+    check('battery_kwh still applies via the unclamped path', state.vehicle['battery_kwh'] == 62)
+
+
+def test_qc_max_soc_pct_profile_load_clamps_out_of_bounds():
+    # qc_max_soc_pct lives in state.charge_emulation (leaf_signals.
+    # CHARGE_SLIDERS), not state.vehicle - uses the pre-existing
+    # _apply_charge_emulation()/CHARGE_EMULATION_BOUNDS path, same as
+    # ac_min_kw/ac_max_kw/dc_min_kw/dc_max_kw.
+    from bridge import leaf_signals
+    state = SharedState()
+    config_profile._apply_charge_emulation(state, {'qc_max_soc_pct': 150.0})
+    lo, hi = leaf_signals.CHARGE_EMULATION_BOUNDS['qc_max_soc_pct']
+    check('an out-of-bounds qc_max_soc_pct from profile.json is clamped to its max',
+          state.charge_emulation['qc_max_soc_pct'] == hi, f"got {state.charge_emulation['qc_max_soc_pct']}")
+
+
+def test_vehicle_round_trips_through_save_and_load():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, 'profile.json')
+        state = SharedState()
+        state.vehicle['usable_capacity_kwh'] = 55.0
+        state.vehicle['nameplate_capacity_ah'] = 198.0
+        state.charge_emulation['qc_max_soc_pct'] = 90.0
+        from bridge.mapping_engine import MappingEngine
+        from bridge.management_engine import ManagementEngine as ME
+        config_profile.save_profile(state, MappingEngine(), ME(), path=path)
+
+        loaded_state = SharedState()
+        profile = config_profile.load_profile(path=path)
+        config_profile.apply_profile(profile, loaded_state)
+        check('usable_capacity_kwh round-trips through save -> load unchanged',
+              loaded_state.vehicle['usable_capacity_kwh'] == 55.0,
+              f"got {loaded_state.vehicle['usable_capacity_kwh']}")
+        check('nameplate_capacity_ah round-trips through save -> load unchanged',
+              loaded_state.vehicle['nameplate_capacity_ah'] == 198.0,
+              f"got {loaded_state.vehicle['nameplate_capacity_ah']}")
+        check('qc_max_soc_pct round-trips through save -> load unchanged',
+              loaded_state.charge_emulation['qc_max_soc_pct'] == 90.0,
+              f"got {loaded_state.charge_emulation['qc_max_soc_pct']}")
+
+
+def test_qc_max_soc_pct_migrates_from_old_vehicle_section():
+    # One-time migration (added 2026-08-08, same day qc_max_soc_pct moved
+    # from 'vehicle' to 'charge_emulation') - a profile saved during the
+    # brief window it lived in 'vehicle' must not silently lose a real
+    # tuned value, same precedent as the pre-existing ac_zero_v -> ac_min_v
+    # migration.
+    state = SharedState()
+    profile = {'vehicle': {'car_gen': 'ZE1', 'battery_gen': 'ZE1', 'battery_kwh': 40,
+                            'qc_max_soc_pct': 65.0},
+               'charge_emulation': {}}
+    config_profile.apply_profile(profile, state)
+    check('a legacy vehicle.qc_max_soc_pct value migrates into charge_emulation.qc_max_soc_pct',
+          state.charge_emulation['qc_max_soc_pct'] == 65.0,
+          f"got {state.charge_emulation['qc_max_soc_pct']}")
+    check('the legacy key does not also stick around in state.vehicle',
+          'qc_max_soc_pct' not in state.vehicle)
+
+
+def test_qc_max_soc_pct_migration_does_not_override_an_explicit_new_value():
+    state = SharedState()
+    profile = {'vehicle': {'qc_max_soc_pct': 65.0},   # stale legacy value
+               'charge_emulation': {'qc_max_soc_pct': 70.0}}   # genuinely re-saved value
+    config_profile.apply_profile(profile, state)
+    check('an explicitly-saved charge_emulation.qc_max_soc_pct wins over the stale legacy vehicle one',
+          state.charge_emulation['qc_max_soc_pct'] == 70.0,
+          f"got {state.charge_emulation['qc_max_soc_pct']}")
+
+
 if __name__ == '__main__':
     for fn in [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]:
         fn()

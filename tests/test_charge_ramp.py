@@ -62,8 +62,8 @@ def _seed_fresh_battery_data(state):
     helper to keep passing under the new, stricter default."""
     for i in range(1, 97):
         state.update_input(f'cell_{i:02d}', 3.80)
-    state.update_input('temp_max', 77.0)
-    state.update_input('temp_min', 75.0)
+    state.update_input('temp_max', 25.0)
+    state.update_input('temp_min', 23.9)
 
 
 # ── ShutdownSequencer.charge_active() - the shared 0x1F2 detection ─────────
@@ -220,7 +220,7 @@ def test_charger_limit_kw_safety_taper_applies_even_without_rz450e_interlock():
     rz = SharedState()
     for i in range(1, 97):
         rz.update_input(f'cell_{i:02d}', 4.35)   # above the 4.20V emergency-high default
-    rz.update_input('temp_max', 77.0)
+    rz.update_input('temp_max', 25.0)
     rz.update_input('current', 0.0)
     rz.update_input('charge_permission_input', 0.0)   # RZ450e interlock NOT active
 
@@ -242,7 +242,7 @@ def test_charger_limit_kw_proactive_taper_applies_without_interlock_too():
     rz = SharedState()
     for i in range(1, 97):
         rz.update_input(f'cell_{i:02d}', 4.075)   # inside the 4.00-4.15V AC-charger taper window (~50%)
-    rz.update_input('temp_max', 77.0)
+    rz.update_input('temp_max', 25.0)
     rz.update_input('current', 0.0)
     rz.update_input('charge_permission_input', 0.0)
 
