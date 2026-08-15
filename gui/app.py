@@ -25,7 +25,8 @@ from gui.fault_history_window import FaultHistoryWindow
 from gui.info_popup import help_btn
 from gui.theme import apply_style, ACC, BASE_FONT, BG, ERR, FG_DIM, FIELD, FG, OK
 from gui.panels import (ConnectionsPanel, LiveMonitorPanel, MappingPanel, ManagementPanel,
-                         GeneratedSignalsPanel, ChargeEmulationPanel, FuturePlaceholderPanel, VehiclePanel,
+                         GeneratedSignalsPanel, ChargeEmulationPanel, EngineTimingPanel,
+                         FuturePlaceholderPanel, VehiclePanel,
                          write_input_monitor, write_leaf_tx_monitor,
                          RZ450E_CONN_HELP, LEAF_CONN_HELP, BRIDGE_CONTROL_HELP)
 
@@ -310,17 +311,20 @@ class App(tk.Tk):
         t_mgmt = ttk.Frame(tabs)
         t_gen = ttk.Frame(tabs)
         t_charge = ttk.Frame(tabs)
+        t_timing = ttk.Frame(tabs)
         t_future = ttk.Frame(tabs)
         tabs.add(t_map, text='Signal Mapping')
         tabs.add(t_mgmt, text='Battery Management')
         tabs.add(t_gen, text='Generated Signals')
         tabs.add(t_charge, text='Charge Emulation')
+        tabs.add(t_timing, text='Timing')
         tabs.add(t_future, text='Future: Battery Requests')
 
         MappingPanel(t_map, self.state_model, self.mapping).pack(fill='both', expand=True)
         ManagementPanel(t_mgmt, self.state_model, self.management, log_fn=self.log).pack(fill='both', expand=True)
         GeneratedSignalsPanel(t_gen, self.state_model).pack(fill='both', expand=True)
         ChargeEmulationPanel(t_charge, self.state_model, log_fn=self.log, engine=self.engine).pack(fill='both', expand=True)
+        EngineTimingPanel(t_timing, self.state_model, log_fn=self.log).pack(fill='both', expand=True)
         FuturePlaceholderPanel(t_future, self.state_model).pack(fill='both', expand=True)
 
     # ── Right: Leaf emulator (outputs) ──────────────────────────────────

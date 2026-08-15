@@ -89,14 +89,16 @@ against this specific pack per `11-manual-verification-checklist.md`.)
 | Feature | Source signal(s) | Config | Cut tier | Drives |
 |---|---|---|---|---|
 | Low-voltage cutoff, cell-voltage authoritative | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, authoritative) + pack `cell_min` (`0x020`, sanity check) + SoC (DID `0x1F5B`, backup check only, never acts alone) | min-cell-voltage cutoff, soft-cut persistence window, min SoC % (backup), emergency low voltage | Soft (persistence-qualified) → Hard | `capacity_empty` then `relay_cut_request` |
-| Discharge power taper | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, primary) | full-power voltage, zero-power voltage, recovery-ramp time (fast-attack/slow-release hysteresis), min/max discharge power request (`discharge_min_kw`/`discharge_max_kw`, added 2026-08-08) | Soft (ramp, floored/ceilinged at the configured min/max) | `discharge power limit` |
-| Charge/regen power limit (`charge_target_taper`, 2026-08-01 split — regen only) | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, primary) + pack `cell_max` (`0x020`, sanity check) | full-power voltage, zero-power voltage (proactive taper), emergency voltage, min/max regen power request (`regen_min_kw`/`regen_max_kw`, added 2026-08-08) | Soft (ramp, floored/ceilinged at the configured min/max) → Hard (emergency tier bypasses the floor - always literal zero) | `charge_limit_kw` ONLY — active regardless of charging context (driving or plugged in) |
+| Discharge power taper | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, secondary/quick-cutoff) + SoC (DID `0x1F5B`, primary/smoothing, added 2026-08-13) | full-power voltage, min-power voltage (`taper_min_v`, renamed from `taper_zero_v` 2026-08-13 — the floor is a configurable `discharge_min_kw`, not necessarily literal zero), full-power SoC%/min-power SoC% (`taper_start_soc_pct`/`taper_min_soc_pct`, added 2026-08-13), recovery-ramp time (fast-attack/slow-release hysteresis), min/max discharge power request (`discharge_min_kw`/`discharge_max_kw`, added 2026-08-08) | Soft (ramp, floored/ceilinged at the configured min/max) | `discharge power limit` |
+| Charge/regen power limit (`charge_target_taper`, 2026-08-01 split — regen only) | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, secondary/quick-cutoff) + pack `cell_max` (`0x020`, sanity check) + SoC (DID `0x1F5B`, primary/smoothing, added 2026-08-13) | full-power voltage, min-power voltage (`regen_min_v`, renamed from `regen_zero_v` 2026-08-13, same reasoning as the discharge taper's rename — proactive taper), full-power SoC%/min-power SoC% (`regen_full_soc_pct`/`regen_min_soc_pct`, added 2026-08-13), emergency voltage (voltage-only, unaffected by SoC), min/max regen power request (`regen_min_kw`/`regen_max_kw`, added 2026-08-08) | Soft (ramp, floored/ceilinged at the configured min/max) → Hard (emergency tier bypasses the floor - always literal zero) | `charge_limit_kw` ONLY — active regardless of charging context (driving or plugged in) |
 | AC charge target + taper (`ac_charge_taper`, 2026-08-01 split, reworked 2026-08-06, charging-only gating tightened 2026-08-07 — lives in `charge_emulation`, AC-charger only) | RZ450e per-cell voltages (`0x4A9`/`0x4C0`, primary) + SoC (DID `0x1F5B`) + `charge_permission_input` (`0x358`, gates the WHOLE feature — while inactive, `charger_limit_kw` is left untouched, not just the target/flag) | full-power voltage, minimum-power voltage, stop-charging cutoff voltage, emergency voltage, min/max AC kW request, daily target %, extended target % | Soft (ramp to a min-kW floor, dynamically-selected 0-7 convergence rate — not a fixed hysteresis time) → deliberate stop (cutoff voltage or target SoC) → Hard, all only while `charge_permission_input` is active | `charger_limit_kw` (floored at `ac_min_kw`, not zero) and `full_charge_flag` at the stop-charging cutoff voltage OR target SoC |
-| Over-temperature derate | RZ450e `temp_max` (hottest probe) + `temp_min` (coldest probe, cold-side charge decisions only) (fast, `0x4AA`/`0x4A7`) | cold-derate-start/low-block temps (coldest probe), charge derate-start/hard-stop temps (hottest probe), discharge derate-start/hard-stop temps (hottest probe), emergency temp (hottest probe) | Soft (ramp, both hot and cold side) → Hard | `discharge power limit`, `charge power limit` then `relay_cut_request` |
+| Over-temperature derate | RZ450e `temp_max` (hottest probe) + `temp_min` (coldest probe, cold-side charge decisions only) (fast, `0x4AA`/`0x4A7`) | cold-derate-start/low-block temps (coldest probe), charge derate-start/hard-stop temps (hottest probe), discharge derate-start/hard-stop temps (hottest probe), emergency temp (hottest probe) | Soft (ramp, both hot and cold side) → Hard | `discharge power limit`, `charge power limit` (regen ONLY as of 2026-08-11, see below) then, at the emergency tier only, `charger_limit_kw` too plus `relay_cut_request` |
+| AC charger temperature derate (`ac_charge_temp_derate`, added 2026-08-11 — lives in `charge_emulation`, AC-charger only) | RZ450e `temp_max`/`temp_min` (fast, `0x4AA`/`0x4A7`) + `charge_permission_input` (`0x358`, gates the WHOLE feature — while inactive, `charger_limit_kw` is left untouched) | cold-derate-start/low-block temps (coldest probe), derate-start/hard-stop temps (hottest probe) — independently tunable from the driving-mode thresholds above | Soft (ramp, both hot and cold side) → deliberate stop (hard-stop temp reached) | `charger_limit_kw` ONLY, only while `charge_permission_input` is active; hot-side hard-stop also sets `full_charge_flag` (session ends, unplug/replug to resume) — cold-side does not latch, auto-resumes as the pack warms |
 | Cell imbalance monitor (added 2026-07-31) | All 96 RZ450e per-cell voltages (`0x4A9`/`0x4C0`) | warn-spread threshold | **Monitor only — never cuts or derates** | status text only |
 | Overcurrent monitor (added 2026-07-31) | RZ450e `current` (fast, `0x023`) | continuous discharge/charge warn thresholds, persistence window | **Monitor only — never cuts or derates** | status text only |
 | Cell data cross-check (added 2026-08-03) | Per-cell voltages (`0x4A9`/`0x4C0`) vs. pack `cell_min`/`cell_max` summary (`0x020`) | max allowed disagreement, soft-cut delay, hard escalation delay | Soft → Hard | `capacity_empty` then `relay_cut_request` — catches the per-cell broadcast and the pack summary silently disagreeing (e.g. a decode fault on one source), which neither source alone would detect |
 | Temperature data cross-check (added 2026-08-04) | Pack temp extremes (`0x4A7` `temp_max`/`temp_min`) vs. all 16 individual temp probes (`0x4AA` `temp_01`-`temp_16`) | max allowed disagreement, soft-cut delay, hard escalation delay | Soft → Hard | `capacity_empty` then `relay_cut_request` — same pattern as the cell data cross-check above, applied to temperature: catches a decode/mux fault that individually passes `PLAUSIBLE_RANGES` but is physically inconsistent with the 16 probes it's presumably derived from, which matters specifically because `temp_min` drives the cold-side plating-prevention logic below |
+| Temp probe cross-check (added 2026-08-14) | DID `0x1814` per-probe temps (`temp_01_did`-`temp_16_did`, primary) vs. `0x4AA` CAN per-probe temps (`temp_01_can`-`temp_16_can`, backup) — the SAME 16 physical probes, two sources | max allowed disagreement, soft-cut delay, hard escalation delay | Soft → Hard | `capacity_empty` then `relay_cut_request` — user directive ("add the cross check. this is key to make sure we have good data"), added alongside making DID `0x1814` the PRIMARY source for `temp_01`-`temp_16` (see `02-source-signals-rz450e.md`). Distinct from the temperature data cross-check above (which only compares the `0x4A7` pack-extremes summary against the probe array as a whole) — this compares each probe against ITSELF, DID reading vs. CAN reading, catching a bad/stuck probe on either source that the extremes-only check could miss if it isn't currently the pack's hottest/coldest |
 | Staleness watchdog | `0x358`/`0x3F1` alive counters, `0x424` tick, Toyota checksums | per-group timeout (soft, then hard after a short escalation window) | **Soft → Hard** | `capacity_empty` (+ `full_charge_flag`, added 2026-08-03) then `relay_cut_request` — see `06-realtime-engine-and-watchdog.md` |
 | Charge-start data gate (`require_live_data_to_charge`, added 2026-08-03) | Every per-cell voltage + `temp_max`/`temp_min`, checked against the current bridge session's start time | on/off only (default on) | N/A — one-time startup gate, not an ongoing cut | Blocks the charger ramp from starting at all until genuinely live data has arrived this session; see "Charge-start data gate" section below |
 | Input plausibility validation (`input_validation`, given a real toggle 2026-08-03) | Every decoded RZ450e value, checked against `PLAUSIBLE_RANGES` | on/off only (default on) | N/A — an ingest-side data-integrity gate, not a cutoff | A rejected value is simply never written to live state at all — it keeps aging under its last-good value, eventually caught by the staleness watchdog if sustained. See `02-source-signals-rz450e.md`. Was always-on with no config until 2026-08-03; kept as an editable feature so a deliberately-corrupted test value can be pushed through to confirm downstream handling. |
@@ -110,18 +112,24 @@ against this specific pack per `11-manual-verification-checklist.md`.)
 | Min cell voltage cutoff (soft → `capacity_empty`) | 3.00 V | standard NMC BMS floor, margin above the ~2.5V permanent-damage line |
 | Emergency low-voltage (hard cut) | 2.60 V | user edit, 2026-08-01 — second, more extreme tier, before the damage line (was 2.80V) |
 | Discharge taper: full power at/above | 3.00 V | user edit, 2026-08-01 — re-anchored to `low_voltage_cutoff`'s soft-cut floor (was 3.50V) |
-| Discharge taper: zero power at/below | 2.60 V | user edit, 2026-08-01 — matches the emergency low-voltage tier (was 3.00V), so discharge power reaches zero right around where the cutoff tiers sit |
+| Discharge taper: min power at/below (`taper_min_v`, renamed from `taper_zero_v` 2026-08-13) | 2.60 V | user edit, 2026-08-01 — matches the emergency low-voltage tier (was 3.00V), so discharge power reaches its floor right around where the cutoff tiers sit. Renamed 2026-08-13 once `discharge_min_kw` (below) made the floor a configurable value, not necessarily literal zero — same reasoning as `ac_zero_v` → `ac_min_v` (see "AC charger taper rework" below) |
 | Discharge taper: recovery ramp | 3.0 s | user-specified — deliberately slow (vs. the instant fast-attack on a dip) to avoid the power limit hunting/oscillating if cell voltage bounces near the threshold under intermittent acceleration |
+| Discharge taper SoC: full power at/above (`taper_start_soc_pct`, added 2026-08-13) | 20% | new field, not yet researched/real-hardware-confirmed (docs/11) — primary/smoothing input, combined with the voltage taper via `min()`, see "SoC + voltage combined taper" section below |
+| Discharge taper SoC: min power at/below (`taper_min_soc_pct`, added 2026-08-13) | 8% | new field — deliberately matches `low_voltage_cutoff`'s own `min_soc_pct` backup-check floor, same pairing `taper_min_v` already has with `min_cell_v` |
 | Discharge min/max power request (`discharge_min_kw`/`discharge_max_kw`, added 2026-08-08) | 0.0 kW / 110.0 kW (code default; user's own saved profile currently runs 5.0/40.0 kW) | `discharge_max_kw` is researched: `docs/12-nmc-bms-design-research.md` §6 puts real Leaf drive power at "80-110 kW peak ≈ 1.1-1.6C discharge peak — well within NMC capability" — 110.0 sits at the top of that range. `discharge_min_kw`=0.0 preserves the pre-existing true-zero floor behavior exactly (no behavior change on rollout). **Real-hardware finding (2026-08-09, real ZE1 40kWh Leaf)**: the vehicle's dash reacts to `discharge_limit_kw` on its own — around a 40kW setting the turtle (reduced-power) icon comes on, and below roughly 3kW the car starts turning off power systems entirely. This is the Leaf's own reaction to the transmitted value, not a bug in the taper; not yet swept for the exact real thresholds, documented starting point only (docs/11). See `docs/15` B8 / `docs/16` A2. |
 | Regen full power at/below (proactive taper start, `charge_target_taper`) | 4.00 V | as of the 2026-08-01 regen/AC split; deliberately well below the ~4.20V NMC ceiling, since the VCM is slow to respond to a `charge_limit_kw` change and the taper must act well ahead of the danger zone, not at its edge |
-| Regen zero power at/above (proactive taper end, `charge_target_taper`) | 4.15 V | as of the 2026-08-01 regen/AC split; still under the standard 4.20V NMC ceiling, so regen is fully backed off before a cell is anywhere near its actual limit |
-| Regen emergency high-voltage (hard cut, `charge_target_taper`) | 4.20 V | user edit, 2026-08-03 (was 4.30V) — set to the standard NMC charge ceiling exactly, tightening the margin above the 4.15V zero-regen point to 0.05V; second tier, above the zero-regen point — if a cell keeps climbing after regen is already at zero, something else is charging it |
+| Regen min power at/above (proactive taper end, `regen_min_v`, renamed from `regen_zero_v` 2026-08-13, `charge_target_taper`) | 4.15 V | as of the 2026-08-01 regen/AC split; still under the standard 4.20V NMC ceiling, so regen is fully backed off before a cell is anywhere near its actual limit. Renamed 2026-08-13, same reasoning as the discharge taper's `taper_zero_v` → `taper_min_v` rename above |
+| Regen emergency high-voltage (hard cut, `charge_target_taper`) | 4.20 V | user edit, 2026-08-03 (was 4.30V) — set to the standard NMC charge ceiling exactly, tightening the margin above the 4.15V min-regen point to 0.05V; second tier, above the min-regen point — if a cell keeps climbing after regen is already at its floor, something else is charging it |
+| Regen taper SoC: full power at/below (`regen_full_soc_pct`, added 2026-08-13) | 80% | new field, not yet researched/real-hardware-confirmed (docs/11) — primary/smoothing input, combined with the voltage taper via `min()`, see "SoC + voltage combined taper" section below; matches `charge_emulation`'s existing `daily_target_pct` default |
+| Regen taper SoC: min power at/above (`regen_min_soc_pct`, added 2026-08-13) | 100% | new field — regen backs off approaching a full pack, mirroring `taper_start_soc_pct`'s empty-side direction |
 | Regen min/max power request (`regen_min_kw`/`regen_max_kw`, added 2026-08-08) | 0.0 kW / 70.0 kW | **`regen_max_kw`=70.0kW is NOT researched-value-aligned** — kept deliberately unchanged from the pre-existing static default on rollout (user directive, 2026-08-08: ship with no behavior change rather than silently capping regen lower than it can reach today). `docs/12-nmc-bms-design-research.md` §6 actually puts real Leaf regen at "up to a few tens of kW ≈ up to ~0.5C into the pack" (~36kW for this pack's ~200Ah rating) — tune `regen_max_kw` down toward that figure once ready; this default is a placeholder, not a confirmed-correct number. `regen_min_kw`=0.0 preserves the pre-existing true-zero floor exactly. **Real-hardware finding (2026-08-09)**: `regen_min_kw` genuinely reaches true zero cleanly with no issue. But `regen_max_kw` only has any observable effect once set BELOW whatever the real car can actually accept — on the project's real ZE1 40kWh test vehicle, this default (70.0kW) and anything down to ~40kW are functionally identical, since the car's own regen ceiling sits around 40kW: a LEAF LIMIT, not something this bridge controls. Peak regen capability varies substantially by Leaf generation/pack — 1st-gen LEAF (24/30kWh) tops out ~20-30kW, 2nd-gen LEAF (40kWh, this project's real test vehicle) just over 40kW, LEAF PLUS (62kWh) can peak 60-80kW under optimal conditions. `regen_max_kw` should be set at/below whichever ceiling applies to the actual car in use to have any real effect. Documented starting point, not confirmed against every generation (docs/11). See `docs/15` B7 / `docs/16` A3. |
 | AC charge full/min/cutoff/emergency (`ac_charge_taper`, split into its own feature 2026-08-01, reworked 2026-08-06) | 4.00 V / 4.15 V / 4.18 V / 4.20 V | emergency tier user edit, 2026-08-03 (was 4.30V, matching the regen-side change above); `ac_min_v` (renamed from `ac_zero_v`) and `ac_cutoff_v` (new) added 2026-08-06 — see "AC charger taper rework" section below for the full rationale. `ac_cutoff_v` is a deliberate interior point of the already-researched safe envelope (below the 4.20V NMC ceiling), not a new external safety number |
 | AC taper minimum power floor (`ac_min_kw`, added 2026-08-06) | 0.5 kW | user-specified — the taper now holds at this floor instead of driving to true zero (see "AC charger taper rework" below) |
 | AC taper convergence rate thresholds (`_AC_LEVEL_DOWNSHIFT_KW`, added 2026-08-06) | 3.0/1.5/0.75/0.4/0.2/0.1/0.05 kW (levels 7..1) | new, tuned starting values, not researched/real-hardware-confirmed — picks which of the existing 0-7 `chg_uprate_level` rates to converge at based on remaining distance to target; see "AC charger taper rework" below |
 | AC charge power request bounds (`ac_min_kw`/`ac_max_kw`, added 2026-08-06) | 0.5 kW / 6.6 kW | user-specified — 6.6kW is the Leaf's actual onboard AC charger ceiling; clamps both the manual charger-ramp target and the AC taper's own floor |
 | DC fast-charge power request bounds (`dc_min_kw`/`dc_max_kw`, added 2026-08-06) | 5.0 kW / 50.0 kW | user-specified — **placeholder only**, not read by any active logic yet (see `docs/10-open-questions.md` #9) |
+| AC charge cold-derate start / low block (`ac_derate_low_start_c`/`ac_low_block_c`, added 2026-08-11, coldest probe) | 10°C / 0°C | seeded from `over_temperature_derate`'s own charge-side cold thresholds (same researched basis) — independently tunable from here on, not forced to track the driving-mode numbers. See "AC charger temperature derate" section below. |
+| AC charge derate start / hard stop (`ac_derate_start_c`/`ac_hard_stop_c`, added 2026-08-11, hottest probe) | 32°C / 45°C | seeded from `over_temperature_derate`'s own charge-side hot thresholds — reaching the hard-stop temp ALSO ends the AC charge session (`full_charge_flag`), unlike the driving-mode equivalent, which only zeroes power and auto-resumes. See "AC charger temperature derate" section below. |
 | Low-voltage soft-cut persistence window (added 2026-07-31) | 2.0 s | researched — guards the min-cell soft cut against a single-tick voltage sag transient under a spike load (cold-pack internal resistance roughly doubles vs. 25°C); the discharge power taper is already collapsing current/sag on a faster ramp by the time this window matters in the normal case. Emergency low-voltage stays instantaneous, no persistence. |
 | Charge cold-derate start (added 2026-07-31, coldest probe) | 10°C (50°F) | researched — ramps charge/regen acceptance down approaching the freezing line instead of a single on/off block; plating risk rises well above 0°C at meaningful charge current. Full power at/above this, ramping to zero at "Charge temp low block." |
 | Charge temp low block (coldest probe, not hottest — **bug fixed 2026-07-31**) | 0°C (32°F) | lithium-plating risk below this while charging. Previously evaluated against the hottest probe, which let charging continue into a partly-frozen pack as long as the warmest corner read above freezing — fixed to key on the coldest probe, since plating happens in the coldest cells. |
@@ -133,8 +141,12 @@ against this specific pack per `11-manual-verification-checklist.md`.)
 | Cell imbalance warn spread (monitor only) | 100 mV | user edit, 2026-08-01 — widened from the original researched 50mV starting point. A cell resting 30-50mV below its neighbors at rest is a documented early signature of elevated self-discharge (a developing internal defect); monitor/warn only, this bridge cannot balance cells. |
 | Cell data cross-check delta (added 2026-08-03) | 150 mV | new feature — max allowed disagreement between the per-cell broadcast and the `0x020` pack min/max summary before it's treated as a data-integrity fault, not just normal reporting jitter between two independently-sampled sources |
 | Cell data cross-check soft-cut delay / hard escalation | 60 s / +5 s | matches the staleness watchdog's own timing, independently tunable from it |
-| Temperature data cross-check delta (added 2026-08-04) | 10 °F | new feature — max allowed disagreement between `0x4A7`'s pack temp extremes and the actual min/max of the 16 individual `0x4AA` probes; deliberately wider than a "genuine fault" margin needs to be, since real spatial temperature gradient across the pack's 4 physical sub-packs under load is a legitimate, expected source of disagreement — a data-integrity check, not a temperature-level protection feature (that's `over_temperature_derate`'s job). Documented starting point, not yet confirmed against real thermal gradient data on this pack. |
+| Temperature data cross-check delta (added 2026-08-04) | 5.6 °C (converted 2026-08-09 from the original 10 °F, no behavior change) | new feature — max allowed disagreement between `0x4A7`'s pack temp extremes and the actual min/max of the 16 individual `0x4AA` probes; deliberately wider than a "genuine fault" margin needs to be, since real spatial temperature gradient across the pack's 4 physical sub-packs under load is a legitimate, expected source of disagreement — a data-integrity check, not a temperature-level protection feature (that's `over_temperature_derate`'s job). Documented starting point, not yet confirmed against real thermal gradient data on this pack. |
 | Temperature data cross-check soft-cut delay / hard escalation (added 2026-08-04) | 60 s / +5 s | matches the cell data cross-check's own timing, independently tunable from it |
+| Temp probe cross-check delta (added 2026-08-14) | 2.0 °C | new feature — max allowed disagreement between DID `0x1814`'s reading and `0x4AA`'s reading for the SAME physical probe. Deliberately tighter than the temperature data cross-check's 5.6°C (no spatial gradient involved here, same sensor location, two source reads): `0x4AA` is whole-degree-quantized (up to just under 1.0°C of rounding error alone vs. DID's real 1/256°C resolution), plus a small allowance for the two sources being sampled at different times (DID polls every ~10s, CAN is continuous) — temperature moves slowly enough that this shouldn't add much. Documented starting point (user-directed 2026-08-14), not yet confirmed against real DID-vs-CAN agreement under load — see `docs/11`. |
+| Temp probe cross-check soft-cut delay / hard escalation (added 2026-08-14) | 60 s / +5 s | matches the other two cross-checks' own timing, independently tunable from both |
+| DID temp poll interval (`did_temp_poll_interval_s`, added 2026-08-14, GUI-editable via `state.engine_timing` — "Timing" tab, see `06`) | 10 s | user-directed — temp probes are polled on their own gate rather than a 4th slot in the SoC/capacity/primary-V-I DID round-robin, since `docs/02`'s own measured ~9s/poll cadence for that existing 3-item cycle showed adding a 4th item there would slow every item for no benefit; temperature changes slowly enough (thermal mass) that a dedicated ~10s cadence is sufficient |
+| DID temp freshness window (`did_temp_fresh_window_s`, added 2026-08-14, GUI-editable via `state.engine_timing` — "Timing" tab, see `06`) | 20 s | user-directed — how stale a DID `0x1814` reading can be before `RealtimeEngine` falls back to the `0x4AA` CAN broadcast as the front-door `temp_01`-`temp_16` value. Needs real headroom over the 10s poll interval so ordinary DID round-trip jitter doesn't flap the primary source back and forth, while staying well under the 60s cross-check/derate soft-cut timers so a genuinely dead DID responder still gets caught and backed off to CAN long before those would matter. Documented starting point, not yet real-hardware-confirmed — see `docs/11`. |
 | Overcurrent discharge warn (added 2026-07-31, monitor only) | 150 A | derived from this project's own confirmed spec, not an invented number — set comfortably below the `0x023` current sensor's own ±204.7A saturation ceiling (docs/02), so a warning still means something (above ~205A the true magnitude is unmeasurable regardless). That ceiling is a sensor/encoding limit, not a battery limit — the real pack is rated to a 500A discharge fuse and ~660A short-burst peak (user correction, 2026-07-31, docs/02) — so this monitor cannot see anywhere near the pack's real operating range. No cell datasheet exists to source a real cutoff threshold from, so this is monitor-only, not wired to any derate/cut. |
 | Overcurrent charge/regen warn (added 2026-07-31, monitor only) | 30 A | derived from this project's own confirmed spec — set above the Leaf's onboard AC charger's documented ~19A/6.6kW max, so ordinary AC charging never trips it; catches only abnormal charge/regen current. Monitor-only, same reasoning as above. |
 | Overcurrent monitor persistence | 5.0 s | researched — avoids flagging a brief acceleration or regen spike as sustained overcurrent |
@@ -162,7 +174,7 @@ That's still true for `charge_limit_kw` itself, but the two use cases warrant in
 curves and config, so they were split into two features that happen to default to the same curve:
 
 - **`charge_target_taper` (regen only)** — drives `charge_limit_kw` ONLY, active continuously
-  regardless of charging context (driving or plugged in). Config: `regen_full_v`/`regen_zero_v`
+  regardless of charging context (driving or plugged in). Config: `regen_full_v`/`regen_min_v`
   (proactive taper window) and `emergency_high_v` (hard-cut tier).
 - **`ac_charge_taper` (AC charger only, config lives in `charge_emulation` alongside the rest of
   the charger-ramp controls)** — drives `charger_limit_kw` ("Max power for charger," `0x1ED`) and
@@ -187,20 +199,73 @@ curves and config, so they were split into two features that happen to default t
 Both features:
 - Monitor all 96 individual cell voltages (primary: `0x4A9`/`0x4C0`, not the `0x020` pack-level
   summary) and ramp their respective power-limit field down as the **worst (highest) individual
-  cell** rises from the configured full-power point to the configured zero-power point — pure
+  cell** rises from the configured full-power point to the configured min-power point — pure
   voltage-feedback control. This is exactly what a real CC→CV charge algorithm does: hold current
   until voltage approaches the ceiling, then taper current to hold voltage instead — and it's what
   protects an imbalanced cell that reaches the ceiling early, from any charge source.
 - Are **proactive by design (user-specified 2026-07-31)**: the taper window is deliberately wide
   and starts well below the pack's actual NMC ceiling — **default full power at/below 4.00V/cell,
-  linearly down to zero at/above 4.15V/cell** for both — because the real Leaf VCM is slow to
-  respond to a power-limit change. A narrow margin right at the ceiling doesn't give a slow-reacting
-  VCM enough lead time to actually back off before a cell gets close to real danger.
+  linearly down to each feature's own configured min-power floor (0kW by default) at/above
+  4.15V/cell** for both — because the real Leaf VCM is slow to respond to a power-limit change. A
+  narrow margin right at the ceiling doesn't give a slow-reacting VCM enough lead time to actually
+  back off before a cell gets close to real danger.
 - Have an **emergency tier**: if any individual cell reaches the feature's own emergency-high-
-  voltage threshold (default 4.20V, above the zero-power point — user-tightened 2026-08-03 from
+  voltage threshold (default 4.20V, above the min-power point — user-tightened 2026-08-03 from
   4.30V to the standard NMC charge ceiling exactly), this escalates to a hard cut
   (`relay_cut_request`) — if a cell is still climbing after power is already fully backed off,
   something else is charging it. Per-cell voltage is always the authority, not a pack average.
+
+## SoC + voltage combined taper (`discharge_power_taper`/`charge_target_taper`, added 2026-08-13)
+
+**Root-cause investigation, not a guess.** User report: real captured discharge/regen output looked
+"jumpy" under light load. `tests/check_taper_smoothness.py` (new, rerunnable diagnostic) replayed the
+real cell-voltage trace from `logs/minileaf_20260809_080913-power and regen settings test.trc`
+through the actual engine, using that session's own settings (a deliberately narrow 20mV taper
+window). Finding: this was never a hysteresis-timing problem. Per-cell voltage is a 12-bit value over
+0-5V (`rz450e_signals.py` `decode_020`/`decode_frame`), so every reading is quantized to
+1.22mV/count no matter what — an RZ450e sensor/encoding limit, not something this bridge can improve.
+A 20mV-wide taper window is only ~16 raw counts wide, so a SINGLE count of ordinary sensor noise
+swung output by 6.71kW (measured on the real trace, matching the analytical prediction
+`span_kw / window_v × 1.22mV` exactly — confirmed a second way with a clean, noiseless one-count-at-
+a-time sweep). Raising `recovery_ramp_s` (tested at 3/8/20/45s against the same real trace) cut total
+output churn ~7x but left the reversal *count* and time-at-zero unchanged, because the drop side is
+deliberately instant (fast-attack cell protection, see above) — hysteresis alone can't fix a window
+narrower than the sensor's own noise floor.
+
+**Fix: SoC as a second, independent, primary/smoothing input — never a replacement for voltage.**
+Both `discharge_power_taper` and `charge_target_taper` (regen) now compute an SoC-based factor
+alongside the existing voltage-based one (same `_ramp_factor` shape, mirrored for regen's
+approaching-full direction), combined via `min(voltage_factor, soc_factor)` — the more restrictive of
+the two wins, every tick. SoC is polled far less often than voltage (~every 15s via DID, not every
+CAN tick — `06-realtime-engine-and-watchdog.md`) and moves smoothly across a wide %, so the same kW
+range spread across a wide SoC window is inherently smoother per update. Under normal conditions SoC
+is usually the tighter (lower) of the two across its default window, so it dominates the smooth
+day-to-day ramp — but voltage stays fully live as the secondary/quick-cutoff input: a real sag/spike
+still independently and instantly pulls the combined factor down the moment it crosses its own
+window, regardless of what SoC says. No SoC data yet → that factor defaults to 1.0 (does not
+restrict), degrading exactly to the pre-existing voltage-only behavior.
+
+**This does NOT reverse the 2026-07-31 fix described below ("driven ONLY by individual cell voltage,
+continuously, never gated by SoC").** That fix specifically removed SoC as a *gate* (blocking the
+taper from acting at all below some SoC). This change adds SoC as a second, independent *restrictor*
+via `min()` — voltage alone can still restrict power at any SoC, exactly as that fix requires; SoC
+just adds an additional, usually-smoother restriction on top, never a way to bypass or soften what
+voltage alone would already do.
+
+Emergency tiers (`emergency_low_v`, `emergency_high_v`) are UNCHANGED — still voltage-only, still
+instantaneous, never blended with SoC. New config fields: `taper_start_soc_pct`/`taper_min_soc_pct`
+(discharge, default 20%/8%) and `regen_full_soc_pct`/`regen_min_soc_pct` (regen, default 80%/100%) —
+see the researched-default-values table above for the specific rationale on each; both pairs are new,
+untested starting points (docs/11), same status as every other brand-new tunable this project ships.
+
+**Validated against two real bench sessions (2026-08-13, post-Rev-69)** using
+`tests/check_soc_taper_log_replay.py` (added same day - see `14-validation-test-plan.md` for what it
+does and how to run it against a future log): zero direction reversals on both `discharge_limit_kw`
+and `charge_limit_kw` across a ~92-minute session and a separate ~2h16m session, vs. 810 reversals in
+just 16 minutes on the pre-blending voltage-only narrow-window test above. Still a software replay of
+captured data, not a from-scratch real-hardware retest of the feature itself - promote to a
+`11-manual-verification-checklist.md` "Confirmed" entry once directly observed on the bench, same
+discipline as every other threshold in this file.
 
 **REVERSED 2026-08-06, then REWORKED again the same day: `ac_charge_taper` needed genuinely gentle
 convergence, not just hysteresis.** Previously (decided 2026-08-03) `ac_charge_taper` deliberately
@@ -274,7 +339,9 @@ Four related changes, all from the same real bench test session and user directi
 
 An older saved `profile.json` with the pre-rename `ac_zero_v` key is migrated automatically on load
 (`bridge/config_profile.py`'s `_apply_charge_emulation()`) - its real tuned value is copied to
-`ac_min_v` rather than silently reverting to the new default.
+`ac_min_v` rather than silently reverting to the new default. `ManagementEngine.from_dict()` carries
+the same migration for the 2026-08-13 `taper_zero_v` → `taper_min_v` / `regen_zero_v` → `regen_min_v`
+renames (`bridge/management_engine.py`).
 
 `ac_charge_taper`'s target-SoC/`full_charge_flag` logic specifically:
   - **Gated on `charge_permission_input` for a reason found and fixed 2026-07-31**: the
@@ -314,15 +381,20 @@ session. Default on, editable via the Charge Emulation panel's checkbox.
 ## Discharge power taper — the low-end mirror, added 2026-07-31
 
 Same reasoning applied to the other end of the pack: `discharge power limit` (`0x1DC`) is ramped
-down as the **worst (lowest) individual cell voltage** approaches empty — driven by per-cell
-voltage, not SoC, for the same reason as the charge/regen taper (a single weak or imbalanced cell
-sags under heavy discharge load before pack-average SoC would suggest a problem).
+down as the **worst (lowest) individual cell voltage** approaches empty — voltage-driven (not SoC)
+for the same reason as the charge/regen taper (a single weak or imbalanced cell sags under heavy
+discharge load before pack-average SoC would suggest a problem). **As of 2026-08-13, voltage is no
+longer the ONLY input** — SoC now runs alongside it as a second, independent, primary/smoothing
+factor (see "SoC + voltage combined taper" above); this section's per-cell-voltage curve below is
+still fully live and unchanged, just no longer the sole driver.
 
-- **The curve**: full discharge power at/above 3.00V/cell, linearly down to zero at/below 2.60V/cell
-  (re-anchored 2026-08-01, was 3.50V/3.00V) — the zero point deliberately matches
+- **The curve**: full discharge power at/above 3.00V/cell, linearly down to its configured min-power
+  floor (`taper_min_v`, renamed from `taper_zero_v` 2026-08-13 — the floor is `discharge_min_kw`,
+  0.0kW by default but user-configurable, not necessarily literal zero) at/below 2.60V/cell
+  (re-anchored 2026-08-01, was 3.50V/3.00V) — the min-power point deliberately matches
   `low_voltage_cutoff`'s emergency tier, and the full-power point matches its soft-cut floor, so
-  discharge power reaches zero right around where the cutoff tiers sit, a smooth transition into
-  the cutoff rather than full-power-then-sudden-stop.
+  discharge power reaches its floor right around where the cutoff tiers sit, a smooth transition
+  into the cutoff rather than full-power-then-sudden-stop.
 - **Hysteresis — fast attack, slow release (user-specified)**: unlike the charge/regen taper (a
   pure function of the current instantaneous voltage), this feature carries state between control-
   loop ticks. If voltage dips, the applied power limit snaps down immediately — cell protection
@@ -367,6 +439,46 @@ and two structural gaps in this feature, all now fixed:
   voltage features already have. It sits close above the 60°C discharge soft stop deliberately —
   self-heating onset for a cell with any plated lithium can begin as low as ~60°C, so there's very
   little real margin above it in the chemistry to work with.
+
+## AC charger temperature derate — added 2026-08-11
+
+**User report: this bridge had NO heat regulation for charging at all.** `over_temperature_derate`'s
+graduated cold/hot ramp (`c_factor`) used to also multiply `charger_limit_kw` (AC charging) using the
+same thresholds it uses for regen — but AC charging (~19A/0.09C) and regen (up to ~0.5C) are already
+treated as physically distinct everywhere else in this project (see the "AC charger taper rework"
+voltage split above), so sharing one temperature curve between them was inconsistent with that
+precedent, and per the user's own words, "there not the same values."
+
+**Fixed with the same split already applied to voltage**: a new `ac_charge_temp_derate` feature,
+living in `charge_emulation` alongside `ac_charge_taper`, with its own independently-tunable
+cold/hot thresholds (seeded from `over_temperature_derate`'s existing charge-side numbers as a
+starting point, not forced to track them). `over_temperature_derate`'s graduated ramp no longer
+touches `charger_limit_kw` at all — only its true pack-wide emergency tier still does (a genuine
+over-temperature emergency is a real hazard regardless of what's drawing/accepting current, so it
+remains the final universal backstop for every power-limit field, same as every other hard-tier
+emergency in this engine).
+
+Same "fully separate control path from driving" gating `ac_charge_taper` already uses
+(2026-08-07 directive): this feature only ever touches `charger_limit_kw` while
+`charge_permission_input` is genuinely active, never while simply driving with nothing plugged in.
+
+- **Cold side**: ramps power down toward zero as the coldest probe drops toward "AC charge low
+  block," fully blocked at/below it, back to full power at/above "AC charge cold-derate start" — no
+  latch, auto-resumes as the pack warms, same as driving-mode's own cold-side behavior (a cold soak
+  is expected to resolve on its own).
+- **Hot side**: ramps power down as the hottest probe rises past "AC charge derate start," reaching
+  exactly zero at "AC charge hard stop." Reaching that hard-stop temp is deliberately treated as
+  MORE than just a derate: it also latches `full_charge_flag` and ends the session outright (same
+  "unplug/replug to resume" convention `ac_cutoff_v`'s stop-charging cutoff already uses), instead of
+  silently holding at 0kW and auto-retrying — a pack that got this hot WHILE CHARGING deserves a
+  deliberate stop, not a silent retry.
+
+Two new fault_log entries: `ac_charge_cold_block` (warn, no latch) and `ac_charge_temp_stop` (warn,
+latches — the session-ending trigger). While fixing this, also found and closed a small pre-existing
+gap: `ac_cutoff_stop` (the AC voltage-cutoff stop, added 2026-08-06) had been tracked via
+`fault_log.update()` calls the whole time but was never actually registered in `fault_log.py`'s
+`FAULT_DEFINITIONS` catalog — meaning it only ever appeared in the Fault History window after first
+actually firing, unlike every other catalog entry. Now registered alongside the two new entries above.
 
 ## Cell imbalance monitor — added 2026-07-31 (docs/12 finding F4)
 

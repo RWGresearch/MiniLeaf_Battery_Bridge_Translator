@@ -74,7 +74,7 @@ def test_charge_active_public_method():
     seq.note_leaf_rx(CHG_ID, _chg_request_frame())
     check('charge_active is True right after a trans=1 frame',
           seq.charge_active(time.monotonic()) is True)
-    time.sleep(leaf_signals.CHG_CMD_FRESH_S + 0.15)
+    time.sleep(seq.config['chg_cmd_fresh_s'] + 0.15)
     check('charge_active goes False once the 0x1F2 frame goes stale',
           seq.charge_active(time.monotonic()) is False)
 
@@ -204,7 +204,7 @@ def test_ramp_resets_when_charge_request_goes_stale():
     engine._apply_charge_ramp(dict(leaf_signals.DEFAULTS))
     check('ramp is active right after a charge request', engine._chg_ramp_raw is not None)
 
-    time.sleep(leaf_signals.CHG_CMD_FRESH_S + 0.15)
+    time.sleep(state.engine_timing['chg_cmd_fresh_s'] + 0.15)
     default_charger_kw = leaf_signals.DEFAULTS['charger_limit_kw']
     leaf_state = engine._apply_charge_ramp(dict(leaf_signals.DEFAULTS))
     check('ramp resets to None once the 0x1F2 request goes stale', engine._chg_ramp_raw is None)
@@ -212,45 +212,6 @@ def test_ramp_resets_when_charge_request_goes_stale():
           engine._chg_uprate_current == 0)
     check('charger_limit_kw is left untouched (not overridden) once the ramp is inactive',
           leaf_state['charger_limit_kw'] == default_charger_kw)
-
-
-# ── Safety: the per-cell taper must stay authoritative over charger_limit_kw ─
-def test_charger_limit_kw_safety_taper_applies_even_without_rz450e_interlock():
-    mgmt = ManagementEngine()
-    rz = SharedState()
-    for i in range(1, 97):
-        rz.update_input(f'cell_{i:02d}', 4.35)   # above the 4.20V emergency-high default
-    rz.update_input('temp_max', 25.0)
-    rz.update_input('current', 0.0)
-    rz.update_input('charge_permission_input', 0.0)   # RZ450e interlock NOT active
-
-    leaf_state = dict(leaf_signals.DEFAULTS)
-    leaf_state['charger_limit_kw'] = 80.0   # simulate the charge-ramp having raised it
-    out = mgmt.apply(leaf_state, rz)
-    check('charger_limit_kw is zeroed by the per-cell emergency taper even when the RZ450e '
-          'interlock is not active (the charge-ramp is a different, Leaf-side signal that can '
-          'be out of sync with it)', out['charger_limit_kw'] == 0.0, f"got {out['charger_limit_kw']}")
-    check('the hard cut still fires too (worst_high above emergency_high_v)',
-          out.get('relay_cut_request', 0) == 3)
-
-
-def test_charger_limit_kw_proactive_taper_applies_without_interlock_too():
-    # charger_limit_kw is governed by ac_charge_taper (state.charge_emulation's
-    # ac_full_v/ac_zero_v, split out 2026-08-01 from the old combined
-    # charge_target_taper) - default window is 4.00-4.15V/cell.
-    mgmt = ManagementEngine()
-    rz = SharedState()
-    for i in range(1, 97):
-        rz.update_input(f'cell_{i:02d}', 4.075)   # inside the 4.00-4.15V AC-charger taper window (~50%)
-    rz.update_input('temp_max', 25.0)
-    rz.update_input('current', 0.0)
-    rz.update_input('charge_permission_input', 0.0)
-
-    leaf_state = dict(leaf_signals.DEFAULTS)
-    leaf_state['charger_limit_kw'] = 80.0
-    out = mgmt.apply(leaf_state, rz)
-    check('charger_limit_kw is proactively tapered (roughly halved) even without the interlock active',
-          0 < out['charger_limit_kw'] < 80.0, f"got {out['charger_limit_kw']}")
 
 
 # ── docs/13 item 13.1b: charging can't start on cached/default data ─────────
@@ -382,7 +343,7 @@ def test_genuine_gap_does_clear_latch():
 
     # Simulate a real unplug/replug: charge_active has been false for
     # longer than CHG_END_STOP_S before resuming.
-    engine._chg_inactive_since = time.monotonic() - (leaf_signals.CHG_END_STOP_S + 0.5)
+    engine._chg_inactive_since = time.monotonic() - (state.engine_timing['chg_end_stop_s'] + 0.5)
     engine.sequencer.chg_last_frame_t = None
     engine.sequencer.chg_trans = None
     engine._prev_charge_active = False

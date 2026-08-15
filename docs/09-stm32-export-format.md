@@ -27,12 +27,22 @@ the background"):
 4. **Generated-signal send flags** — which internally-generated fields are enabled
    (`03-target-signals-leaf.md`'s checkbox list) — firmware needs to know which opaque replay
    tables/counters to actually run.
-5. **Real-time engine parameters** — per-message TX periods, staleness-watchdog timeouts and
-   escalation windows (`06-realtime-engine-and-watchdog.md`) — these are numeric parameters, not
-   just Python-app behavior, so firmware needs the same numbers.
-6. **Startup/shutdown timing constants** — the staged bring-up/wind-down timings
-   (`07-startup-shutdown-plan.md`) — currently hardcoded in the Leaf project's own source, but
-   should be represented as data here so firmware doesn't have to hardcode them independently.
+5. **Real-time engine parameters** — staleness-watchdog timeouts and escalation windows
+   (`06-realtime-engine-and-watchdog.md`, in `management_features.staleness_watchdog`) plus, as of
+   2026-08-14, DID-polling cadence (`engine_timing.did_response_timeout_s`/
+   `did_inter_request_gap_s`/`did_temp_poll_interval_s`/`did_temp_fresh_window_s`) — DONE, see the
+   `engine_timing` section below. Per-message TX periods (`leaf_signals.TX_PERIOD_MS`) are still
+   NOT yet represented as data - remain hardcoded in `bridge/leaf_signals.py` (correctly so for now,
+   since those are bit-verified real-Leaf protocol values, not a user tunable - but firmware would
+   still need them as data, just not as an editable field).
+6. **Startup/shutdown timing constants** — the staged bring-up/wind-down triggers
+   (`07-startup-shutdown-plan.md`)'s wind-down TRIGGER timing (ignition quiet/off-delay/grace,
+   charge-end/stall timeouts, bus-silence timeout) is now represented as data as of 2026-08-14
+   (`engine_timing`, see below) - DONE for that half. The staged bring-up TIMELINE and shutdown
+   STAGING (the ms-offset tables, `T_1DB_START` etc./`PWRDOWN_STAGE*_MS`) are bit-verified
+   real-Leaf protocol values (not a user tunable) and remain hardcoded in
+   `bridge/leaf_signals.py` - still NOT yet represented as data, same reasoning as the TX periods
+   above.
 
 ## Format
 
@@ -60,10 +70,12 @@ just an illustrative sketch. Regenerated 2026-08-01 directly from `default_confi
   "management_features": {
     "low_voltage_cutoff": {"enabled": true, "min_cell_v": 3.0, "min_soc_pct": 8.0,
                            "emergency_low_v": 2.6, "soft_cut_persistence_s": 2.0},
-    "discharge_power_taper": {"enabled": true, "taper_start_v": 3.0, "taper_zero_v": 2.6,
+    "discharge_power_taper": {"enabled": true, "taper_start_v": 3.0, "taper_min_v": 2.6,
+                              "taper_start_soc_pct": 20.0, "taper_min_soc_pct": 8.0,
                               "recovery_ramp_s": 3.0,
                               "discharge_min_kw": 0.0, "discharge_max_kw": 110.0},
-    "charge_target_taper": {"enabled": true, "regen_full_v": 4.0, "regen_zero_v": 4.15,
+    "charge_target_taper": {"enabled": true, "regen_full_v": 4.0, "regen_min_v": 4.15,
+                            "regen_full_soc_pct": 80.0, "regen_min_soc_pct": 100.0,
                             "emergency_high_v": 4.2, "recovery_ramp_s": 3.0,
                             "regen_min_kw": 0.0, "regen_max_kw": 70.0},
     "over_temperature_derate": {"enabled": true, "charge_derate_low_start_c": 10.0,
@@ -78,20 +90,36 @@ just an illustrative sketch. Regenerated 2026-08-01 directly from `default_confi
                               "hard_escalation_s": 5.0},
     "temp_data_cross_check": {"enabled": true, "max_delta_c": 5.6, "soft_cut_s": 60.0,
                               "hard_escalation_s": 5.0},
+    "temp_probe_cross_check": {"enabled": true, "max_delta_c": 2.0, "soft_cut_s": 60.0,
+                               "hard_escalation_s": 5.0},
     "input_validation": {"enabled": true},
     "checksum_validation": {"enabled": true}
   },
   "generated_signals": {"prun": true, "voltage_latch_toggle": true, "heartbeat_1c2": true,
                         "code_1dc": true, "chg_time_5bc": true, "hist_5c0": true, "seq_5eb": true},
   "charge_emulation": {"charge_emulate": 1, "ac_taper_enabled": 1, "extended_mode": 0,
-                       "require_live_data_to_charge": 1,
+                       "require_live_data_to_charge": 1, "ac_temp_derate_enabled": 1,
                        "charge_target_kw": 6.6, "chg_uprate_level": 7,
                        "ac_full_v": 4.0, "ac_min_v": 4.15, "ac_cutoff_v": 4.18, "ac_emergency_v": 4.2,
                        "ac_min_kw": 0.5, "ac_max_kw": 6.6,
                        "dc_min_kw": 5.0, "dc_max_kw": 50.0, "qc_max_soc_pct": 80.0,
-                       "daily_target_pct": 80.0, "extended_target_pct": 100.0}
+                       "daily_target_pct": 80.0, "extended_target_pct": 100.0,
+                       "ac_derate_low_start_c": 10.0, "ac_low_block_c": 0.0,
+                       "ac_derate_start_c": 32.0, "ac_hard_stop_c": 45.0},
+  "engine_timing": {"did_response_timeout_s": 5.0, "did_inter_request_gap_s": 0.3,
+                    "did_temp_poll_interval_s": 10.0, "did_temp_fresh_window_s": 20.0,
+                    "ignition_quiet_s": 0.5, "ignition_off_delay_s": 10.0, "ignition_grace_s": 10.0,
+                    "chg_end_stop_s": 3.0, "chg_stall_timeout_s": 15.0, "chg_cmd_fresh_s": 0.5,
+                    "bus_silence_timeout_s": 30.0}
 }
 ```
+`ac_temp_derate_enabled`/`ac_derate_low_start_c`/`ac_low_block_c`/`ac_derate_start_c`/
+`ac_hard_stop_c` added 2026-08-11 - `ac_charge_temp_derate`, the AC-charger-specific counterpart to
+`over_temperature_derate` above (same split already applied to voltage: `ac_charge_taper` vs.
+`charge_target_taper`). Drives only `charger_limit_kw`, only while `charge_permission_input` is
+active; reaching `ac_hard_stop_c` also sets `full_charge_flag` (session ends, same convention as
+`ac_cutoff_v` above) rather than just ramping to zero. See `05-battery-management-safety.md`'s "AC
+charger temperature derate" section for the full rationale.
 Note: `ac_charge_taper`'s convergence rate is NOT a config field (unlike every other taper's
 `recovery_ramp_s`) - see the "AC taper" note below for why, and what a firmware port needs to
 replicate instead.
@@ -187,12 +215,24 @@ real-hardware-confirmed) as real control logic, not just a config value like eve
 `recovery_ramp_s`.
 
 `discharge_power_taper` has the same proactive shape mirrored for the low end (full power at/above
-`taper_start_v`, zero at/below `taper_zero_v`) — **plus real runtime state**, not just a stateless
-formula: `recovery_ramp_s` implements fast-attack/slow-release hysteresis (snap down immediately on
-a voltage dip, rate-limited ramp back up once voltage recovers), which needs an "applied factor"
-value and a last-update timestamp carried between control-loop iterations. Firmware must replicate
-this as stateful logic, not recompute the output purely from the current instantaneous voltage each
-cycle, or the hysteresis (and the point of it — avoiding power hunting near the threshold) is lost.
+`taper_start_v`, its configured min-power floor at/below `taper_min_v`) — **plus real runtime
+state**, not just a stateless formula: `recovery_ramp_s` implements fast-attack/slow-release
+hysteresis (snap down immediately on a voltage dip, rate-limited ramp back up once voltage
+recovers), which needs an "applied factor" value and a last-update timestamp carried between
+control-loop iterations. Firmware must replicate this as stateful logic, not recompute the output
+purely from the current instantaneous voltage each cycle, or the hysteresis (and the point of it —
+avoiding power hunting near the threshold) is lost.
+
+**Both `discharge_power_taper` and `charge_target_taper` also blend in a second, independent SoC
+factor as of 2026-08-13** (`taper_start_soc_pct`/`taper_min_soc_pct` and
+`regen_full_soc_pct`/`regen_min_soc_pct` above) — combined with the voltage factor via
+`min(voltage_factor, soc_factor)`, not averaged. Firmware must replicate this as two parallel
+ramp-factor computations feeding one `min()`, not just add a third input to the existing voltage
+formula: SoC is the primary/smoothing input (changes slowly, wide window), voltage stays the
+independent secondary/quick-cutoff input (must still be able to restrict power on its own,
+regardless of what SoC reports) — see `05-battery-management-safety.md`'s "SoC + voltage combined
+taper" section for the full rationale (a real per-cell-voltage quantization/narrow-window
+interaction this blending was built to fix).
 
 Note `low_voltage_cutoff`'s `min_soc_pct` is a **backup check only** (2026-07-31 fix) — firmware
 must evaluate it purely for cross-checking/logging (agrees vs. disagrees with the cell-voltage
@@ -202,11 +242,24 @@ here. This is a general rule across every safety feature in this schema, not spe
 real-time per-cell voltage is the sole authoritative signal for every cutoff/derate decision: SoC
 never independently triggers anything.
 
-Still to be added to this schema as milestone 1 continues: real-time engine parameters (per-message
-TX periods, watchdog timeouts) and startup/shutdown timing constants — currently hardcoded in
-`bridge/leaf_signals.py` rather than represented as profile data, which is fine for the Python app
-but will need to be exposed here before a firmware codegen script can consume them without reading
-Python source.
+**Temp probe primary (DID `0x1814`) / backup (`0x4AA` CAN) source selection, added 2026-08-14**:
+`temp_01`-`temp_16` are stateful the same way the tapers above are — firmware must track, per
+probe, whether the last-accepted value came from the DID or the CAN source, and the timestamp of
+the last DID `0x1814` response, not just recompute from whichever frame arrived most recently. The
+rule: DID always wins the instant a response arrives; CAN only supplies the value when the DID
+response is older than `engine_timing.did_temp_fresh_window_s`. See
+`06-realtime-engine-and-watchdog.md` section 1b for the full state machine `RealtimeEngine`
+implements (`_ingest_rz_bus`'s `ID_TEMPS` branch + `_did_poll_loop`'s temp gate) — this is
+temp-probe-specific, not a general "prefer fast broadcast over DID" rule (the rest of this schema's
+DID-sourced fields, e.g. `soc_pct`, stay simple last-value-wins).
+
+Still to be added to this schema as milestone 1 continues: Leaf per-message TX periods and the
+startup-timeline/shutdown-staging ms-offset tables — currently hardcoded in
+`bridge/leaf_signals.py` rather than represented as profile data (correctly hardcoded, since
+they're bit-verified real-Leaf protocol values, not a user tunable - but firmware would still need
+them as data to codegen from, just not as an editable field). DID-polling cadence and wind-down-
+TRIGGER timing (as opposed to the fixed startup/shutdown ms tables) moved OUT of this "still
+hardcoded" category on 2026-08-14 - see the `engine_timing` section above.
 
 **Fault containment does NOT export as schema data, but the underlying requirement carries over to
 firmware (docs/13 item 16.1, added 2026-08-04, direct answer to a user question: "if we fix this

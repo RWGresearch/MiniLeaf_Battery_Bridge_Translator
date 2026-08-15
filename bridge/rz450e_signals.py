@@ -34,16 +34,14 @@ FAST_RAW_IDS = {ID_PACK_V, ID_CURRENT, ID_TEMP_MINMAX, ID_CELLS_A, ID_CELLS_B,
 DID_SOC = (0x1F, 0x5B)
 DID_CAPACITY = (0x1D, 0x3E)
 DID_PRIMARY_V_I = (0x1F, 0x9A)
-# Reworked 2026-08-01 (user directive): the old DID_POLL_INTERVAL_S slept a
-# flat 5.0s after EVERY request regardless of how fast the response actually
-# came back, so any one specific DID was really only re-polled every ~15s
-# (3 DIDs x 5s), not "roughly every 5s each" as the old name implied. Now:
-# wait up to DID_RESPONSE_TIMEOUT_S for a response, then move to the next
-# DID immediately - only a small DID_INTER_REQUEST_GAP_S pacing delay
-# between requests, so a fast response doesn't also cost a needless extra
-# wait, but the bus still isn't flooded with back-to-back requests.
-DID_RESPONSE_TIMEOUT_S = 5.0
-DID_INTER_REQUEST_GAP_S = 0.3
+DID_TEMP_PROBES = (0x18, 0x14)
+# DID polling timing (response timeout, inter-request gap, temp-probe poll
+# interval/freshness window) moved to leaf_signals.ENGINE_TIMING_FIELDS and
+# state.engine_timing (added 2026-08-14, GUI-editable "Engine Timing" tab,
+# user directive - this app is meant to be a hardware configurator, these
+# were never protocol-mandated values, just this bridge's own tunable
+# polling heuristics). See RealtimeEngine._did_poll_loop/_ingest_rz_bus for
+# where they're read live from self.state.engine_timing.
 
 
 def toyota_sum_checksum(arb_id, data):
@@ -222,6 +220,22 @@ def decode_primary_v_i(d):
     }
 
 
+def decode_temp_probes_did(d):
+    """DID 0x1814 (16 probes), Toyota 0x22 ReadDataByIdentifier response:
+    d[0]=0x62 echo, d[1:3]=DID, data starts at d[3] - 16 back-to-back big-
+    endian uint16 fields, one per probe. Confirmed formula/byte layout
+    (Refrance/RZ450e_battery_can_decode_Project's confirmed_DID_PID_
+    reference.md: "Battery Temperatures - DID 0x1814 (16 probes)" - spot-
+    verified vs CarScanner, matched the raw-CAN 0x4AA per-probe mirror
+    within 1 degree quantization step). That reference project stores °F
+    (`(raw/256.0 - 50.0) * 9/5 + 32`); this project stores °C everywhere
+    (2026-08-09), so the °F conversion is dropped here - same underlying
+    value, no unit change from the confirmed formula's Celsius stage."""
+    if len(d) < 35:
+        return {}
+    return {f'temp_{n:02d}_did': _u16(d, 3 + (n - 1) * 2) / 256.0 - 50.0 for n in range(1, 17)}
+
+
 class DidClient:
     """Minimal blocking ISO-TP (ISO 15765-2) client for UDS ReadDataByIdentifier
     (service 0x22) over the Toyota extended addressing (0x747 -> 0x74F). Call
@@ -314,9 +328,20 @@ def _build_input_registry():
                     'unit': 'V', 'fast': True, 'source': '0x4A9/0x4C0', 'group': '0x4A9/0x4C0 per-cell voltages (96)',
                     'range': (2.5, 5.0)})
     for probe in range(1, 17):
-        reg.append({'key': f'temp_{probe:02d}', 'label': f'Temp probe {probe}',
-                    'unit': '°C', 'fast': True, 'source': '0x4AA', 'group': '0x4AA per-probe temps (16)',
+        # Front-door key (added 2026-08-14): the EFFECTIVE value every
+        # consumer (mapping engine, GUI, temp_data_cross_check,
+        # over_temperature_derate) actually reads - DID 0x1814 (primary)
+        # when fresh, falling back to the 0x4AA CAN broadcast (backup)
+        # otherwise. See RealtimeEngine._ingest_rz_bus/_did_poll_loop.
+        reg.append({'key': f'temp_{probe:02d}', 'label': f'Temp probe {probe} (effective: DID primary / CAN backup)',
+                    'unit': '°C', 'fast': True, 'source': '0x4AA + DID 0x1814', 'group': '0x4AA per-probe temps (16)',
                     'range': (-40, 71)})
+        reg.append({'key': f'temp_{probe:02d}_did', 'label': f'Temp probe {probe} (DID 0x1814, primary, high-res)',
+                    'unit': '°C', 'fast': False, 'source': 'DID 0x1814',
+                    'group': 'DID 0x1814 per-probe temps (16, primary)', 'range': (-40, 71)})
+        reg.append({'key': f'temp_{probe:02d}_can', 'label': f'Temp probe {probe} (0x4AA CAN, backup, 1°C)',
+                    'unit': '°C', 'fast': True, 'source': '0x4AA',
+                    'group': '0x4AA per-probe temps (16, backup copy)', 'range': (-40, 71)})
     return reg
 
 
@@ -330,6 +355,14 @@ def cell_voltage_keys():
 
 def temp_probe_keys():
     return [f'temp_{i:02d}' for i in range(1, 17)]
+
+
+def temp_probe_did_keys():
+    return [f'temp_{i:02d}_did' for i in range(1, 17)]
+
+
+def temp_probe_can_keys():
+    return [f'temp_{i:02d}_can' for i in range(1, 17)]
 
 
 # ── Input plausibility validation (added 2026-08-01, user directive) ──────
@@ -361,6 +394,21 @@ for _p in range(1, 17):
     PLAUSIBLE_RANGES[f'temp_{_p:02d}'] = (-51.1, 121.1)
 del _c, _p
 
+_SOURCE_SUFFIXES = ('_did', '_can')
+
+
+def _plausible_key(key):
+    """Strip a source-suffix (added 2026-08-14: temp probes now have both a
+    `_did` and a `_can` copy alongside the plain front-door key - see
+    temp_probe_did_keys()/temp_probe_can_keys()) before a PLAUSIBLE_RANGES
+    lookup, so a signal available from more than one source shares the one
+    physical-plausibility range instead of needing it duplicated per
+    source."""
+    for suffix in _SOURCE_SUFFIXES:
+        if key.endswith(suffix):
+            return key[:-len(suffix)]
+    return key
+
 
 def validate_inputs(mapping):
     """Split a freshly-decoded {key: value} dict into (valid, rejected)
@@ -377,7 +425,7 @@ def validate_inputs(mapping):
     surfaces as a real fault after the watchdog's window elapses."""
     valid, rejected = {}, {}
     for key, value in mapping.items():
-        bounds = PLAUSIBLE_RANGES.get(key)
+        bounds = PLAUSIBLE_RANGES.get(_plausible_key(key))
         if bounds is None or value is None:
             valid[key] = value
             continue

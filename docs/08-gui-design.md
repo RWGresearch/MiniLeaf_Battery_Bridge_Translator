@@ -26,6 +26,9 @@ the dashboard's bar-gauge visuals specifically, not just its text monitor style.
 |                           |  - send/don't-send checkboxes   |                                  |
 |                           | Charge Emulation tab            |                                  |
 |                           |  - charger-request ramp (0x1DC) |                                  |
+|                           | Timing tab (2026-08-14)         |                                  |
+|                           |  - DID polling + wind-down      |                                  |
+|                           |    heuristics, GUI-editable     |                                  |
 +-------------------------+-------------------------------+-------------------------------+
 | Log (full width, timestamped, thread-safe queue - ported pattern from the Leaf app's logq)   |
 +-----------------------------------------------------------------------------------------------+
@@ -184,7 +187,10 @@ One block per protection feature from `05-battery-management-safety.md`:
   bridge doesn't act on, by deliberate design (see `05`).
 - **`cell_data_cross_check` (added 2026-08-01)** — same visual pattern as every other feature block:
   enable checkbox, max-delta-vs-`0x020`-pack-summary field plus soft-cut/hard-escalation timing
-  fields, live status text, and a "?" popup explaining the redundancy check.
+  fields, live status text, and a "?" popup explaining the redundancy check. `temp_data_cross_check`
+  (added 2026-08-04) and `temp_probe_cross_check` (added 2026-08-14) follow the identical pattern —
+  the latter compares DID `0x1814` (primary) against `0x4AA` CAN (backup) per-probe, distinct from
+  `temp_data_cross_check`'s pack-extremes-vs-probe-array comparison (see `05`).
 - **`input_validation` and `checksum_validation` (given real checkboxes 2026-08-03, docs/13 items
   15.14/15.15)** — same feature-block pattern but with no threshold fields, just an enable checkbox
   + live status + "?" popup, since these are on/off data-integrity gates, not tunable thresholds.
@@ -242,16 +248,81 @@ been — it hadn't yet at the time. One block, same visual pattern as a `Managem
   6.6kW ceiling matching the Leaf's real onboard AC charger max) sit in the main charge box near the
   ramp target — they clamp both the manual "Charger ramp target (kW)" field and the AC taper's own
   `ac_min_v`-floor value. `dc_min_kw`/`dc_max_kw` are a **placeholder only** (no active DC
-  fast-charge logic exists yet — `docs/10-open-questions.md` #9), surfaced on the Future placeholder
-  tab below instead of here, so they aren't mistaken for something currently wired to anything.
+  fast-charge logic exists yet — `docs/10-open-questions.md` #9) — **moved 2026-08-08** (alongside
+  `qc_max_soc_pct`) from the Future placeholder tab into its own "DC fast-charge / QC capacity"
+  section near the bottom of this tab instead, same theme as the AC fields above, not a future-work
+  concern; the Future placeholder tab (below) now only ever hosts the not-yet-implemented
+  Leaf→battery PID/DID request stub, nothing charging-related.
 - **New 2026-08-06 — invalid/clamped input feedback.** Every numeric field on this tab now shows a
   small "invalid" (empty/non-numeric entry, value unchanged) or "clamped" (out-of-bounds entry,
   value clamped) flag next to it, same pattern `ManagementPanel`'s Battery Management fields already
   had — previously this tab silently swallowed both cases with no visual indication.
+- **New 2026-08-11 — "AC charger temperature derate" section**, the temperature counterpart to the
+  "AC charger overvoltage taper" section above (user report: no heat regulation existed for AC
+  charging at all — Battery Management's `over_temperature_derate` used to also govern
+  `charger_limit_kw`, using its own driving-mode thresholds; now split the same way voltage already
+  was). Own enable checkbox (`ac_temp_derate_enabled`, default on), four fields — cold-derate start/
+  low block (coldest probe), derate start/hard stop (hottest probe) — and its own live status line.
+  Reaching the hard-stop temp both zeroes `charger_limit_kw` AND latches `full_charge_flag` (session
+  ends, unplug/replug to resume, same convention `ac_cutoff_v` above uses), unlike the driving-mode
+  cold/hot ramp, which only ever derates and auto-resumes. Values are seeded from
+  `over_temperature_derate`'s existing charge-side numbers as a starting point, independently
+  tunable from here on (`05-battery-management-safety.md`).
 
 See the Dashboard section below for the *other* place this feature's live state is surfaced — a
 dedicated right-column section, since the two triggers driving it (the Leaf's own `0x1F2` request
 and RZ450e's permission interlock) weren't shown together anywhere.
+
+### Timing tab (added 2026-08-14)
+
+User directive: "this app is kinda supposed to be a configurator for the hardware version... what
+else could be changed for configuration?" — 11 fields, every one previously a bare hardcoded module
+constant (`rz450e_signals.DID_RESPONSE_TIMEOUT_S` etc., `leaf_signals.IGNITION_QUIET_S` etc.), now
+GUI-editable and profile-persisted (`state.engine_timing`, `06-realtime-engine-and-watchdog.md`
+section 1c). Built as a single generic loop over `leaf_signals.ENGINE_TIMING_FIELDS` (`EngineTimingPanel`,
+`gui/panels.py`) — no per-field enable checkbox or hand-written row needed, unlike Charge Emulation
+above, since every field here is a flat numeric knob with no dependent sub-controls. A third,
+read-only reference group was added the same day — see below.
+
+Two labeled groups (`ttk.Frame` boxes, same `relief='groove'` visual pattern as every other feature
+block), each with its own "?" help button:
+
+- **"DID polling (RZ450e diagnostic requests)"** — `did_response_timeout_s`, `did_inter_request_gap_s`
+  (govern the SoC/capacity/primary-V-I round-robin), `did_temp_poll_interval_s`/
+  `did_temp_fresh_window_s` (govern the temp-probe DID `0x1814` primary/backup gate, added the same
+  day - see `02-source-signals-rz450e.md`).
+- **"Wind-down / charge-session detection"** — `ignition_quiet_s`, `ignition_off_delay_s`,
+  `ignition_grace_s`, `chg_end_stop_s`, `chg_stall_timeout_s`, `chg_cmd_fresh_s`,
+  `bus_silence_timeout_s` — feed `ShutdownSequencer`'s four wind-down triggers plus the charge-ramp's
+  replug-debounce gap (`07-startup-shutdown-plan.md`).
+
+Every field uses the exact same `Entry` + `StringVar.trace` + bounds-clamp pattern Charge Emulation's
+`_set_float` already established (invalid entry → "invalid" flag, out-of-bounds entry → clamped +
+"clamped" flag) — verified end-to-end by launching the real app: typed `999` into
+`did_response_timeout_s` (bounds 0.5-30.0s), confirmed it clamped to 30.0 with the "clamped" flag
+shown, matching Charge Emulation's own behavior exactly.
+
+None of these two groups' values are ported/confirmed real-Leaf protocol timing — they're this
+bridge's own DID-polling/wind-down heuristics, so editing them here is safe in a way editing a
+protocol constant wouldn't be.
+
+**Third group, added same day (user follow-up: "lets add it to the timing tab. but lets make it non
+configurable. this way its listed, for clarity. but not changable")** — **"Real-Leaf protocol
+timing (fixed - reference only)"**, plain `ttk.Label` pairs with no `Entry`/`StringVar`/trace at all,
+deliberately not editable from this tab:
+
+- **Leaf message TX periods** — one row per HVBAT CAN ID, from `leaf_signals.TX_PERIOD_MS` (labels
+  from the new `TX_PERIOD_LABELS` dict).
+- **Startup timeline** — ms offsets from bus wake, from the new `STARTUP_TIMELINE_REFERENCE` list
+  (`T_1DB_START`/`T_55B_START`/`T_59E_START`/`T_PH_B`/`T_PH_C`/`T_VALID`/`T_RUNNING`).
+- **Shutdown staging** — ms offsets from a wind-down trigger, from the new
+  `SHUTDOWN_STAGING_REFERENCE` list (`PWRDOWN_STAGE2_MS`/`PWRDOWN_STAGE3_MS`/`PWRDOWN_STAGE4_MS`).
+- **Re-arm cooldown** — `PWRDOWN_DEFAULT_COOLDOWN_S`.
+
+Every value in this third group IS real-hardware-confirmed (bit-verified against real Leaf VCM
+captures, see `07-startup-shutdown-plan.md`) and stays hardcoded in `bridge/leaf_signals.py` -
+editing any of it would desync the bridge from what the real vehicle actually expects, so unlike
+the two groups above it there is deliberately no way to edit it from this GUI at all.
 
 ### Future placeholder — Leaf→battery requests (disabled, not implemented)
 

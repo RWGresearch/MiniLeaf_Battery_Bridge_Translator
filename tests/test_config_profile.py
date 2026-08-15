@@ -197,6 +197,50 @@ def test_vehicle_round_trips_through_save_and_load():
               f"got {loaded_state.charge_emulation['qc_max_soc_pct']}")
 
 
+def test_engine_timing_round_trips_through_save_and_load():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, 'profile.json')
+        state = SharedState()
+        state.engine_timing['did_temp_fresh_window_s'] = 12.0
+        state.engine_timing['bus_silence_timeout_s'] = 45.0
+        from bridge.mapping_engine import MappingEngine
+        from bridge.management_engine import ManagementEngine as ME
+        config_profile.save_profile(state, MappingEngine(), ME(), path=path)
+
+        loaded_state = SharedState()
+        profile = config_profile.load_profile(path=path)
+        config_profile.apply_profile(profile, loaded_state)
+        check('did_temp_fresh_window_s round-trips through save -> load unchanged',
+              loaded_state.engine_timing['did_temp_fresh_window_s'] == 12.0,
+              f"got {loaded_state.engine_timing['did_temp_fresh_window_s']}")
+        check('bus_silence_timeout_s round-trips through save -> load unchanged',
+              loaded_state.engine_timing['bus_silence_timeout_s'] == 45.0,
+              f"got {loaded_state.engine_timing['bus_silence_timeout_s']}")
+
+
+def test_engine_timing_clamps_out_of_bounds_value_from_profile():
+    from bridge import leaf_signals
+    state = SharedState()
+    lo, hi = leaf_signals.ENGINE_TIMING_BOUNDS['did_response_timeout_s']
+    profile = {'engine_timing': {'did_response_timeout_s': hi + 100.0}}
+    config_profile.apply_profile(profile, state)
+    check('a wildly out-of-bounds engine_timing value from profile.json is clamped, '
+          'matching what EngineTimingPanel itself would allow',
+          state.engine_timing['did_response_timeout_s'] == hi,
+          f"got {state.engine_timing['did_response_timeout_s']}")
+
+
+def test_engine_timing_missing_from_profile_keeps_code_defaults():
+    """A profile saved before this feature existed has no 'engine_timing'
+    key at all - every field must stay at its code default, not error or
+    silently zero out."""
+    state = SharedState()
+    default_bus_silence = state.engine_timing['bus_silence_timeout_s']
+    config_profile.apply_profile({'vehicle': {}, 'charge_emulation': {}}, state)
+    check('engine_timing keeps its code default when the profile has no engine_timing section at all',
+          state.engine_timing['bus_silence_timeout_s'] == default_bus_silence)
+
+
 def test_qc_max_soc_pct_migrates_from_old_vehicle_section():
     # One-time migration (added 2026-08-08, same day qc_max_soc_pct moved
     # from 'vehicle' to 'charge_emulation') - a profile saved during the

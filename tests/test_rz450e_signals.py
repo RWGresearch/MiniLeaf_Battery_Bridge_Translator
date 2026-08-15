@@ -71,6 +71,52 @@ def test_validate_inputs_rejects_non_numeric_without_crashing():
     check('a normal numeric value alongside it still validates fine', valid.get('pack_v') == 355.0)
 
 
+# ── decode_temp_probes_did() (DID 0x1814, added 2026-08-14) ────────────────
+def _temp_probes_did_frame(raws):
+    """Builds a 35-byte 0x22 ReadDataByIdentifier response: d[0]=0x62 echo,
+    d[1:3]=DID 0x18 0x14, then 16 back-to-back big-endian uint16 raw values,
+    one per probe."""
+    b = [0x62, 0x18, 0x14]
+    for raw in raws:
+        b += [(raw >> 8) & 0xFF, raw & 0xFF]
+    return bytes(b)
+
+
+def test_decode_temp_probes_did_formula():
+    # probe 1 raw=12800 -> 12800/256 - 50 = 0.0C; probe 16 raw=19154 ->
+    # 19154/256 - 50 = 24.8203125C (matches the confirmed reference project's
+    # spot-check formula, Celsius stage only - see decode_temp_probes_did()'s
+    # own docstring for the citation).
+    raws = [12800] + [12800] * 14 + [19154]
+    vals = rz450e_signals.decode_temp_probes_did(_temp_probes_did_frame(raws))
+    check('16 probes decoded', len(vals) == 16, vals)
+    check('probe 1 (raw 12800) decodes to 0.0C', vals['temp_01_did'] == 0.0, vals['temp_01_did'])
+    check('probe 16 (raw 19154) decodes to ~24.82C',
+          abs(vals['temp_16_did'] - 24.8203125) < 1e-9, vals['temp_16_did'])
+
+
+def test_decode_temp_probes_did_too_short_response():
+    check('a response shorter than 35 bytes decodes to nothing (not a partial/garbage dict)',
+          rz450e_signals.decode_temp_probes_did(bytes([0x62, 0x18, 0x14])) == {})
+
+
+# ── _plausible_key() suffix stripping (added 2026-08-14, temp probes now ───
+# have a plain front-door key plus _did/_can source-specific copies) ───────
+def test_validate_inputs_shares_plausible_range_across_did_and_can_suffixes():
+    valid, rejected = rz450e_signals.validate_inputs({
+        'temp_01_did': 25.0, 'temp_01_can': 25.0,       # both in-range
+        'temp_02_did': 999.0, 'temp_02_can': -999.0,    # both wildly out of range
+    })
+    check('an in-range _did-suffixed value validates using the plain temp_XX range',
+          valid.get('temp_01_did') == 25.0)
+    check('an in-range _can-suffixed value validates using the plain temp_XX range',
+          valid.get('temp_01_can') == 25.0)
+    check('an out-of-range _did-suffixed value is rejected, not silently passed through',
+          'temp_02_did' in rejected and 'temp_02_did' not in valid)
+    check('an out-of-range _can-suffixed value is rejected, not silently passed through',
+          'temp_02_can' in rejected and 'temp_02_can' not in valid)
+
+
 if __name__ == '__main__':
     for fn in [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]:
         fn()

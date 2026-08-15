@@ -82,6 +82,16 @@ class SharedState:
         self.charge_emulation = {k: d for (k, _, d) in leaf_signals.CHARGE_CHECKS}
         self.charge_emulation.update({k: d for (k, _, _, _, _, d) in leaf_signals.CHARGE_SLIDERS})
 
+        # Engine timing (DID polling cadence, wind-down/charge heuristics),
+        # added 2026-08-14 - same pattern as charge_emulation above (a plain
+        # live dict, seeded from leaf_signals.ENGINE_TIMING_FIELDS' own
+        # defaults, edited directly by gui/panels.py's EngineTimingPanel and
+        # read directly by RealtimeEngine/ShutdownSequencer). User directive:
+        # this app is meant to be a hardware configurator, so bridge-owned
+        # timing heuristics (never protocol-mandated Leaf/RZ450e values)
+        # belong here, not as bare module constants.
+        self.engine_timing = {k: d for (k, _l, _lo, _hi, _s, d) in leaf_signals.ENGINE_TIMING_FIELDS}
+
         # Management-layer runtime flags (soft/hard cut currently asserted),
         # surfaced for the GUI's "?" popups.
         self.management_status = {}

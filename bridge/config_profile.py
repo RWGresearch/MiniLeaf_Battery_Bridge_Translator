@@ -48,6 +48,7 @@ def build_profile_dict(state, mapping_engine, management_engine, profile_name=No
         'management_features': management_engine.to_dict(),
         'generated_signals': dict(state.generated_enabled),
         'charge_emulation': dict(state.charge_emulation),
+        'engine_timing': dict(state.engine_timing),
     }
 
 
@@ -90,6 +91,7 @@ def apply_profile(profile, state):
     _apply_vehicle(state, vehicle_loaded)
     state.generated_enabled.update(profile.get('generated_signals', {}))
     _apply_charge_emulation(state, charge_emu_loaded)
+    _apply_engine_timing(state, dict(profile.get('engine_timing', {})))
     mapping = MappingEngine.from_list(_migrate_temp_mapping_ties(profile.get('mappings', [])))
     management = ManagementEngine.from_dict(profile.get('management_features', {}))
     return mapping, management
@@ -143,13 +145,16 @@ def _apply_vehicle(state, loaded):
     profile.json must not be able to set an arbitrary value just because it
     bypasses the GUI's own clamp) - this closes a real, pre-existing gap:
     `state.vehicle` had zero profile-load validation at all before this."""
+    from bridge import leaf_signals
     from bridge.mapping_engine import VEHICLE_FIELD_BOUNDS
     state.vehicle.update({k: v for k, v in loaded.items() if k not in VEHICLE_FIELD_BOUNDS})
     for key, bounds in VEHICLE_FIELD_BOUNDS.items():
         if key not in loaded:
             continue
         try:
-            value = max(bounds[0], min(bounds[1], float(loaded[key])))
+            # parse_finite_float (not bare float()) - a NaN would otherwise
+            # sail through min()/max() as if in-range (2026-08-13 finding).
+            value = max(bounds[0], min(bounds[1], leaf_signals.parse_finite_float(loaded[key])))
         except (TypeError, ValueError):
             continue
         state.vehicle[key] = value
@@ -182,10 +187,34 @@ def _apply_charge_emulation(state, loaded):
         bounds = leaf_signals.CHARGE_EMULATION_BOUNDS.get(key)
         if bounds is not None:
             try:
-                value = max(bounds[0], min(bounds[1], float(value)))
+                # parse_finite_float (not bare float()) - a NaN would
+                # otherwise sail through min()/max() as if in-range
+                # (2026-08-13 finding).
+                value = max(bounds[0], min(bounds[1], leaf_signals.parse_finite_float(value)))
             except (TypeError, ValueError):
                 continue
         state.charge_emulation[key] = value
+
+
+def _apply_engine_timing(state, loaded):
+    """Same clamp-and-apply pattern as _apply_charge_emulation() above,
+    against leaf_signals.ENGINE_TIMING_BOUNDS (added 2026-08-14, "Engine
+    Timing" tab) - a hand-edited or corrupted profile.json must not be able
+    to set a DID-polling/wind-down timing value to an arbitrary number just
+    because it bypasses the GUI. No key-migration needed (brand new
+    section); a profile saved before this feature existed simply has no
+    'engine_timing' key at all, so every field stays at its code default."""
+    from bridge import leaf_signals
+    for key, value in loaded.items():
+        if key not in state.engine_timing:
+            continue
+        bounds = leaf_signals.ENGINE_TIMING_BOUNDS.get(key)
+        if bounds is not None:
+            try:
+                value = max(bounds[0], min(bounds[1], leaf_signals.parse_finite_float(value)))
+            except (TypeError, ValueError):
+                continue
+        state.engine_timing[key] = value
 
 
 def save_last_known_good(state, path=LAST_KNOWN_GOOD_PATH):

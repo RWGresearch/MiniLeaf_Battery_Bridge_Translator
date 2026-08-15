@@ -3,7 +3,7 @@
 mapping.md and docs/05's design-philosophy note - no generic expression
 engine, so every tie stays portable to a future STM32 C function.
 """
-from bridge import rz450e_signals
+from bridge import leaf_signals, rz450e_signals
 
 COMBINE_TYPES = ('linear', 'sum', 'average', 'min', 'max', 'lookup', 'soh_percent')
 
@@ -91,8 +91,27 @@ class MappingTie:
 
     @classmethod
     def from_dict(cls, d):
+        # scale/offset validation (added 2026-08-13, blind-review finding):
+        # a hand-edited/corrupted profile.json (or a NaN that slipped past
+        # the GUI's own entry validation before this fix) must not be able
+        # to plant a non-finite scale/offset - same "drop the bad value,
+        # keep the safe default" convention as every other bounds-clamped
+        # config category in this project (FEATURE_FIELD_BOUNDS,
+        # VEHICLE_FIELD_BOUNDS, CHARGE_EMULATION_BOUNDS). scale/offset are
+        # legitimately unbounded (a signal conversion can need any real
+        # slope/intercept), so this only rejects NON-FINITE/unparseable
+        # values, not out-of-range ones. Other params keys (`table`,
+        # `nameplate_ah`, used by the 'lookup'/'soh_percent' combine types)
+        # are untouched - no known corruption vector for those yet.
+        params = dict(d.get('params', {}))
+        for key, default in (('scale', 1.0), ('offset', 0.0)):
+            if key in params:
+                try:
+                    params[key] = leaf_signals.parse_finite_float(params[key])
+                except (TypeError, ValueError):
+                    params[key] = default
         return cls(d['inputs'], d['combine'], d['output'],
-                    params=d.get('params', {}), name=d.get('name'))
+                    params=params, name=d.get('name'))
 
 
 # ── Sensible starting ties (not safety-relevant, just baseline wiring so the

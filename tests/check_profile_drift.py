@@ -53,6 +53,10 @@ def _generated_signals_defaults():
     return {k: v for k, _, v in leaf_signals.GENERATED_SIGNALS}
 
 
+def _engine_timing_defaults():
+    return {k: v for k, _l, _lo, _hi, _s, v in leaf_signals.ENGINE_TIMING_FIELDS}
+
+
 VEHICLE_DEFAULTS = {'car_gen': 'ZE1', 'battery_gen': 'ZE1', 'battery_kwh': 40,
                      'usable_capacity_kwh': 64.0, 'nameplate_capacity_ah': 201.00}
 
@@ -103,6 +107,10 @@ def report(path=None):
 
     lines.append(f'== charge_emulation ==')
     c, m, o = _diff_flat('charge_emulation', profile.get('charge_emulation'), _charge_emulation_defaults(), lines)
+    total[0] += c; total[1] += m; total[2] += o
+
+    lines.append(f'== engine_timing ==')
+    c, m, o = _diff_flat('engine_timing', profile.get('engine_timing'), _engine_timing_defaults(), lines)
     total[0] += c; total[1] += m; total[2] += o
 
     print(f'Profile-vs-code-defaults drift report: {path}\n')

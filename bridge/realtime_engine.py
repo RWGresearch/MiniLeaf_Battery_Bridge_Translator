@@ -24,10 +24,24 @@ class ShutdownSequencer:
     """Ported logic (not verbatim code, no direct equivalent function to
     copy) from Leaf_BMS_Emulator's Core: staged startup timing plus the four
     independent wind-down triggers, using that project's own confirmed
-    constants (bridge/leaf_signals.py)."""
+    constants (bridge/leaf_signals.py).
 
-    def __init__(self):
+    `config` (added 2026-08-14, GUI-editable "Engine Timing" tab, user
+    directive): the wind-down/charge-detection TIMING thresholds (ignition
+    quiet window, off-delay, grace period, charge-end/stall timeouts, bus-
+    silence timeout - none of these are ported/confirmed real-Leaf protocol
+    values, just this bridge's own heuristics) now come from a live dict
+    instead of bare leaf_signals module constants, so they're editable at
+    runtime. Pass `RealtimeEngine`'s `state.engine_timing` (the SAME dict
+    object the GUI edits, for live effect with no reload step) - defaults to
+    a fresh copy of `leaf_signals.ENGINE_TIMING_FIELDS`' own defaults when
+    None, so existing direct/isolated unit tests of this class
+    (`tests/test_shutdown_sequencer.py`) keep working unchanged."""
+
+    def __init__(self, config=None):
         self.lock = threading.RLock()
+        self.config = config if config is not None else {
+            k: d for (k, _l, _lo, _hi, _s, d) in leaf_signals.ENGINE_TIMING_FIELDS}
         # idle -> waiting_for_wake -> startup -> running -> winding_down -> stopped -> waiting_for_wake
         # 'idle': bridge not started (Start Bridge not yet pressed) - nothing
         #   transmits, nothing is evaluated.
@@ -130,7 +144,7 @@ class ShutdownSequencer:
 
     def _run_state_fresh(self, now):
         times = list(self.ignition_last_seen.values())
-        return bool(times) and (now - max(times) <= leaf_signals.IGNITION_QUIET_S)
+        return bool(times) and (now - max(times) <= self.config['ignition_quiet_s'])
 
     def refuse_sleep_value(self, now):
         """LB_RefusetoSleep (0x55B byte 6, bits 5-6) - previously hardcoded
@@ -150,16 +164,16 @@ class ShutdownSequencer:
             return 0 if self._run_state_fresh(now) else 1
 
     def _ignition_off_detected(self, now):
-        if now - self.session_start < leaf_signals.IGNITION_GRACE_S:
+        if now - self.session_start < self.config['ignition_grace_s']:
             return False
         if len(self.ignition_last_seen) < len(leaf_signals.IGNITION_IDS):
             return False
         newest = max(self.ignition_last_seen.values())
-        return (now - newest) > leaf_signals.IGNITION_QUIET_S
+        return (now - newest) > self.config['ignition_quiet_s']
 
     def _chg_fresh(self, now):
         return (self.chg_last_frame_t is not None and
-                now - self.chg_last_frame_t <= leaf_signals.CHG_CMD_FRESH_S)
+                now - self.chg_last_frame_t <= self.config['chg_cmd_fresh_s'])
 
     def charge_active(self, now):
         """Public (was an inline local in _should_wind_down) - True while a
@@ -217,7 +231,7 @@ class ShutdownSequencer:
             if self._ignition_off_detected(now):
                 if self._ignition_off_since is None:
                     self._ignition_off_since = now
-                if now - self._ignition_off_since >= leaf_signals.IGNITION_OFF_DELAY_S:
+                if now - self._ignition_off_since >= self.config['ignition_off_delay_s']:
                     return True
             else:
                 self._ignition_off_since = None
@@ -225,7 +239,7 @@ class ShutdownSequencer:
             if self.chg_seen_active and not chg_effective and not self._run_state_fresh(now):
                 if self._chg_end_since is None:
                     self._chg_end_since = now
-                if now - self._chg_end_since >= leaf_signals.CHG_END_STOP_S:
+                if now - self._chg_end_since >= self.config['chg_end_stop_s']:
                     return True
             else:
                 self._chg_end_since = None
@@ -234,20 +248,21 @@ class ShutdownSequencer:
                 anchor = self.chg_trans_last_change_t or now
                 if self._chg_stall_since is None or self._chg_stall_since < anchor:
                     self._chg_stall_since = anchor
-                if now - self._chg_stall_since >= leaf_signals.CHG_STALL_TIMEOUT_S:
+                if now - self._chg_stall_since >= self.config['chg_stall_timeout_s']:
                     return True
             else:
                 self._chg_stall_since = None
 
             # 6th trigger, bridge-specific defensive fallback (docs/07,
-            # added 2026-08-06 - see leaf_signals.BUS_SILENCE_TIMEOUT_S's own
-            # comment for the full rationale): if the Leaf bus has gone
-            # completely silent (no frame of ANY ID, not just ignition/charge
-            # IDs) for this long while still in startup/running, wind down
-            # regardless of what the other triggers are doing. last_leaf_rx_t
-            # is guaranteed non-None here (reaching startup/running at all
-            # required at least one prior note_leaf_rx() call).
-            if now - self.last_leaf_rx_t >= leaf_signals.BUS_SILENCE_TIMEOUT_S:
+            # added 2026-08-06 - see leaf_signals.ENGINE_TIMING_FIELDS'
+            # bus_silence_timeout_s entry for the full rationale): if the
+            # Leaf bus has gone completely silent (no frame of ANY ID, not
+            # just ignition/charge IDs) for this long while still in
+            # startup/running, wind down regardless of what the other
+            # triggers are doing. last_leaf_rx_t is guaranteed non-None here
+            # (reaching startup/running at all required at least one prior
+            # note_leaf_rx() call).
+            if now - self.last_leaf_rx_t >= self.config['bus_silence_timeout_s']:
                 return True
 
             return False
@@ -326,7 +341,7 @@ class RealtimeEngine:
         self.rz_bus = rz_bus
         self.leaf_bus = leaf_bus
         self.did_client = rz450e_signals.DidClient(rz_bus)
-        self.sequencer = ShutdownSequencer()
+        self.sequencer = ShutdownSequencer(config=state.engine_timing)
         self._running = False
         self._threads = []
         self._prun = 0
@@ -377,7 +392,7 @@ class RealtimeEngine:
         if self._running:
             return
         self._running = True
-        self.sequencer = ShutdownSequencer()
+        self.sequencer = ShutdownSequencer(config=self.state.engine_timing)
         self._chg_ramp_raw = None
         self._chg_ramp_last_t = None
         self._chg_uprate_current = 0
@@ -478,6 +493,29 @@ class RealtimeEngine:
                         self.state.update_input('charge_permission_input', vals['charge_permission_input'])
                         self.state.note_counter('alive_358', int(vals.get('alive_358', 0)))
                     continue
+                if arb_id == rz450e_signals.ID_TEMPS:
+                    # Temp probes (updated 2026-08-14, user directive): DID
+                    # 0x1814 is now the PRIMARY source for temp_01..temp_16
+                    # (real fractional-degree resolution) - this CAN broadcast
+                    # is the BACKUP. Always write the backup copy
+                    # (temp_NN_can) so it's ready to take over instantly, but
+                    # only promote it to the front-door temp_NN keys (what
+                    # every consumer - mapping_engine, the GUI,
+                    # temp_data_cross_check/temp_probe_cross_check,
+                    # over_temperature_derate - actually reads) when the DID
+                    # side hasn't produced a fresh-enough reading. The DID
+                    # side of this lives in _did_poll_loop below; DID_TEMP_
+                    # FRESH_WINDOW_S is the freshness cutoff.
+                    can_vals = rz450e_signals.decode_temp_msg(data)
+                    if can_vals:
+                        self._ingest_validated(f'CAN 0x{arb_id:03X} (backup)',
+                                                {f'{k}_can': v for k, v in can_vals.items()})
+                        did_age = self.state.age_of('temp_01_did')
+                        did_fresh = did_age is not None and \
+                            did_age <= self.state.engine_timing['did_temp_fresh_window_s']
+                        if not did_fresh:
+                            self._ingest_validated(f'CAN 0x{arb_id:03X}', can_vals)
+                    continue
                 vals = rz450e_signals.decode_frame(arb_id, data)
                 if vals:
                     self._ingest_validated(f'CAN 0x{arb_id:03X}', vals)
@@ -536,20 +574,39 @@ class RealtimeEngine:
             self.sequencer.note_leaf_rx(arb_id, data)
 
     def _did_poll_loop(self):
-        """Reworked 2026-08-01 (user directive): wait up to
-        DID_RESPONSE_TIMEOUT_S (5.0s) for each DID's response, then move to
-        the next one immediately once it arrives - rather than always
-        sleeping a flat 5.0s after every single request regardless of how
-        fast it actually answered (the old behavior meant any one specific
-        DID was really only re-polled every ~15s, not "every 5s" as it
-        looked). Only a small DID_INTER_REQUEST_GAP_S pacing delay between
-        requests, so the bus still isn't hit with back-to-back polls."""
+        """Reworked 2026-08-01 (user directive): wait up to the configured
+        response timeout (`state.engine_timing['did_response_timeout_s']`,
+        5.0s default) for each DID's response, then move to the next one
+        immediately once it arrives - rather than always sleeping a flat
+        5.0s after every single request regardless of how fast it actually
+        answered (the old behavior meant any one specific DID was really
+        only re-polled every ~15s, not "every 5s" as it looked). Only a
+        small `did_inter_request_gap_s` pacing delay between requests, so the
+        bus still isn't hit with back-to-back polls.
+
+        Temp probes (DID 0x1814, added 2026-08-14, user directive) are
+        deliberately NOT a 4th slot in the round-robin below: docs/02:104
+        measured ~9s/poll for the slowest item in the EXISTING 3-item cycle,
+        and temperature changes slowly enough (thermal mass) that it doesn't
+        need that cadence - folding it in would just slow the other three for
+        no benefit. Instead it's polled on its own gate, at most every
+        `did_temp_poll_interval_s`, still using the same (extended) response
+        timeout per request. It's the PRIMARY source for temp_01..temp_16 -
+        see _ingest_rz_bus's ID_TEMPS branch for the CAN-backup/fallback side
+        of this.
+
+        All four timing values (added 2026-08-14, GUI-editable "Engine
+        Timing" tab) are read live from `self.state.engine_timing` every
+        loop pass, not cached - so an edit while the bridge is running takes
+        effect on the very next request, same as every other live-tunable
+        feature in this app."""
         cycle = [
             (rz450e_signals.DID_SOC, rz450e_signals.decode_soc),
             (rz450e_signals.DID_CAPACITY, rz450e_signals.decode_capacity),
             (rz450e_signals.DID_PRIMARY_V_I, rz450e_signals.decode_primary_v_i),
         ]
         idx = 0
+        next_temp_due = time.monotonic()
         # Fault containment (docs/13 item 16.1, added 2026-08-04) - same
         # pattern/rationale as _tx_loop and _ingest_rz_bus. `idx` is
         # incremented BEFORE the risky request()/decode() call so a failure
@@ -558,10 +615,11 @@ class RealtimeEngine:
         last_exc_log_t = 0.0
         exc_count_since_log = 0
         while self._running:
+            timing = self.state.engine_timing
             did, decoder = cycle[idx % len(cycle)]
             idx += 1
             try:
-                resp = self.did_client.request(did, timeout=rz450e_signals.DID_RESPONSE_TIMEOUT_S)
+                resp = self.did_client.request(did, timeout=timing['did_response_timeout_s'])
                 if resp:
                     vals = decoder(resp)
                     if vals:
@@ -574,7 +632,34 @@ class RealtimeEngine:
                                 f'{exc_count_since_log}x in the last ~1s, most recent: {exc!r}')
                     last_exc_log_t = now
                     exc_count_since_log = 0
-            time.sleep(rz450e_signals.DID_INTER_REQUEST_GAP_S)
+            time.sleep(timing['did_inter_request_gap_s'])
+
+            if time.monotonic() >= next_temp_due:
+                # Rescheduled BEFORE the risky request()/decode() call, same
+                # fault-containment reasoning as `idx` above - a failure here
+                # must not get this gate stuck retrying every loop pass.
+                next_temp_due = time.monotonic() + timing['did_temp_poll_interval_s']
+                try:
+                    resp = self.did_client.request(rz450e_signals.DID_TEMP_PROBES,
+                                                    timeout=timing['did_response_timeout_s'])
+                    if resp:
+                        vals = rz450e_signals.decode_temp_probes_did(resp)
+                        if vals:
+                            self._ingest_validated('DID 0x1814', vals)
+                            # DID temps always win when present - write
+                            # straight through to the front-door temp_NN keys
+                            # too (temp_NN_did -> temp_NN).
+                            self._ingest_validated(
+                                'DID 0x1814 (primary)', {k[:-len('_did')]: v for k, v in vals.items()})
+                except Exception as exc:
+                    exc_count_since_log += 1
+                    now = time.monotonic()
+                    if now - last_exc_log_t >= 1.0:
+                        self.log_fn(f'DID POLL ERROR (temps, thread continuing) - '
+                                    f'{exc_count_since_log}x in the last ~1s, most recent: {exc!r}')
+                        last_exc_log_t = now
+                        exc_count_since_log = 0
+                time.sleep(timing['did_inter_request_gap_s'])
 
     # ── TX side ──────────────────────────────────────────────────────────
     def _prun_tick_loop(self):
@@ -609,6 +694,21 @@ class RealtimeEngine:
         that safety feature still gets the final say and can reduce the
         ramped value further - it's never bypassed.
 
+        INTENTIONAL, not a bug (2026-08-13, blind-review finding, user-
+        confirmed): `charger_limit_kw` stays fully Signal-Mapping-selectable
+        even though this function overwrites it every tick during a real
+        charge session - unlike gids/qc_full_wh/qc_remain_wh (pure derived
+        math, no legitimate mapping use, see leaf_signals.
+        MANAGEMENT_EXCLUSIVE_KEYS), `charger_limit_kw` is genuinely dual-
+        purpose: "drive mode" (a mapping tie, or no tie at all) and "charge
+        mode" (this ramp) are two separate control paths that both
+        legitimately drive this SAME output at different times, exactly
+        like ac_charge_taper/charge_target_taper's own charging_active
+        split in management_engine.py. A mapping tie targeting
+        charger_limit_kw is fully live and correct while idle/driving or
+        with charge_emulate off; it's meant to be superseded only once a
+        real charge session starts.
+
         Requires BOTH the Leaf-side 0x1F2 request AND the RZ450e-side
         `charge_permission_input` interlock (user directive, 2026-07-31) -
         the ramp only ever represents an ACTUALLY-AUTHORIZED charge session,
@@ -632,28 +732,30 @@ class RealtimeEngine:
         # Replug detection (docs/13 item 13.4, fixed 2026-08-03): a bare
         # rising edge of leaf_wants_charge is NOT reliable evidence of an
         # actual physical unplug/replug - a single dropped/delayed 0x1F2
-        # frame (goes stale >CHG_CMD_FRESH_S=0.5s, then resumes) or the VCM's
-        # own charge-negotiation retry behavior can produce the exact same
-        # rising edge with the plug never having moved, which would silently
-        # clear an emergency-tier latch with no relation to a real replug -
-        # exactly the gap an independent review pass found in the original
-        # (2026-08-01) version of this fix. Require the request to have been
-        # genuinely ABSENT for at least leaf_signals.CHG_END_STOP_S (3.0s -
-        # the same threshold the shutdown sequencer itself uses to decide a
-        # charge session has really ended, not a new invented number) before
-        # a resumption counts as a "replug" allowed to clear the latch. A
-        # shorter gap just resumes the ramp normally without touching it.
+        # frame (goes stale >chg_cmd_fresh_s=0.5s default, then resumes) or
+        # the VCM's own charge-negotiation retry behavior can produce the
+        # exact same rising edge with the plug never having moved, which
+        # would silently clear an emergency-tier latch with no relation to a
+        # real replug - exactly the gap an independent review pass found in
+        # the original (2026-08-01) version of this fix. Require the request
+        # to have been genuinely ABSENT for at least engine_timing's
+        # chg_end_stop_s (3.0s default - the same threshold the shutdown
+        # sequencer itself uses to decide a charge session has really ended,
+        # not a separate invented number) before a resumption counts as a
+        # "replug" allowed to clear the latch. A shorter gap just resumes the
+        # ramp normally without touching it.
+        chg_end_stop_s = self.state.engine_timing['chg_end_stop_s']
         if not leaf_wants_charge:
             if self._chg_inactive_since is None:
                 self._chg_inactive_since = now
         else:
             if not self._prev_charge_active:
                 gap = (now - self._chg_inactive_since) if self._chg_inactive_since is not None else 0.0
-                if gap >= leaf_signals.CHG_END_STOP_S:
+                if gap >= chg_end_stop_s:
                     self.management.notify_charge_replug()
                 else:
                     self.log_fn(f'0x1F2 charge request resumed after only {gap:.2f}s - too brief to '
-                                f'count as a real unplug/replug (need >= {leaf_signals.CHG_END_STOP_S:g}s); '
+                                f'count as a real unplug/replug (need >= {chg_end_stop_s:g}s); '
                                 f'ramp resumes normally, any latched hard cut is NOT cleared by this')
             self._chg_inactive_since = None
         self._prev_charge_active = leaf_wants_charge

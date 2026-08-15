@@ -115,6 +115,75 @@ def test_checksum_validation_toggle_lets_corrupt_frames_through_when_disabled():
         t.join(timeout=1.0)
 
 
+# ── Temp probe primary (DID 0x1814) / backup (0x4AA CAN) ingest wiring
+# (added 2026-08-14, user directive) ────────────────────────────────────────
+def _push_temp_can_frame(rz_bus, probe1_7_c):
+    """0x4AA mux=0x00 frame: probes 1-7 from d[1..7] (whole-degree C)."""
+    _push_frame(rz_bus, rz450e_signals.ID_TEMPS, [0x00] + [int(v) for v in probe1_7_c])
+
+
+def test_temp_can_backup_promoted_to_front_door_when_no_did_data_yet():
+    eng, state, _mgmt, rz_bus = fresh_engine()
+    eng._running = True
+    t = threading.Thread(target=eng._ingest_rz_bus, daemon=True)
+    t.start()
+    try:
+        _push_temp_can_frame(rz_bus, [25] * 7)
+        time.sleep(0.3)
+        check('backup copy (temp_01_can) is written from the CAN broadcast',
+              state.get_input('temp_01_can') == 25.0)
+        check('front-door temp_01 is ALSO promoted from CAN - no DID data has ever arrived',
+              state.get_input('temp_01') == 25.0)
+    finally:
+        eng._running = False
+        t.join(timeout=1.0)
+
+
+def test_temp_can_backup_does_not_override_front_door_while_did_is_fresh():
+    eng, state, _mgmt, rz_bus = fresh_engine()
+    # Simulates a DID 0x1814 response that just arrived - _did_poll_loop
+    # writes both the backup key (temp_01_did) AND the front door (temp_01)
+    # together (DID always wins when present), so both are set here.
+    state.update_input('temp_01_did', 30.0)
+    state.update_input('temp_01', 30.0)
+    eng._running = True
+    t = threading.Thread(target=eng._ingest_rz_bus, daemon=True)
+    t.start()
+    try:
+        _push_temp_can_frame(rz_bus, [20] * 7)   # CAN disagrees - should stay the backup, not win
+        time.sleep(0.3)
+        check('backup copy (temp_01_can) still updates from the CAN broadcast',
+              state.get_input('temp_01_can') == 20.0)
+        check('front-door temp_01 stays on the fresh DID value, NOT overwritten by CAN',
+              state.get_input('temp_01') == 30.0)
+    finally:
+        eng._running = False
+        t.join(timeout=1.0)
+
+
+def test_temp_falls_back_to_can_once_did_reading_goes_stale():
+    eng, state, _mgmt, rz_bus = fresh_engine()
+    state.update_input('temp_01_did', 30.0)
+    state.update_input('temp_01', 30.0)
+    # Shrunk so the test doesn't wait the real 20s default - added 2026-08-14,
+    # engine_timing is a per-engine live dict (not a module constant), so
+    # this needs no monkeypatch/restore, unlike the old rz450e_signals.
+    # DID_TEMP_FRESH_WINDOW_S approach.
+    state.engine_timing['did_temp_fresh_window_s'] = 0.05
+    eng._running = True
+    t = threading.Thread(target=eng._ingest_rz_bus, daemon=True)
+    t.start()
+    try:
+        time.sleep(0.15)   # past the shrunk freshness window - the DID reading is now stale
+        _push_temp_can_frame(rz_bus, [20] * 7)
+        time.sleep(0.3)
+        check('front-door temp_01 falls back to CAN once the DID reading is stale',
+              state.get_input('temp_01') == 20.0)
+    finally:
+        eng._running = False
+        t.join(timeout=1.0)
+
+
 def test_disabling_checksum_validation_clears_its_fault_log_entry_live():
     eng, state, mgmt, _rz_bus = fresh_engine()
     state.note_checksum_failure(rz450e_signals.ID_PACK_V)

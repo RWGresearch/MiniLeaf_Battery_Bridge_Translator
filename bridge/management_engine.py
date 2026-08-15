@@ -9,7 +9,7 @@ for emergency-tier thresholds and the staleness watchdog's escalation.
 """
 import time
 
-from bridge import rz450e_signals
+from bridge import leaf_signals, rz450e_signals
 from bridge.fault_log import FaultLog
 
 
@@ -32,7 +32,7 @@ FEATURE_FIELD_BOUNDS = {
     ('low_voltage_cutoff', 'soft_cut_persistence_s'): (0.0, 60.0),
     ('low_voltage_cutoff', 'min_soc_pct'): (0.0, 100.0),
     ('discharge_power_taper', 'taper_start_v'): (0.0, 5.0),
-    ('discharge_power_taper', 'taper_zero_v'): (0.0, 5.0),
+    ('discharge_power_taper', 'taper_min_v'): (0.0, 5.0),
     ('discharge_power_taper', 'recovery_ramp_s'): (0.01, 60.0),
     # discharge_min_kw/discharge_max_kw (added 2026-08-08, docs/16 audit - user directive: "both
     # need min and max settings by the user", same pattern as charger_limit_kw's ac_min_kw/
@@ -40,14 +40,25 @@ FEATURE_FIELD_BOUNDS = {
     # hardware-encodable ceiling for this CAN field, same reasoning as every other bound here.
     ('discharge_power_taper', 'discharge_min_kw'): (0.0, 255.75),
     ('discharge_power_taper', 'discharge_max_kw'): (0.0, 255.75),
+    # taper_start_soc_pct/taper_min_soc_pct (added 2026-08-13, user
+    # directive: SoC as the primary/smoothing control, voltage kept as a
+    # secondary/quick-cutoff - see apply()'s discharge_power_taper block for
+    # the full rationale) - same 0-100% bound as every other SoC field.
+    ('discharge_power_taper', 'taper_start_soc_pct'): (0.0, 100.0),
+    ('discharge_power_taper', 'taper_min_soc_pct'): (0.0, 100.0),
     ('charge_target_taper', 'regen_full_v'): (0.0, 5.0),
-    ('charge_target_taper', 'regen_zero_v'): (0.0, 5.0),
+    ('charge_target_taper', 'regen_min_v'): (0.0, 5.0),
     ('charge_target_taper', 'emergency_high_v'): (0.0, 5.0),
     ('charge_target_taper', 'recovery_ramp_s'): (0.01, 60.0),
     # regen_min_kw/regen_max_kw (added 2026-08-08, same directive/pattern as discharge above) -
     # bound matches leaf_signals.RANGES['charge_limit_kw'] (0, 255.75).
     ('charge_target_taper', 'regen_min_kw'): (0.0, 255.75),
     ('charge_target_taper', 'regen_max_kw'): (0.0, 255.75),
+    # regen_full_soc_pct/regen_min_soc_pct (added 2026-08-13) - mirrors
+    # discharge_power_taper's own SoC fields above, applied to regen instead
+    # (backs off as the pack approaches full, not empty).
+    ('charge_target_taper', 'regen_full_soc_pct'): (0.0, 100.0),
+    ('charge_target_taper', 'regen_min_soc_pct'): (0.0, 100.0),
     ('over_temperature_derate', 'charge_derate_low_start_c'): (-51.1, 121.1),
     ('over_temperature_derate', 'charge_low_block_c'): (-51.1, 121.1),
     ('over_temperature_derate', 'charge_derate_start_c'): (-51.1, 121.1),
@@ -67,6 +78,9 @@ FEATURE_FIELD_BOUNDS = {
     ('temp_data_cross_check', 'max_delta_c'): (0.0, 33.3),
     ('temp_data_cross_check', 'soft_cut_s'): (1.0, 600.0),
     ('temp_data_cross_check', 'hard_escalation_s'): (0.0, 600.0),
+    ('temp_probe_cross_check', 'max_delta_c'): (0.0, 33.3),
+    ('temp_probe_cross_check', 'soft_cut_s'): (1.0, 600.0),
+    ('temp_probe_cross_check', 'hard_escalation_s'): (0.0, 600.0),
 }
 
 
@@ -97,6 +111,40 @@ _TEMP_ABS_F_TO_C_KEY_MIGRATIONS = {
 _TEMP_DELTA_F_TO_C_KEY_MIGRATIONS = {
     'temp_data_cross_check': [('max_delta_f', 'max_delta_c')],
 }
+
+# taper_zero_v -> taper_min_v / regen_zero_v -> regen_min_v (added 2026-08-13,
+# user directive: "it states 'zero' but we added a min value so those should
+# state the min not zero") - same rename/reasoning as leaf_signals.py's
+# CHARGE_SLIDERS' pre-existing ac_zero_v -> ac_min_v (2026-08-06): once
+# discharge_min_kw/regen_min_kw (2026-08-08) made the taper's floor a
+# configurable value instead of a hardcoded true zero, a field literally
+# named "zero" was actively misleading - it stops at the configured MIN, not
+# necessarily 0. A plain 1:1 key rename (unlike the °F->°C migration above,
+# no value conversion needed) - the voltage itself doesn't change, only what
+# the field is called.
+_ZERO_TO_MIN_KEY_MIGRATIONS = {
+    # taper_zero_soc_pct/regen_zero_soc_pct (the SoC pair) were only ever
+    # live under the old "zero" name for one session before this rename -
+    # they can still be sitting in a saved profile.json from that window
+    # (this project's own live-app-autosave, same class of gap the
+    # qc_max_soc_pct vehicle->charge_emulation move handled in
+    # config_profile.py) - migrated here too so a real value the user tuned
+    # in that brief window isn't silently dropped.
+    'discharge_power_taper': [('taper_zero_v', 'taper_min_v'), ('taper_zero_soc_pct', 'taper_min_soc_pct')],
+    'charge_target_taper': [('regen_zero_v', 'regen_min_v'), ('regen_zero_soc_pct', 'regen_min_soc_pct')],
+}
+
+
+def _migrate_zero_to_min_keys(feature, values):
+    """Returns a copy of `values` with any old zero_v-suffixed key translated
+    to its new min_v-suffixed equivalent, only when the new key isn't already
+    present (same "don't overwrite a post-migration save" guard as
+    _migrate_temp_f_keys)."""
+    values = dict(values)
+    for old_key, new_key in _ZERO_TO_MIN_KEY_MIGRATIONS.get(feature, []):
+        if old_key in values and new_key not in values:
+            values[new_key] = values.pop(old_key)
+    return values
 
 
 def _migrate_temp_f_keys(feature, values):
@@ -213,16 +261,20 @@ def _clear_disabled_feature(fault_log, entries):
 _CONFIG_SANITY_CHECKS = [
     ('low_voltage_cutoff', 'emergency_low_v', 'min_cell_v',
      'the emergency tier should be more extreme (lower) than the soft-cut tier'),
-    ('discharge_power_taper', 'taper_zero_v', 'taper_start_v',
-     'zero-power point should be below the full-power point'),
+    ('discharge_power_taper', 'taper_min_v', 'taper_start_v',
+     'min-power point should be below the full-power point'),
     ('discharge_power_taper', 'discharge_min_kw', 'discharge_max_kw',
      'minimum discharge power request should be below maximum discharge power request'),
-    ('charge_target_taper', 'regen_full_v', 'regen_zero_v',
-     'full-power point should be below the zero-power point'),
-    ('charge_target_taper', 'regen_zero_v', 'emergency_high_v',
-     'the emergency tier should be more extreme (higher) than the zero-power point'),
+    ('discharge_power_taper', 'taper_min_soc_pct', 'taper_start_soc_pct',
+     'min-power SoC% should be below the full-power SoC% (discharge backs off approaching empty)'),
+    ('charge_target_taper', 'regen_full_v', 'regen_min_v',
+     'full-power point should be below the min-power point'),
+    ('charge_target_taper', 'regen_min_v', 'emergency_high_v',
+     'the emergency tier should be more extreme (higher) than the min-power point'),
     ('charge_target_taper', 'regen_min_kw', 'regen_max_kw',
      'minimum regen power request should be below maximum regen power request'),
+    ('charge_target_taper', 'regen_full_soc_pct', 'regen_min_soc_pct',
+     'full-power SoC% should be below the min-power SoC% (regen backs off approaching full)'),
     ('over_temperature_derate', 'charge_low_block_c', 'charge_derate_low_start_c',
      'the cold block point should be below the cold-derate-start point'),
     ('over_temperature_derate', 'charge_derate_start_c', 'charge_hard_stop_c',
@@ -246,6 +298,21 @@ _CHARGE_EMULATION_SANITY_CHECKS = [
     ('ac_min_v', 'ac_cutoff_v', 'the minimum-power point should be at or below the stop-charging cutoff', True),
     ('ac_cutoff_v', 'ac_emergency_v', 'the emergency tier should be more extreme (higher) than the stop-charging cutoff', False),
     ('ac_min_kw', 'ac_max_kw', 'AC minimum power request should be below AC maximum power request', False),
+    # AC-charger temperature pair (added 2026-08-13, blind-review finding -
+    # these 4 fields, added 2026-08-11, were never given the same ordering
+    # check every other threshold family in this file already has, matching
+    # over_temperature_derate's analogous charge_low_block_c/
+    # charge_derate_low_start_c and discharge_derate_start_c/
+    # discharge_hard_stop_c pairs above). Direction confirmed against
+    # _ramp_factor(value, floor, ceiling)'s own contract (0.0 at/below
+    # floor, 1.0 at/above ceiling): cold_factor uses
+    # (ac_low_block_c=floor, ac_derate_low_start_c=ceiling); hot_factor
+    # uses (ac_derate_start_c=floor, ac_hard_stop_c=ceiling) - see
+    # ac_charge_temp_derate in apply() below.
+    ('ac_low_block_c', 'ac_derate_low_start_c',
+     'the cold block point should be below the cold-derate-start point', False),
+    ('ac_derate_start_c', 'ac_hard_stop_c',
+     'the derate-start point should be below the hard-stop point', False),
 ]
 
 
@@ -311,15 +378,39 @@ def default_config():
             # individual cell voltage, not SoC - a single weak/imbalanced
             # cell sags under heavy discharge load well before pack-average
             # SoC would suggest. Full power at/above taper_start_v, ramping
-            # to zero at/below taper_zero_v (matches low_voltage_cutoff's
+            # to zero at/below taper_min_v (matches low_voltage_cutoff's
             # min_cell_v soft-cut floor by default, so the ramp reaches zero
             # right as the soft cut engages - a smooth transition instead of
             # full-power-then-sudden-stop).
-            # taper_start_v 3.50->3.00V and taper_zero_v 3.00->2.60V (user
+            # taper_start_v 3.50->3.00V and taper_min_v 3.00->2.60V (user
             # edit, 2026-08-01): re-anchored to the same 2.60V now used by
             # low_voltage_cutoff's emergency tier, so the taper still
             # reaches zero right around where the cutoff tiers sit.
-            'taper_start_v': 3.00, 'taper_zero_v': 2.60,
+            'taper_start_v': 3.00, 'taper_min_v': 2.60,
+            # taper_start_soc_pct/taper_min_soc_pct (added 2026-08-13, user
+            # directive: "use SOC as the primary control and the battery
+            # voltage as a secondary... SOC does not dramatically drop like
+            # voltage does" - investigation that led here:
+            # tests/check_taper_smoothness.py showed a real captured session
+            # producing 6.7kW jumps from a SINGLE raw ADC count of per-cell
+            # voltage noise (1.22mV, the RZ450e's own 12-bit/5V CAN
+            # resolution) through a narrow taper window - not something this
+            # bridge can fix by improving voltage resolution, since that
+            # ceiling is set by the RZ450e's own sensor. SoC is polled far
+            # less often (~every 15s via DID, not every CAN tick) and moves
+            # smoothly across a wide %, so spreading the SAME kW range across
+            # a wide SoC window is inherently smoother per update. Combined
+            # with the voltage factor via min() in apply() below - NOT a
+            # replacement - so SoC dominates the smooth day-to-day ramp while
+            # a genuine voltage sag can still independently and instantly
+            # pull power down (the "quick cutoff still works with voltage"
+            # the user asked to keep). Starting values, not yet researched or
+            # real-hardware-confirmed (docs/11): full power down to 20% SoC,
+            # ramping to zero by 8% SoC - deliberately lands right at
+            # low_voltage_cutoff's own min_soc_pct backup-check floor (8.0%
+            # default), the same "taper reaches zero right as the harder cut
+            # engages" pairing taper_min_v already does against min_cell_v.
+            'taper_start_soc_pct': 20.0, 'taper_min_soc_pct': 8.0,
             # Hysteresis (user-specified): fast to respond to a dip (snap
             # down immediately - cell protection can't wait), slow to
             # recover back to full power once voltage comes back up (avoids
@@ -331,7 +422,7 @@ def default_config():
             # parameter-clamping audit - user directive: "both need min and
             # max settings by the user", same pattern as charger_limit_kw's
             # ac_min_kw/ac_max_kw). min_kw=0.0 preserves existing behavior
-            # exactly (the taper still reaches true zero at taper_zero_v,
+            # exactly (the taper still reaches true zero at taper_min_v,
             # matching tests/test_management_engine.py's existing hysteresis
             # test). max_kw=110.0 matches the existing static
             # leaf_signals.DEFAULTS['discharge_limit_kw'] AND is independently
@@ -362,13 +453,13 @@ def default_config():
             # the VCM is slow to respond to a charge_limit_kw change, so the
             # taper must start well before the danger zone, not right at its
             # edge. Full power at/below regen_full_v, zero at/above
-            # regen_zero_v, linear between.
-            'regen_full_v': 4.00, 'regen_zero_v': 4.15,
+            # regen_min_v, linear between.
+            'regen_full_v': 4.00, 'regen_min_v': 4.15,
             # emergency_high_v 4.30->4.20V (user edit, 2026-08-03, docs/13
             # item 15.3) - set to the standard NMC charge ceiling exactly
             # (docs/05's researched 4.20V), tightening the margin above the
             # 4.15V zero-power point to 0.05V (still passes the
-            # regen_zero_v < emergency_high_v config-sanity check).
+            # regen_min_v < emergency_high_v config-sanity check).
             'emergency_high_v': 4.20,
             # Hysteresis (added 2026-08-01, user request: "regen we should
             # add some hysteresis? same as discharge?") - same fast-attack/
@@ -390,6 +481,16 @@ def default_config():
             # researched ~36kW figure once ready, this is not a "confirmed
             # correct" default.
             'regen_min_kw': 0.0, 'regen_max_kw': 70.0,
+            # regen_full_soc_pct/regen_min_soc_pct (added 2026-08-13) -
+            # mirrors discharge_power_taper's own SoC fields above (see that
+            # block's comment for the full rationale), applied to regen
+            # instead: backs off approaching a FULL pack, not an empty one.
+            # Full power at/below 80% SoC (matches charge_emulation's own
+            # daily_target_pct default, a deliberate, already-established
+            # "80% is the normal stop point" reference in this project, not
+            # a new invented number), ramping to zero by 100%. Starting
+            # values, not yet researched or real-hardware-confirmed.
+            'regen_full_soc_pct': 80.0, 'regen_min_soc_pct': 100.0,
         },
         'over_temperature_derate': {
             'enabled': True,
@@ -503,6 +604,28 @@ def default_config():
             # 5.6°C delta, no behavior change.)
             'enabled': True, 'max_delta_c': 5.6, 'soft_cut_s': 60.0, 'hard_escalation_s': 5.0,
         },
+        'temp_probe_cross_check': {
+            # Live redundancy check between the DID 0x1814 per-probe temps
+            # (primary as of 2026-08-14) and the 0x4AA CAN-broadcast per-probe
+            # temps (backup) for the SAME 16 physical probes - added
+            # alongside making DID primary (user directive: "add the cross
+            # check. this is key to make sure we have good data"). Distinct
+            # from temp_data_cross_check above, which compares the 0x4A7
+            # pack-level EXTREMES summary against the probe array as a whole
+            # - this instead compares each of the 16 probes against itself
+            # (DID reading vs CAN reading for that exact probe), catching a
+            # bad/stuck probe on either source that the extremes-only check
+            # could miss if it isn't currently the pack's hottest/coldest.
+            # max_delta_c starting point (documented, not yet real-hardware-
+            # confirmed - see docs/11): 0x4AA is whole-degree-quantized (up
+            # to just under 1.0C of rounding error alone vs DID's real
+            # 1/256C resolution), plus a small allowance for the two sources
+            # being sampled at different times (DID polls every ~10s, CAN is
+            # continuous) - temperature moves slowly enough that this
+            # shouldn't add much. Same 60s/5s soft->hard timing as every
+            # other cross-check here, independently tunable.
+            'enabled': True, 'max_delta_c': 2.0, 'soft_cut_s': 60.0, 'hard_escalation_s': 5.0,
+        },
         # Both below: given a real enable/disable toggle 2026-08-03 (docs/13
         # items 15.14/15.15, user directive) - previously hardcoded always-on
         # with no config field at all. Default ON (these are genuine safety
@@ -556,6 +679,7 @@ class ManagementEngine:
         self._overcurrent_direction = None
         self._cross_check_since = None
         self._temp_cross_check_since = None
+        self._temp_probe_cross_check_since = None
         # Hard-cut latch (docs/12 finding F8, fixed 2026-08-01 per user
         # directive: "it should only reset AFTER the car has been powered
         # down and back on OR if the charger is unplugged and replugged").
@@ -586,6 +710,13 @@ class ManagementEngine:
         # conditions as the hard-cut latch, "wait for the plug to be
         # reinserted to charge again" (user directive).
         self._ac_charge_stop_latched = False
+        # AC-charging-specific temperature stop latch (added 2026-08-11, user
+        # report: no heat regulation existed for charging at all). Separate
+        # from `_ac_charge_stop_latched` above (voltage cutoff/SoC target)
+        # so Fault History can distinguish WHY a session stopped - same
+        # "unplug/replug to resume" latch discipline, cleared only by
+        # notify_session_start()/notify_charge_replug().
+        self._ac_charge_temp_stop_latched = False
         # Staleness-specific hard cut, THIS tick only (docs/13 item 14.3,
         # fixed 2026-08-03) - RealtimeEngine's ShutdownSequencer needs to
         # know specifically whether the CURRENT hard cut came from the
@@ -617,6 +748,7 @@ class ManagementEngine:
         back on." Clears a latched hard cut and a latched AC charge-stop."""
         self._hard_latched = False
         self._ac_charge_stop_latched = False
+        self._ac_charge_temp_stop_latched = False
 
     def notify_charge_replug(self):
         """Called by RealtimeEngine when a fresh charge request follows a
@@ -625,6 +757,7 @@ class ManagementEngine:
         condition, alongside a fresh session start, that's allowed to)."""
         self._hard_latched = False
         self._ac_charge_stop_latched = False
+        self._ac_charge_temp_stop_latched = False
 
     def apply(self, leaf_state, rz_state):
         """leaf_state: dict of Leaf output values already produced by
@@ -718,14 +851,35 @@ class ManagementEngine:
         f = cfg['discharge_power_taper']
         if f['enabled']:
             if worst_low is not None:
-                instant_factor = _ramp_factor(worst_low, f['taper_zero_v'], f['taper_start_v'])
+                v_factor = _ramp_factor(worst_low, f['taper_min_v'], f['taper_start_v'])
             else:
-                instant_factor = 1.0
+                v_factor = 1.0
+            # SoC-based factor (added 2026-08-13, user directive: "use SOC as
+            # the primary control and the battery voltage as a secondary...
+            # SOC does not dramatically drop like voltage does" - see
+            # default_config()'s own comment on taper_start_soc_pct for the
+            # full investigation that led here). Combined with v_factor via
+            # min() below, NOT a replacement: under normal conditions SoC's
+            # wide default window makes it the tighter (lower, i.e. more
+            # restrictive) of the two across most of the discharge range, so
+            # it dominates the smooth day-to-day ramp - but a genuine voltage
+            # sag can still independently and instantly pull the combined
+            # factor down, same as before this change. No SoC data yet ->
+            # factor 1.0 (does not restrict), same fallback convention as
+            # every other missing-data case in this engine - degrades
+            # exactly to the old voltage-only behavior.
+            if soc is not None:
+                soc_factor = _ramp_factor(soc, f['taper_min_soc_pct'], f['taper_start_soc_pct'])
+            else:
+                soc_factor = 1.0
+            instant_factor = min(v_factor, soc_factor)
 
             # Hysteresis: fast attack (snap down immediately on a dip - cell
             # protection can't wait for a slow ramp), slow release (rate-
             # limited recovery back to full power, avoids power hunting if
             # voltage bounces near the threshold under intermittent load).
+            # Applies to the COMBINED instant_factor - whichever of
+            # voltage/SoC is currently more restrictive.
             if instant_factor < self._discharge_factor_applied:
                 self._discharge_factor_applied = instant_factor
             elif instant_factor > self._discharge_factor_applied:
@@ -743,13 +897,14 @@ class ManagementEngine:
             floor_kw, max_kw = f['discharge_min_kw'], f['discharge_max_kw']
             ceiling_kw = max(floor_kw, min(out.get('discharge_limit_kw', 0.0), max_kw))
             out['discharge_limit_kw'] = floor_kw + (ceiling_kw - floor_kw) * self._discharge_factor_applied
-            if worst_low is not None:
-                status['discharge_power_taper'] = (
-                    f'applied factor={self._discharge_factor_applied:.2f} (instant={instant_factor:.2f}, '
-                    f'worst cell {worst_low:.3f}V - full >= {f["taper_start_v"]}V, zero <= {f["taper_zero_v"]}V)')
-            else:
-                status['discharge_power_taper'] = (
-                    f'applied factor={self._discharge_factor_applied:.2f} (no per-cell voltage data yet)')
+            binding = 'SoC' if soc_factor <= v_factor else 'voltage'
+            v_desc = f'{worst_low:.3f}V' if worst_low is not None else 'no data'
+            soc_desc = f'{soc:.1f}%' if soc is not None else 'no data'
+            status['discharge_power_taper'] = (
+                f'applied factor={self._discharge_factor_applied:.2f} (instant={instant_factor:.2f}, '
+                f'binding={binding}; voltage_factor={v_factor:.2f} [{v_desc}, full >= {f["taper_start_v"]}V, '
+                f'min <= {f["taper_min_v"]}V]; soc_factor={soc_factor:.2f} [{soc_desc}, full >= '
+                f'{f["taper_start_soc_pct"]:g}%, min <= {f["taper_min_soc_pct"]:g}%])')
         else:
             status['discharge_power_taper'] = 'disabled'
             self._discharge_factor_applied = 1.0   # docs/13 item 14.5 - don't resume a stale ramped-down factor if re-enabled later
@@ -776,16 +931,32 @@ class ManagementEngine:
                 out['charge_limit_kw'] = 0.0
             else:
                 if worst_high is not None:
-                    instant_factor = 1.0 - _ramp_factor(worst_high, f['regen_full_v'], f['regen_zero_v'])
-                    cell_status = (
-                        f'proactive regen taper factor={instant_factor:.2f} (worst cell '
-                        f'{worst_high:.3f}V - full <= {f["regen_full_v"]}V, zero >= {f["regen_zero_v"]}V)')
+                    v_factor = 1.0 - _ramp_factor(worst_high, f['regen_full_v'], f['regen_min_v'])
                 else:
-                    instant_factor = 1.0
-                    cell_status = 'no per-cell voltage data yet - full power'
+                    v_factor = 1.0
+                # SoC-based factor (added 2026-08-13) - mirrors
+                # discharge_power_taper's own SoC addition above (see that
+                # block's comment for the full rationale), applied to regen
+                # instead: backs off approaching a FULL pack, not an empty
+                # one. Combined with v_factor via min(), not a replacement -
+                # see discharge_power_taper's comment for why.
+                if soc is not None:
+                    soc_factor = 1.0 - _ramp_factor(soc, f['regen_full_soc_pct'], f['regen_min_soc_pct'])
+                else:
+                    soc_factor = 1.0
+                instant_factor = min(v_factor, soc_factor)
+                binding = 'SoC' if soc_factor <= v_factor else 'voltage'
+                v_desc = f'{worst_high:.3f}V' if worst_high is not None else 'no data'
+                soc_desc = f'{soc:.1f}%' if soc is not None else 'no data'
+                cell_status = (
+                    f'proactive regen taper factor={instant_factor:.2f} (binding={binding}; '
+                    f'voltage_factor={v_factor:.2f} [{v_desc}, full <= {f["regen_full_v"]}V, min >= '
+                    f'{f["regen_min_v"]}V]; soc_factor={soc_factor:.2f} [{soc_desc}, full <= '
+                    f'{f["regen_full_soc_pct"]:g}%, min >= {f["regen_min_soc_pct"]:g}%])')
                 # Hysteresis (added 2026-08-01, user request: "regen we
                 # should add some hysteresis? same as discharge?") - same
                 # fast-attack/slow-release pattern as discharge_power_taper.
+                # Applies to the COMBINED instant_factor.
                 if instant_factor < self._regen_factor_applied:
                     self._regen_factor_applied = instant_factor
                 elif instant_factor > self._regen_factor_applied:
@@ -978,6 +1149,94 @@ class ManagementEngine:
                 'ac_cutoff_stop', 'AC charger stop-charging cutoff reached (per-cell)',
                 'warn', self._ac_charge_stop_latched, status['ac_charge_taper'])
 
+        # AC-charger-specific temperature derate (added 2026-08-11, user
+        # report: "we dont have any heat regulation for charging... the
+        # battery temp should control the charge ramp... we need separate
+        # inputs for those temps for when charging in the charger tab.
+        # there not the same values"). Same split already applied to voltage
+        # above (ac_charge_taper vs charge_target_taper) - independently
+        # tunable cold/hot thresholds, own enable checkbox on the Charge
+        # Emulation tab, own fault_log entries. Only ever touches
+        # charger_limit_kw, and only while a real charge session is active -
+        # same "fully separate control path from driving" gating
+        # ac_charge_taper already uses (see its own 2026-08-07 comment
+        # above), so this feature can never reduce "Max power for charger"
+        # while simply driving with nothing plugged in.
+        ac_temp_cfg = rz_state.charge_emulation
+        if not ac_temp_cfg.get('ac_temp_derate_enabled', True):
+            status['ac_charge_temp_derate'] = 'disabled'
+            _clear_disabled_feature(self.fault_log, [
+                ('ac_charge_cold_block', 'AC charger blocked - coldest probe at/below freezing', 'warn'),
+                ('ac_charge_temp_stop', 'AC charger stopped - hottest probe over the charging-specific '
+                                        'hard-stop temp', 'warn')])
+        elif not charging_active:
+            # Do NOT clear _ac_charge_temp_stop_latched here - charging_active
+            # is a bare, undebounced read of the RZ450e interlock, and a
+            # momentary glitch (not a real unplug) would silently resume a
+            # charger that just hard-stopped on heat. Matches
+            # _ac_charge_stop_latched's own sibling branch above: only
+            # notify_session_start()/notify_charge_replug() (real,
+            # replug-debounced events) may clear this latch.
+            status['ac_charge_temp_derate'] = (
+                'not actively charging per RZ450e interlock - AC charging-specific temp derate inactive '
+                "(driving-mode over-temperature protection is over_temperature_derate, above, not this "
+                "feature)")
+            self.fault_log.update(
+                'ac_charge_cold_block', 'AC charger blocked - coldest probe at/below freezing',
+                'warn', False, status['ac_charge_temp_derate'])
+            self.fault_log.update(
+                'ac_charge_temp_stop', 'AC charger stopped - hottest probe over the charging-specific '
+                                       'hard-stop temp', 'warn', self._ac_charge_temp_stop_latched,
+                status['ac_charge_temp_derate'])
+        elif temp_max is None:
+            status['ac_charge_temp_derate'] = 'no temperature data yet - full power (see docs/13 13.1)'
+            self.fault_log.update(
+                'ac_charge_cold_block', 'AC charger blocked - coldest probe at/below freezing',
+                'warn', False, status['ac_charge_temp_derate'])
+            self.fault_log.update(
+                'ac_charge_temp_stop', 'AC charger stopped - hottest probe over the charging-specific '
+                                       'hard-stop temp', 'warn', self._ac_charge_temp_stop_latched,
+                status['ac_charge_temp_derate'])
+        else:
+            ac_temp_min = rz_state.get_input('temp_min')
+            ac_cold_ref = ac_temp_min if ac_temp_min is not None else temp_max
+            cold_factor = _ramp_factor(ac_cold_ref, ac_temp_cfg['ac_low_block_c'], ac_temp_cfg['ac_derate_low_start_c'])
+            hot_factor = 1.0 - _ramp_factor(temp_max, ac_temp_cfg['ac_derate_start_c'], ac_temp_cfg['ac_hard_stop_c'])
+            ac_temp_factor = min(cold_factor, hot_factor)
+            out['charger_limit_kw'] = out.get('charger_limit_kw', 0.0) * ac_temp_factor
+
+            # Latch (same discipline as `_ac_charge_stop_latched` above,
+            # kept as its own separate flag so Fault History can distinguish
+            # "stopped on voltage/SoC" from "stopped on heat"): reaching the
+            # hot hard-stop temp ends the session outright rather than just
+            # holding at 0kW and silently auto-resuming as the pack cools -
+            # a pack that got this hot WHILE CHARGING deserves a deliberate
+            # stop, not a silent retry. The cold side deliberately does NOT
+            # latch (mirrors driving-mode behavior) - a cold-soaked pack
+            # warming back up is expected to resume on its own.
+            if temp_max >= ac_temp_cfg['ac_hard_stop_c']:
+                self._ac_charge_temp_stop_latched = True
+            if self._ac_charge_temp_stop_latched:
+                out['full_charge_flag'] = 1
+                out['charge_limit_kw'] = 0.0
+                out['charger_limit_kw'] = -10.0
+
+            status['ac_charge_temp_derate'] = (
+                f'charger_factor={ac_temp_factor:.2f} (coldest probe {ac_cold_ref:.1f}C, '
+                f'hottest probe {temp_max:.1f}C, cold block <= {ac_temp_cfg["ac_low_block_c"]}C, '
+                f'hard stop >= {ac_temp_cfg["ac_hard_stop_c"]}C)')
+            if self._ac_charge_temp_stop_latched:
+                status['ac_charge_temp_derate'] += (
+                    ' | AC charge stopped - over the charging hard-stop temp, unplug/replug to resume')
+
+            self.fault_log.update(
+                'ac_charge_cold_block', 'AC charger blocked - coldest probe at/below freezing',
+                'warn', ac_cold_ref <= ac_temp_cfg['ac_low_block_c'], status['ac_charge_temp_derate'])
+            self.fault_log.update(
+                'ac_charge_temp_stop', 'AC charger stopped - hottest probe over the charging-specific '
+                                       'hard-stop temp', 'warn', self._ac_charge_temp_stop_latched,
+                status['ac_charge_temp_derate'])
+
         f = cfg['over_temperature_derate']
         if f['enabled'] and temp_max is None:
             # Parity fix (docs/13 item 13.7, added 2026-08-03): previously
@@ -991,9 +1250,9 @@ class ManagementEngine:
             status['over_temperature_derate'] = 'no temperature data yet - full power (see docs/13 13.1)'
             for key, label in (
                     ('over_temp_emergency', 'Over-temperature EMERGENCY hard cut (hottest probe)'),
-                    ('charge_cold_block', 'Charge/regen blocked - coldest probe at/below freezing'),
+                    ('charge_cold_block', 'Regen blocked - coldest probe at/below freezing'),
                     ('discharge_temp_zero', 'Discharge power at zero - over-temperature'),
-                    ('charge_temp_zero', 'Charge/regen power at zero - over-temperature')):
+                    ('charge_temp_zero', 'Regen power at zero - over-temperature')):
                 self.fault_log.update(key, label, 'warn' if key != 'over_temp_emergency' else 'hard',
                                       False, status['over_temperature_derate'])
         elif f['enabled'] and temp_max is not None:
@@ -1008,7 +1267,8 @@ class ManagementEngine:
             temp_min = rz_state.get_input('temp_min')
             cold_ref = temp_min if temp_min is not None else temp_max
 
-            if temp_max >= f['emergency_temp_c']:
+            emergency = temp_max >= f['emergency_temp_c']
+            if emergency:
                 hard_cut = True
                 d_factor = 0.0
                 c_factor = 0.0
@@ -1017,37 +1277,50 @@ class ManagementEngine:
             else:
                 d_factor = 1.0 - _ramp_factor(temp_max, f['discharge_derate_start_c'], f['discharge_hard_stop_c'])
 
-                # Cold-side derate (docs/12 finding F3): ramps charge/regen
+                # Cold-side derate (docs/12 finding F3): ramps regen
                 # acceptance down approaching 0C instead of a single on/off
                 # block at the freezing line - our real exposure here is
-                # regen into a cold-soaked pack, not the 0.09C AC charger.
+                # regen into a cold-soaked pack, not the 0.09C AC charger
+                # (which has its OWN independently-tunable cold/hot
+                # thresholds, ac_charge_temp_derate above, not these ones).
                 cold_factor = _ramp_factor(cold_ref, f['charge_low_block_c'], f['charge_derate_low_start_c'])
                 hot_factor = 1.0 - _ramp_factor(temp_max, f['charge_derate_start_c'], f['charge_hard_stop_c'])
                 c_factor = min(cold_factor, hot_factor)
 
                 status['over_temperature_derate'] = (
-                    f'discharge_factor={d_factor:.2f}, charge_factor={c_factor:.2f} '
+                    f'discharge_factor={d_factor:.2f}, regen_factor={c_factor:.2f} '
                     f'(coldest probe {cold_ref:.1f}C, hottest probe {temp_max:.1f}C)')
 
             out['discharge_limit_kw'] = out.get('discharge_limit_kw', 0.0) * d_factor
             out['charge_limit_kw'] = out.get('charge_limit_kw', 0.0) * c_factor
-            out['charger_limit_kw'] = out.get('charger_limit_kw', 0.0) * c_factor
+            # charger_limit_kw (AC charging) is deliberately NOT multiplied by
+            # the graduated c_factor above (fixed 2026-08-11, user report:
+            # "we need separate inputs for those temps for when charging in
+            # the charger tab. there not the same values") - that's now
+            # ac_charge_temp_derate's own job, with its own thresholds, above.
+            # The TRUE pack-wide emergency below is the one exception: a
+            # genuine over-temperature emergency is a real hazard regardless
+            # of what's drawing/accepting current, so it still forces
+            # charger_limit_kw to 0 as the final universal backstop, same as
+            # every other hard-tier emergency in this engine.
+            if emergency:
+                out['charger_limit_kw'] = 0.0
 
             self.fault_log.update('over_temp_emergency', 'Over-temperature EMERGENCY hard cut (hottest probe)',
                                   'hard', temp_max >= f['emergency_temp_c'], status['over_temperature_derate'])
-            self.fault_log.update('charge_cold_block', 'Charge/regen blocked - coldest probe at/below freezing',
+            self.fault_log.update('charge_cold_block', 'Regen blocked - coldest probe at/below freezing',
                                   'warn', cold_ref <= f['charge_low_block_c'], status['over_temperature_derate'])
             self.fault_log.update('discharge_temp_zero', 'Discharge power at zero - over-temperature',
                                   'warn', d_factor <= 0.0, status['over_temperature_derate'])
-            self.fault_log.update('charge_temp_zero', 'Charge/regen power at zero - over-temperature',
+            self.fault_log.update('charge_temp_zero', 'Regen power at zero - over-temperature',
                                   'warn', c_factor <= 0.0, status['over_temperature_derate'])
         elif not f['enabled']:
             status['over_temperature_derate'] = 'disabled'
             _clear_disabled_feature(self.fault_log, [
                 ('over_temp_emergency', 'Over-temperature EMERGENCY hard cut (hottest probe)', 'hard'),
-                ('charge_cold_block', 'Charge/regen blocked - coldest probe at/below freezing', 'warn'),
+                ('charge_cold_block', 'Regen blocked - coldest probe at/below freezing', 'warn'),
                 ('discharge_temp_zero', 'Discharge power at zero - over-temperature', 'warn'),
-                ('charge_temp_zero', 'Charge/regen power at zero - over-temperature', 'warn')])
+                ('charge_temp_zero', 'Regen power at zero - over-temperature', 'warn')])
 
         f = cfg['cell_imbalance_monitor']
         if f['enabled']:
@@ -1263,18 +1536,18 @@ class ManagementEngine:
                             hard_cut = True
                             temp_hard_active = True
                             status['temp_data_cross_check'] = (
-                                f'MISMATCH {delta:.1f}F vs 0x4A7 pack-extremes summary for {held:.0f}s - '
+                                f'MISMATCH {delta:.1f}C vs 0x4A7 pack-extremes summary for {held:.0f}s - '
                                 f'escalated to HARD cut')
                         else:
                             status['temp_data_cross_check'] = (
-                                f'MISMATCH {delta:.1f}F vs 0x4A7 pack-extremes summary for {held:.0f}s - soft cut')
+                                f'MISMATCH {delta:.1f}C vs 0x4A7 pack-extremes summary for {held:.0f}s - soft cut')
                     else:
                         status['temp_data_cross_check'] = (
-                            f'mismatch {delta:.1f}F present {held:.1f}s/{f["soft_cut_s"]:.0f}s before '
+                            f'mismatch {delta:.1f}C present {held:.1f}s/{f["soft_cut_s"]:.0f}s before '
                             f'soft cut latches')
                 else:
                     self._temp_cross_check_since = None
-                    status['temp_data_cross_check'] = f'ok (delta {delta:.1f}F)'
+                    status['temp_data_cross_check'] = f'ok (delta {delta:.1f}C)'
             else:
                 self._temp_cross_check_since = None
                 status['temp_data_cross_check'] = 'no data to cross-check yet'
@@ -1291,6 +1564,64 @@ class ManagementEngine:
             _clear_disabled_feature(self.fault_log, [
                 ('temp_data_mismatch', 'Temperature data cross-check mismatch (0x4A7 extremes vs 0x4AA per-probe)', 'soft'),
                 ('temp_data_mismatch_hard', 'Temperature data cross-check mismatch - hard cut escalation', 'hard')])
+
+        # Temp probe cross-check (DID 0x1814 vs 0x4AA per-probe, added
+        # 2026-08-14) - same soft->hard escalation pattern as the two
+        # cross-checks above, but per-probe: compares each of the 16
+        # DID-sourced probe readings against the CAN-sourced reading for
+        # THAT SAME probe, and flags the worst (largest) single-probe
+        # disagreement. See default_config()'s comment for the max_delta_c
+        # reasoning (CAN quantization + sampling-time gap between the two
+        # sources).
+        f = cfg['temp_probe_cross_check']
+        if f['enabled']:
+            probe_soft_active = False
+            probe_hard_active = False
+            did_probe_vals = [rz_state.get_input(k) for k in rz450e_signals.temp_probe_did_keys()]
+            can_probe_vals = [rz_state.get_input(k) for k in rz450e_signals.temp_probe_can_keys()]
+            deltas = [(i + 1, abs(d - c)) for i, (d, c) in enumerate(zip(did_probe_vals, can_probe_vals))
+                      if d is not None and c is not None]
+            if deltas:
+                worst_probe, delta = max(deltas, key=lambda t: t[1])
+                if delta >= f['max_delta_c']:
+                    if self._temp_probe_cross_check_since is None:
+                        self._temp_probe_cross_check_since = now
+                    held = now - self._temp_probe_cross_check_since
+                    if held >= f['soft_cut_s']:
+                        soft_cut = True
+                        probe_soft_active = True
+                        if held - f['soft_cut_s'] >= f['hard_escalation_s']:
+                            hard_cut = True
+                            probe_hard_active = True
+                            status['temp_probe_cross_check'] = (
+                                f'MISMATCH probe {worst_probe} {delta:.1f}C DID vs CAN for {held:.0f}s - '
+                                f'escalated to HARD cut')
+                        else:
+                            status['temp_probe_cross_check'] = (
+                                f'MISMATCH probe {worst_probe} {delta:.1f}C DID vs CAN for {held:.0f}s - soft cut')
+                    else:
+                        status['temp_probe_cross_check'] = (
+                            f'mismatch probe {worst_probe} {delta:.1f}C present {held:.1f}s/'
+                            f'{f["soft_cut_s"]:.0f}s before soft cut latches')
+                else:
+                    self._temp_probe_cross_check_since = None
+                    status['temp_probe_cross_check'] = f'ok (worst delta probe {worst_probe} {delta:.1f}C)'
+            else:
+                self._temp_probe_cross_check_since = None
+                status['temp_probe_cross_check'] = 'no data to cross-check yet'
+
+            self.fault_log.update(
+                'temp_probe_mismatch', 'Temp probe cross-check mismatch (DID 0x1814 vs 0x4AA per-probe)',
+                'soft', probe_soft_active, status['temp_probe_cross_check'])
+            self.fault_log.update(
+                'temp_probe_mismatch_hard', 'Temp probe cross-check mismatch - hard cut escalation',
+                'hard', probe_hard_active, status['temp_probe_cross_check'])
+        else:
+            status['temp_probe_cross_check'] = 'disabled'
+            self._temp_probe_cross_check_since = None
+            _clear_disabled_feature(self.fault_log, [
+                ('temp_probe_mismatch', 'Temp probe cross-check mismatch (DID 0x1814 vs 0x4AA per-probe)', 'soft'),
+                ('temp_probe_mismatch_hard', 'Temp probe cross-check mismatch - hard cut escalation', 'hard')])
 
         f = cfg['staleness_watchdog']
         if f['enabled']:
@@ -1439,6 +1770,7 @@ class ManagementEngine:
                 # below, or an old _f-suffixed key would just look like dead
                 # config and be silently dropped instead of translated.
                 values = _migrate_temp_f_keys(feature, values)
+                values = _migrate_zero_to_min_keys(feature, values)
                 # Only pull in keys the current schema still defines - a saved
                 # profile from an older revision may carry fields that have
                 # since been removed (e.g. taper_start_pct, removed rev 2)
@@ -1458,7 +1790,10 @@ class ManagementEngine:
                     bounds = FEATURE_FIELD_BOUNDS.get((feature, key))
                     if bounds is not None:
                         try:
-                            value = max(bounds[0], min(bounds[1], float(value)))
+                            # parse_finite_float (not bare float()) - a NaN
+                            # would otherwise sail through min()/max() as if
+                            # in-range (2026-08-13 blind-review finding).
+                            value = max(bounds[0], min(bounds[1], leaf_signals.parse_finite_float(value)))
                         except (TypeError, ValueError):
                             continue
                     cfg[feature][key] = value

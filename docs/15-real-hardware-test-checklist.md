@@ -22,9 +22,9 @@ For most features, you do not need the real pack to actually reach a dangerous v
 to test the *logic* — you can instead temporarily move the feature's threshold to sit just past
 wherever the pack's real, current, everyday value already is, confirm the feature reacts exactly as
 designed, then put the threshold back to its real default. Example: if the pack is resting at
-3.70V/cell, temporarily set `discharge_power_taper`'s `taper_zero_v` to 3.75V — the real bench pack
-now sits "past zero-power" on that curve with zero real risk, and you can watch `discharge power
-limit` actually ramp down on the real Leaf dash exactly as it would at the true 2.60V default. This
+3.70V/cell, temporarily set `discharge_power_taper`'s `taper_min_v` to 3.75V — the real bench pack
+now sits "past its min-power point" on that curve with zero real risk, and you can watch `discharge
+power limit` actually ramp down on the real Leaf dash exactly as it would at the true 2.60V default. This
 confirms the wiring, the math, the Leaf-side effect, and the fault-log entry all work correctly on
 real hardware — it just doesn't confirm the *default number itself* is the physically-correct one
 (that part genuinely does need either real extremes or the future emulator — flagged per-item
@@ -163,11 +163,18 @@ monitor-only/data-integrity features.
 - [ ] **[LOGIC TESTABLE NOW, via bracketing or real regen near-full]** During real regenerative
       braking (ideally with the pack already at a higher SoC, closer to the 4.00-4.15V window), confirm
       `charge_limit_kw` ramps down as the worst cell rises. If the pack isn't naturally near that
-      window, bracket `regen_full_v`/`regen_zero_v` down to the pack's actual present voltage and
+      window, bracket `regen_full_v`/`regen_min_v` down to the pack's actual present voltage and
       confirm the same ramping behavior and fast-attack/slow-release hysteresis on recovery.
 - [ ] **[NUMBER UNCONFIRMED]** Whether 4.00V/4.15V/4.20V are actually early/wide enough given the
       real VCM's response lag to a `charge_limit_kw` change — needs an actual descending-hill regen
       event near a genuinely high SoC.
+- [ ] **[LOGIC TESTABLE NOW, via `tests/check_soc_taper_log_replay.py`]** SoC+voltage blending
+      (`regen_full_soc_pct`/`regen_min_soc_pct`, added Rev 69 2026-08-13 — see `05-...md`'s "SoC +
+      voltage combined taper" section): already software/real-log validated (zero regen reversals
+      across two real ~92min/~2h16m sessions, replayed through the real engine) — what's still
+      needed for a full Confirmed pass is watching it live on the dashboard/dash during an actual
+      test, not just replaying a captured log after the fact, and confirming a real voltage sag
+      still overrides a healthy SoC reading in person (not just in replay).
 - Result / date / notes: **FINDING (2026-08-09, real ZE1 40kWh Leaf)**: `regen_min_kw` reaches true
   zero cleanly. `regen_max_kw` only does anything once set BELOW what the real car can actually
   accept — on this real 40kWh test vehicle, anything from 70kW down to ~40kW is a no-op, since the
@@ -179,12 +186,18 @@ monitor-only/data-integrity features.
 
 ### B8. Discharge power taper
 - [ ] **[LOGIC TESTABLE NOW, via bracketing]** During real driving, bracket `taper_start_v`/
-      `taper_zero_v` up to just above the pack's actual present cell voltage and confirm discharge
+      `taper_min_v` up to just above the pack's actual present cell voltage and confirm discharge
       power visibly ramps down on the real dash, then recovers only gradually (not instantly) once
       the bracket is removed — confirming the fast-attack/slow-release hysteresis on real hardware.
 - [ ] **[NUMBER UNCONFIRMED]** Whether the real 3.00V/2.60V window and 3.0s recovery ramp feel right
       under genuine acceleration-load sag — needs actual hard-acceleration testing at a real,
       naturally low SoC (or after extended real discharge).
+- [ ] **[LOGIC TESTABLE NOW, via `tests/check_soc_taper_log_replay.py`]** SoC+voltage blending
+      (`taper_start_soc_pct`/`taper_min_soc_pct`, added Rev 69 2026-08-13 — root cause + fix
+      described in `05-...md`'s "SoC + voltage combined taper" section): already software/real-log
+      validated (zero discharge-side reversals across two real ~92min/~2h16m sessions). Same
+      remaining gap as B7's equivalent item — needs an in-person live observation, not just a
+      post-hoc replay.
 - Result / date / notes: **FINDING (2026-08-09, real ZE1 40kWh Leaf)**: `discharge_max_kw` around
   40kW brings the turtle (reduced-power) dash icon on; `discharge_min_kw` below roughly 3kW makes
   the car start turning off power systems entirely. Both are the real Leaf's own reaction to the
@@ -248,7 +261,7 @@ monitor-only/data-integrity features.
 
 ### B14. Temperature data cross-check (`0x4A7` extremes vs. 16 `0x4AA` probes)
 - [ ] **[LOGIC TESTABLE NOW]** Passively confirm "ok" status during normal operation.
-- [ ] **[NUMBER UNCONFIRMED]** Whether the 10°F default is wide enough to avoid nuisance-tripping
+- [ ] **[NUMBER UNCONFIRMED]** Whether the 5.6°C default is wide enough to avoid nuisance-tripping
       from real spatial thermal gradient across the pack's 4 physical sub-packs under real load —
       needs observation during genuine sustained driving, not just at rest.
 - [ ] **[NEEDS FAULT INJECTION — defer to emulator]** Forcing a genuine mismatch (real decode
@@ -270,7 +283,19 @@ monitor-only/data-integrity features.
 - [ ] **[LOGIC TESTABLE NOW]** Unplug the adapter mid-session; confirm the TX-OK indicator,
       reconnect counter, and `send_errors` counter all behave correctly, and reconnecting recovers
       cleanly.
-- Result / date / notes:
+- [ ] **[GAP FOUND, NOT YET BUILT]** After a manual reconnect during a rough patch, double-check the
+      channel dropdown before clicking Connect — `PCAN_USBBUSx` numbering isn't guaranteed stable
+      across a USB-level disconnect/reconnect (confirmed real-world, 2026-08-13, `docs/10-open-
+      questions.md` item 17: a session's RZ450e connection landed on `PCAN_USBBUS2` after a manual
+      reconnect, having used `PCAN_USBBUS1` for the whole rest of the session, with no physical
+      adapter swap). The app currently has no active check that a (re)connected channel is actually
+      carrying the traffic it's supposed to — see item 17 for the proposed fix, not yet built.
+- Result / date / notes: **FINDING (2026-08-13)**: real reconnect after a staleness-triggered
+  wind-down landed on a different bus number than the session started on (see docs/10 item 17 for
+  the full timeline). Evidence suggests no actual cross-wire happened (the very next `running`
+  window ran 43+ minutes with no further staleness event, which a genuine RZ450e/Leaf swap should
+  have re-triggered almost immediately), but this was inferred from the log, not directly observed
+  in person.
 
 ### B17. Signal mapping (current sign, GIDS/QC capacity)
 - [ ] **[LOGIC TESTABLE NOW]** Cross-check current sign convention against LeafSpy live (already
@@ -289,9 +314,11 @@ monitor-only/data-integrity features.
 - Result / date / notes: **RESOLVED 2026-08-06** - `LOGS_DIR` == the real `logs/` folder that
   already contains today's two test captures. Nothing further to verify.
 
-### B19. 6th wind-down trigger - bus-silence timeout (`leaf_signals.BUS_SILENCE_TIMEOUT_S`, added 2026-08-06)
-- [ ] **[LOGIC TESTABLE NOW, via bracketing]** Temporarily lower `BUS_SILENCE_TIMEOUT_S` (code
-      constant, not currently GUI-exposed) to a few seconds, get the bridge into `running` with a
+### B19. 6th wind-down trigger - bus-silence timeout (`bus_silence_timeout_s`, added 2026-08-06)
+- [ ] **[LOGIC TESTABLE NOW, via bracketing]** Temporarily lower `bus_silence_timeout_s` (GUI-
+      editable as of 2026-08-14 via the "Timing" tab - was a bare `leaf_signals.
+      BUS_SILENCE_TIMEOUT_S` code constant before that) to a few seconds, get the bridge into
+      `running` with a
       real Leaf connected, then physically stop all Leaf-bus traffic (unplug the Leaf-side adapter,
       not the RZ450e side) without going through a normal ignition-off/charge-end sequence. Confirm
       the sequencer winds down after the shortened timeout even though none of the other 4 (or
@@ -399,6 +426,94 @@ promoting to Confirmed.
 - Result / date / notes: **RESOLVED 2026-08-06** - confirmed directly, not just by inspection. Feel
   free to also just try typing garbage into the real running app for a sanity check, but this one
   doesn't need real CAN hardware to be considered done.
+
+### B23. AC charger temperature derate (`ac_charge_temp_derate`, added 2026-08-11)
+User report: no heat regulation existed for AC charging at all - `over_temperature_derate`'s
+graduated ramp used to also govern `charger_limit_kw` using driving-mode thresholds; now split into
+its own independently-tunable feature on the Charge Emulation tab, same split B6 already covers for
+voltage. `ac_charge_taper` and this feature can both be active on `charger_limit_kw` at once
+(whichever is more restrictive dominates) - see B6 for the voltage side.
+- [x] **[SOFTWARE-VERIFIED]** Unit-tested (`tests/test_management_engine.py`): stays untouched
+      while driving (not actually charging), cold-side ramps/blocks with no latch and auto-resumes
+      as the pack warms, hot side ramps to zero at `ac_hard_stop_c` AND latches `full_charge_flag`
+      (session ends), the latch survives the temp recovering and only clears via
+      `notify_charge_replug()`, disabling the feature live-clears its fault_log entries, and
+      `over_temperature_derate`'s own graduated ramp confirmed to no longer touch `charger_limit_kw`
+      except its true pack-wide emergency tier.
+- [ ] **[LOGIC TESTABLE NOW, via bracketing]** During a real charge session, bracket
+      `ac_derate_start_c`/`ac_hard_stop_c` (hot side) down to just past the pack's real current
+      hottest-probe reading; confirm `charger_limit_kw` ramps down correctly and, on reaching
+      `ac_hard_stop_c`, `full_charge_flag` latches and the session genuinely stops (needs a real
+      unplug/replug to resume) - same bracketing technique as B10/B20 above.
+- [ ] **[LOGIC TESTABLE NOW, via bracketing]** Bracket `ac_low_block_c`/`ac_derate_low_start_c`
+      (cold side) up to just past the pack's real current coldest-probe reading; confirm charging
+      is blocked/derated correctly and auto-resumes with NO latch/replug needed once the bracketed
+      threshold is restored (or the probe warms past it) - this is the one case in this feature that
+      must NOT require a replug, worth specifically confirming it doesn't.
+- [ ] **[LOGIC TESTABLE NOW]** With both `ac_charge_taper` (voltage) and this feature enabled during
+      a real charge session, confirm they compose correctly - i.e. whichever factor is currently
+      more restrictive is the one actually limiting `charger_limit_kw`, not one silently overriding
+      the other.
+- [ ] **[NUMBER UNCONFIRMED]** All four thresholds (10/0°C cold, 32/45°C hot) are seeded from
+      `over_temperature_derate`'s existing charge-side numbers, not independently researched or
+      real-hardware-confirmed for the AC-charging-specific case (~0.09C, much lower current than
+      regen) - genuinely needs a real cold-soak or hot-soak charge test, or the future emulator, same
+      status as B10's own unconfirmed numbers.
+- Result / date / notes:
+
+### B24. Temp probe DID 0x1814 primary / 0x4AA CAN backup + temp probe cross-check (added 2026-08-14)
+User directive: DID `0x1814` (real 1/256°C resolution) is now the PRIMARY source for `temp_01`-
+`temp_16`, with the `0x4AA` CAN broadcast (whole-degree resolution) as the BACKUP, for both GUI
+display and the data generated for the Leaf output - see `02-source-signals-rz450e.md` and
+`06-realtime-engine-and-watchdog.md` section 1b. `temp_probe_cross_check` compares the two sources
+directly, per probe.
+- [x] **[SOFTWARE-VERIFIED]** Unit-tested (`tests/test_rz450e_signals.py`,
+      `tests/test_management_engine.py`, `tests/test_realtime_engine.py`) - decode formula, the
+      cross-check's soft/hard escalation and boundary delta, and the actual ingest-thread wiring
+      (CAN promoted to front-door when no DID data has arrived yet; front-door stays on DID while
+      fresh; falls back to CAN once the DID reading goes stale) - see `docs/14` for the full list.
+- [ ] **[LOGIC TESTABLE NOW]** With the real bench pack connected and DID polling running, confirm
+      `temp_01_did`..`temp_16_did` actually populate (GUI raw-value display) and that `temp_01`..
+      `temp_16` (front-door/effective values) match them once DID is live - i.e. DID really is
+      winning as primary, not silently falling back to CAN the whole time.
+- [ ] **[LOGIC TESTABLE NOW]** Temporarily disconnect/stall the DID responder only (if possible) or
+      just observe a session where DID polling naturally lags; confirm `temp_01`..`temp_16` fall back
+      to the `0x4AA` CAN values within roughly `did_temp_fresh_window_s` (20s default) of the DID
+      reading going stale, and recover to DID once it resumes.
+- [ ] **[NUMBER UNCONFIRMED]** Whether real DID `0x1814` vs. `0x4AA` per-probe readings actually
+      agree within the 2.0°C `temp_probe_cross_check` threshold under real conditions - this
+      assumes CAN quantization (~1.0°C) plus a small sampling-time-gap allowance is the only real
+      source of disagreement, which hasn't been checked against a real bench session with both
+      sources live.
+- [ ] **[NUMBER UNCONFIRMED]** Whether `did_temp_poll_interval_s` (10s default)/
+      `did_temp_fresh_window_s` (20s default) match the DID `0x1814` request's real round-trip time
+      on this pack, or need retuning via the "Timing" tab - see `docs/10-open-questions.md`
+      #18.
+- Result / date / notes:
+
+### B25. Timing tab (`engine_timing`, added 2026-08-14)
+User directive: "this app is kinda supposed to be a configurator for the hardware version... what
+else could be changed for configuration?" - 11 fields (4 DID-polling + 7 wind-down/charge-detection)
+moved from bare hardcoded module constants to a GUI-editable, profile-persisted live dict. None are
+ported/confirmed real-Leaf protocol values - see `06-realtime-engine-and-watchdog.md` section 1c.
+- [x] **[SOFTWARE-VERIFIED]** Unit-tested (`tests/test_shutdown_sequencer.py`,
+      `tests/test_config_profile.py`) - custom config actually drives `ShutdownSequencer`, default
+      instances don't share a mutable dict, profile save/load round-trips and clamps correctly, a
+      profile with no `engine_timing` section falls back to code defaults cleanly. GUI manually
+      verified end-to-end (launched the real app, all 11 fields render with correct defaults,
+      clamp/invalid-value feedback works) - see `docs/14` for the full list.
+- [ ] **[LOGIC TESTABLE NOW]** On the real bench rig, retune `ignition_off_delay_s`/
+      `chg_end_stop_s`/`chg_stall_timeout_s` down (bracketing technique, same as B10/B20) during a
+      real drive/charge session; confirm the bridge actually winds down faster, proving the live
+      values (not the old hardcoded ones) are really what's driving `ShutdownSequencer`.
+- [ ] **[LOGIC TESTABLE NOW]** Retune `did_response_timeout_s`/`did_inter_request_gap_s` and confirm
+      SoC/capacity/primary-V-I polling cadence actually changes accordingly on the Signal Mapping
+      tab's live-decoded-values list.
+- [ ] **[NUMBER UNCONFIRMED]** Whether the 7 wind-down/charge-detection defaults (unchanged values,
+      just newly editable) still hold up as the right numbers for THIS bench rig/real Leaf - same
+      unconfirmed status each already had individually before this tab existed (see their original
+      citations, now in `leaf_signals.ENGINE_TIMING_FIELDS`).
+- Result / date / notes:
 
 ---
 

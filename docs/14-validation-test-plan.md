@@ -67,6 +67,80 @@ Run it any time after changing a default in `bridge/management_engine.py`'s `def
 `bridge/leaf_signals.py`'s slider/check tables, to see exactly what it does to the actual saved
 profile rather than assuming nothing's affected.
 
+## `tests/check_taper_smoothness.py` — discharge/regen taper smoothness analysis (added 2026-08-13)
+
+Prompted by a user report that real captured discharge/regen taper output looked "jumpy." Four
+scenarios, each producing a PNG under `logs/` plus console stats (total variation, worst single-tick
+jump, direction-reversal count):
+
+1. **AC charge taper, smooth synthetic voltage sweep** (3.90V → past cutoff) — confirms the
+   predictable/monotonic case stays smooth (it does, aside from the dynamic uprate-level staircase
+   texture).
+2. **Discharge taper, synthetic sporadic load-sag pulses** — compares several `recovery_ramp_s`
+   values (3/8/20/45s) against the same noisy voltage trace, to isolate what raising the recovery
+   time alone does and doesn't fix.
+3. **Real log replay** — replays the actual captured cell-voltage trace from
+   `logs/minileaf_20260809_080913-power and regen settings test.trc` through the real engine using
+   that session's own settings (from its `_log_output.txt` companion), then re-runs the SAME real
+   trace at several `recovery_ramp_s` values.
+4. **Quantization staircase** — sweeps voltage ONE RAW ADC COUNT (1.22mV, the RZ450e's own 12-bit/5V
+   CAN resolution) at a time through the real engine, no noise at all, for both a narrow (20mV) and
+   wide (300mV) taper window, to isolate the actual root cause.
+
+**Root-cause finding this script established**: the jumpiness was never a hysteresis-timing problem.
+Per-cell voltage is quantized to ~1.22mV/count by the RZ450e's own sensor/CAN encoding - a taper
+window narrower than a few hundred mV amplifies that fixed quantization step into a multi-kW output
+jump (`span_kw / window_v × 1.22mV` - verified both analytically and against the real engine).
+Raising `recovery_ramp_s` reduces total output churn but does NOT reduce jump frequency, since the
+attack/drop side is deliberately instant (fast-attack cell protection). This finding directly
+motivated Rev 69's SoC blending - see `05-battery-management-safety.md`'s "SoC + voltage combined
+taper" section.
+
+Usage: `py tests/check_taper_smoothness.py` (no arguments - scenario 3's log path is currently
+hardcoded to the session above; scenarios 1/2/4 are fully synthetic).
+
+## `tests/check_soc_taper_log_replay.py` — real-log SoC+voltage taper replay (added 2026-08-13)
+
+The general-purpose successor to `check_taper_smoothness.py`'s scenario 3, generalized after a
+second real bench session showed hand-transcribing each session's settings/window boundaries doesn't
+scale. Replays a real captured session's cell voltage AND SoC through the actual
+`discharge_power_taper`/`charge_target_taper` (regen), to see how the SoC-primary/voltage-secondary
+blending (Rev 69) performed on real data - not a synthetic scenario.
+
+**Fully auto-driven from the target `.trc`'s own companion `_log_output.txt`** (see
+`08-gui-design.md`'s Log panel section) - no per-session hand-editing needed:
+- Taper settings (`discharge_power_taper`/`charge_target_taper` config) are parsed straight from
+  that session's own settings snapshot, not hardcoded.
+- The real `running`-phase window(s) are auto-detected from the Log-panel mirror's `Sequencer
+  phase:` lines (a session with a mid-capture disconnect/reconnect produces multiple windows,
+  plotted separately - a clean session produces one).
+- Disconnect/reconnect/cut/manual-stop-start events are pulled from the same mirror and annotated
+  directly on the plots (vertical markers + labels).
+- Falls back to a hardcoded default config if no companion file exists (older/partial captures).
+
+Decodes two real signal sources from the raw `.trc`: `0x020` (cell_min/cell_max, fast) and `0x74F`
+(UDS DID responses, slow - only the single-frame SoC response, DID `0x1F5B`, is decoded; the other
+two DIDs in this app's poll cycle are multi-frame and irrelevant here, so they're skipped rather than
+ISO-TP-reassembled). Both tapers are isolated (every other management feature disabled) and replayed
+with real captured timestamps so `recovery_ramp_s` hysteresis behaves exactly as it would have live.
+
+**Perf**: real captures run 700MB-1GB+ for a multi-hour session. Shells out to `grep -E` as a fast
+pre-filter (a few seconds even on a 1GB+ file, verified directly) before parsing the much smaller
+result in pure Python; falls back to a pure-Python scan (`bridge/trc_log.read_trc_rows`) if `grep`
+isn't on PATH.
+
+Usage: `py tests/check_soc_taper_log_replay.py ["<path to .trc>"]` - defaults to the most-recently-
+modified `.trc` under `logs/` if no path is given. Writes `logs/soc_taper_replay_<stem>_full.png`
+(whole session) plus one `..._window_<A/B/C/...>.png` per auto-detected running window, and prints
+per-window jumpiness stats to the console.
+
+**Validated against two real sessions (2026-08-13, post-Rev-69)**: zero direction reversals on both
+`discharge_limit_kw` and `charge_limit_kw` across a ~92-minute and a ~2h16m session respectively -
+compare to 810 reversals in just 16 minutes on the pre-Rev-69 voltage-only narrow-window test
+(`check_taper_smoothness.py`'s real-log-replay scenario). Strong real-data confirmation the SoC
+blending fix works, though still a software replay of captured data, not a from-scratch real-
+hardware retest of the feature itself.
+
 ---
 
 ## Part 1 — Software-testable (no hardware needed)
@@ -92,6 +166,8 @@ boundary. For each, add a test at (or just before/after) the exact configured va
       **done 2026-08-03**,
       `tests/test_management_engine.py::test_boundary_staleness_watchdog_soft_and_hard_escalation`
       (same shrunk-window pattern)
+- [x] `temp_probe_cross_check.max_delta_c` (2.0°C, new 2026-08-14) - just below vs. just above -
+      **done 2026-08-14**, `tests/test_management_engine.py::test_boundary_temp_probe_cross_check_delta`
 
 ### Tighten loose assertions (docs/13 item 6.4)
 - [x] `test_f1_cold_block_uses_coldest_probe`'s second check - assert the exact expected
@@ -150,6 +226,42 @@ boundary. For each, add a test at (or just before/after) the exact configured va
       adding test-only synchronization hooks to `bridge/can_backend.py` itself, which this project
       doesn't have; real-hardware/manual verification remains the only way to close that specific
       sub-case (see Part 2 below).
+- [x] Temp probe DID 0x1814 primary / 0x4AA CAN backup ingest wiring and `temp_probe_cross_check`
+      (added 2026-08-14, user directive) - previously ZERO coverage (brand-new feature this
+      session). `tests/test_rz450e_signals.py::test_decode_temp_probes_did_formula` /
+      `test_decode_temp_probes_did_too_short_response` (decode correctness),
+      `test_validate_inputs_shares_plausible_range_across_did_and_can_suffixes` (the new
+      `_plausible_key()` suffix-stripping so `temp_NN_did`/`temp_NN_can` share `temp_NN`'s
+      plausibility range). `tests/test_management_engine.py::
+      test_temp_probe_cross_check_soft_and_hard_escalation` /
+      `test_temp_probe_cross_check_no_data_yet_does_not_false_trigger` /
+      `test_temp_probe_cross_check_disabling_clears_fault_log_live` /
+      `test_boundary_temp_probe_cross_check_delta` (feature logic, same pattern as the pre-existing
+      cross-checks). `tests/test_realtime_engine.py::
+      test_temp_can_backup_promoted_to_front_door_when_no_did_data_yet` /
+      `test_temp_can_backup_does_not_override_front_door_while_did_is_fresh` /
+      `test_temp_falls_back_to_can_once_did_reading_goes_stale` - these three drive real frames
+      through the actual `_ingest_rz_bus()` thread (not just direct `SharedState` writes), the only
+      tests in this project that exercise the primary/backup SOURCE SELECTION logic itself rather
+      than just the downstream feature that consumes its output.
+- [x] Timing tab (`engine_timing`, added 2026-08-14, user directive: "this app is kinda
+      supposed to be a configurator for the hardware version... what else could be changed for
+      configuration?") - previously ZERO coverage (every value was a bare module constant with no
+      test injecting a custom value at all). `tests/test_shutdown_sequencer.py::
+      test_custom_config_overrides_default_timing` (a custom `config` dict actually drives
+      `ShutdownSequencer`'s behavior, not just the default fallback) and
+      `test_default_config_is_a_fresh_dict_not_shared_between_instances` (two default-constructed
+      instances don't share one mutable dict - would have silently broken if the default were a
+      module-level dict literal instead of built fresh per `__init__` call).
+      `tests/test_config_profile.py::test_engine_timing_round_trips_through_save_and_load`,
+      `test_engine_timing_clamps_out_of_bounds_value_from_profile` (same bounds-clamp pattern as
+      `charge_emulation`), `test_engine_timing_missing_from_profile_keeps_code_defaults` (an old
+      profile with no `engine_timing` section at all doesn't error or zero out - falls back to code
+      defaults). GUI itself (`EngineTimingPanel`) manually verified end-to-end: launched the real
+      app, confirmed all 11 fields render with correct defaults, and confirmed the clamp/invalid-
+      value feedback works (typed 999 into `did_response_timeout_s`, correctly clamped + flagged) -
+      no automated GUI test exists for this project's tkinter panels (none of the other panels have
+      one either), so this was a manual pass, not an automated regression test.
 
 ---
 
@@ -170,6 +282,18 @@ these are hardware-validated, they are edited numbers pending confirmation**:
       hot-weather operation
 - [ ] Cell imbalance warn spread: 100mV (was 50mV)
 - [ ] Cell data cross-check delta: 150mV (brand new feature/threshold)
+- [ ] Temp probe cross-check delta: 2.0°C, DID `0x1814` vs `0x4AA` CAN per probe (brand new feature/
+      threshold, 2026-08-14)
+- [ ] DID temp poll interval / freshness window: 10s / 20s (`engine_timing.did_temp_poll_interval_s`/
+      `did_temp_fresh_window_s`, GUI-editable "Timing" tab, added 2026-08-14) - chosen from
+      `02-source-signals-rz450e.md`'s ~9s/poll measured cadence for the existing 3-item DID cycle,
+      not from an actual observed DID `0x1814` round-trip time
+- [ ] The other 6 `engine_timing` fields (`did_response_timeout_s`, `did_inter_request_gap_s`,
+      `ignition_quiet_s`, `ignition_off_delay_s`, `ignition_grace_s`, `chg_end_stop_s`,
+      `chg_stall_timeout_s`, `chg_cmd_fresh_s`, `bus_silence_timeout_s`) moved from bare module
+      constants to GUI-editable fields 2026-08-14 - same values as before (no behavior change on
+      rollout), same provisional/unconfirmed status each already had individually (see their
+      original inline comments, now migrated into `leaf_signals.ENGINE_TIMING_FIELDS`)
 
 Other real-hardware-only items, some carried over from `docs/10`:
 

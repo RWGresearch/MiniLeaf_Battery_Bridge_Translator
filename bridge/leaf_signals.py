@@ -7,7 +7,27 @@ project's own CLAUDE.md instruction not to re-derive real-hardware-confirmed
 byte formulas by hand. See docs/03-target-signals-leaf.md for the source
 citation and docs/07-startup-shutdown-plan.md for the timing this feeds.
 """
+import math
 import re
+
+
+def parse_finite_float(value):
+    """float(value), but treats NaN/+-inf as invalid too (added 2026-08-13,
+    blind-review finding: `float("nan")` does NOT raise ValueError, and
+    `nan < lo`/`nan > hi` are BOTH False, so every existing bounds-clamp in
+    this project - this module's own clamp_state() below, plus every GUI
+    _set_float()-style handler and every profile-load bounds clamp - was
+    silently passing a NaN straight through as if it were in-range, which
+    can permanently and invisibly disable a safety-tier cutoff (the
+    comparison it feeds is never true again). Single choke point so every
+    caller's existing `except (TypeError, ValueError): ...` fallback (drop
+    the bad value, keep the safe default) already handles this case for
+    free, with zero restructuring at each call site."""
+    v = float(value)
+    if not math.isfinite(v):
+        raise ValueError(f'non-finite value: {value!r}')
+    return v
+
 
 # ── HVBAT CAN IDs, gated by car/battery generation ──────────────────────────
 HVBAT_IDS_BASE = {0x1DB, 0x1DC, 0x55B, 0x5BC, 0x59E, 0x5C0}
@@ -125,7 +145,35 @@ CHECKS = [  # (key, label, default) - soft/hard cut and permission flags
 # unconditional clear there would be wrong) - removing it as a mapping
 # target closes the actual vulnerability (a user tie holding it non-zero)
 # without needing the unsafe centralized-clear fix.
-MANAGEMENT_EXCLUSIVE_KEYS = {'relay_cut_request', 'capacity_empty', 'full_charge_flag', 'interlock'}
+MANAGEMENT_EXCLUSIVE_KEYS = {
+    'relay_cut_request', 'capacity_empty', 'full_charge_flag', 'interlock',
+    # gids/qc_full_wh/qc_remain_wh: same problem, found later - these are
+    # always unconditionally overwritten by mapping_engine.derive_capacity_outputs()
+    # once soc_pct/capacity_ah are both live, so a user mapping tie targeting
+    # any of them would appear to work (dropdown-selectable, explain_tie()
+    # shows a plausible result) but have zero effect on the actual
+    # transmitted value the moment real pack data arrives.
+    'gids', 'qc_full_wh', 'qc_remain_wh',
+}
+
+# NOTE (2026-08-13, blind-review finding, user-confirmed INTENTIONAL - do
+# NOT add to MANAGEMENT_EXCLUSIVE_KEYS above): `charger_limit_kw` looks like
+# the same class of bug as gids/qc_full_wh/qc_remain_wh - it's still fully
+# Signal-Mapping-selectable, yet realtime_engine.py's _apply_charge_ramp()
+# unconditionally overwrites it every tick during any real, RZ450e-
+# authorized charge session (when "Emulate charger request" is on, the
+# default). The difference: gids/qc_full_wh/qc_remain_wh have no legitimate
+# reason to ever be a mapping target (they're pure derived math with no
+# "drive mode" use). `charger_limit_kw` is genuinely dual-purpose by design:
+# "drive mode" (a mapping tie, or nothing at all) and "charge mode" (the
+# charge ramp) are two SEPARATE control paths that both legitimately drive
+# this same output at different times - a mapping tie for it is fully live
+# and correct while idle/driving or with charge_emulate off, and is meant to
+# be superseded only during an actual charge session, the same way
+# ac_charge_taper/charge_target_taper are deliberately split by
+# charging_active elsewhere in this project (see management_engine.py's own
+# 2026-08-07 comment on that split). See _apply_charge_ramp()'s docstring
+# for the full rationale.
 
 # 'voltage_latch' removed as a mapping target (2026-08-01, item 12.5, user
 # decision): build_1db() never read s['voltage_latch'] at all, so mapping
@@ -167,6 +215,15 @@ CHARGE_CHECKS = [
     # this project's "ship enabled" philosophy for anything safety-relevant.
     ('require_live_data_to_charge',
      'Require genuinely live (not cached/default) battery data before the charge ramp can start', 1),
+    # AC-charger-specific temperature derate enable (added 2026-08-11, user
+    # report: "we dont have any heat regulation for charging... we need
+    # separate inputs for those temps for when charging in the charger tab.
+    # there not the same values" - split out the same way ac_charge_taper
+    # split AC-charger voltage from driving-mode regen voltage on 2026-08-01.
+    # See management_engine.py's ac_charge_temp_derate block. Default ON,
+    # matching this project's "ship enabled" philosophy for anything
+    # safety-relevant.
+    ('ac_temp_derate_enabled', 'AC charger temperature derate enabled', 1),
 ]
 CHARGE_SLIDERS = [
     # Default 92.2->6.6kW (changed 2026-08-06) - 6.6kW is the Leaf's actual
@@ -259,6 +316,28 @@ CHARGE_SLIDERS = [
     # mattered while actually plugged in (gated on charge_permission_input).
     ('daily_target_pct', 'Daily target % (SoC stop point)', 0, 100, 1, 80.0),
     ('extended_target_pct', 'Extended target % (SoC stop point)', 0, 100, 1, 100.0),
+    # AC-charger-specific temperature thresholds (added 2026-08-11, user
+    # report: the app had no heat regulation for charging at all -
+    # over_temperature_derate's cold/hot ramp used to also multiply
+    # charger_limit_kw using the DRIVING-mode thresholds below, but the user
+    # wants charging to use its own independently-tunable thresholds instead
+    # ("there not the same values"), same split already applied to voltage
+    # (ac_full_v/ac_min_v vs charge_target_taper's regen_full_v/regen_min_v).
+    # Defaulted to the same starting values as over_temperature_derate's
+    # charge-side fields (bridge/management_engine.py's default_config()) -
+    # not yet independently tuned, just no longer forced to share one curve.
+    # Documented/researched starting points, NOT real-hardware-confirmed
+    # (docs/11) - same status as the driving-mode values they're seeded from.
+    ('ac_derate_low_start_c', 'AC charge cold-derate start °C (coldest probe)', -51.1, 121.1, 0.1, 10.0),
+    ('ac_low_block_c', 'AC charge low block °C (coldest probe)', -51.1, 121.1, 0.1, 0.0),
+    ('ac_derate_start_c', 'AC charge derate start °C (hottest probe)', -51.1, 121.1, 0.1, 32.0),
+    # Reaching ac_hard_stop_c both floors charger_limit_kw at 0.0 AND ends the
+    # charge session (full_charge_flag, same "unplug/replug to resume" latch
+    # ac_cutoff_v uses for voltage) - unlike the driving-mode equivalent
+    # (charge_hard_stop_c), which only zeroes power and auto-resumes as the
+    # pack cools, since a parked/plugged-in pack that got this hot charging
+    # deserves a deliberate stop, not a silent auto-retry.
+    ('ac_hard_stop_c', 'AC charge hard stop °C (hottest probe) - ends session', -51.1, 121.1, 0.1, 45.0),
 ]
 # (lo, hi) numeric bounds per charge_emulation field, derived straight from
 # CHARGE_SLIDERS' own (lo, hi) columns (added 2026-08-03, docs/13 items
@@ -328,6 +407,19 @@ def clamp_state(s):
     for key, (lo, hi) in RANGES.items():
         v = out.get(key)
         if v is None:
+            continue
+        if not math.isfinite(v):
+            # NaN/+-inf can't be caught by the </> checks below - both
+            # comparisons are silently False for NaN, so an unclamped NaN
+            # would sail through here and then crash int(round(...)) in
+            # whichever _build_frame() branch packs it (added 2026-08-13,
+            # blind-review finding - this is meant as a last-resort backstop;
+            # the real fix is upstream validation not producing one in the
+            # first place, see parse_finite_float() above). Falls back to
+            # `lo` unconditionally since there's no meaningful "closer bound"
+            # for a non-finite value - always reported like any other clamp.
+            clamped.append((key, v, lo))
+            out[key] = lo
             continue
         if v < lo:
             clamped.append((key, v, lo))
@@ -461,33 +553,89 @@ PWRDOWN_STAGE4_MS = 1200
 # second constant is needed here.)
 PWRDOWN_DEFAULT_COOLDOWN_S = 1.0
 
-IGNITION_IDS = {0x108, 0x1CB, 0x284}
-IGNITION_QUIET_S = 0.5
-IGNITION_OFF_DELAY_S = 10.0
-IGNITION_GRACE_S = 10.0
-CHG_END_STOP_S = 3.0
-CHG_STALL_TIMEOUT_S = 15.0
-CHG_CMD_IDLE = 100
-CHG_CMD_FRESH_S = 0.5
+# ── Real-Leaf protocol timing reference (added 2026-08-14, "Timing" tab,
+# user follow-up: "lets add it to the timing tab. but lets make it non
+# configurable. this way its listed, for clarity. but not changable") -
+# READ-ONLY display data for gui/panels.py's EngineTimingPanel. Every value
+# below (TX_PERIOD_MS above, plus these three lists) is real-hardware-
+# confirmed - the actual real Leaf VCM expects these exactly, so unlike
+# ENGINE_TIMING_FIELDS below, NONE of this is ever meant to become editable.
+# Listed here purely so a user studying/porting this bridge's timing can see
+# the whole picture in one place instead of hunting through source.
+TX_PERIOD_LABELS = {
+    0x1DB: 'Battery status', 0x1DC: 'Power limits', 0x1C2: 'Heartbeat',
+    0x1ED: 'Charger limit (62kWh)', 0x55B: 'Fine SOC', 0x5BC: 'Display / SOH',
+    0x59E: 'Quick-charge capacity', 0x5C0: 'History data', 0x5EB: 'Sequence table',
+}
 
-# Sixth wind-down trigger, bridge-specific defensive addition (docs/07,
-# added 2026-08-06) - NOT a ported/confirmed real-Leaf value like the four
-# triggers above it, same category as the staleness watchdog's "fifth
-# trigger". Added after a real bench test ("Charging to xx% the restart"
-# log, 2026-08-05) showed the bridge staying awake and transmitting for
-# 100+ seconds straight with no explanation found in the captured traffic -
-# root cause not fully identified (docs/10 open question), but structurally
-# a bench rig with no ignition wiring can only ever rely on the
-# charge-session triggers (2/3/4 above) to ever wind down at all; if a real
-# run ever lands in a state where none of those resolve, there is currently
-# no fallback and the bridge would stay awake forever. This is that
-# fallback: if the Leaf bus has been COMPLETELY silent (no frame of any ID)
-# for this long, wind down regardless of any other trigger's state. Set
-# well above every other trigger's own timeout (CHG_STALL_TIMEOUT_S=15s) so
-# it never preempts a legitimate slower real condition - it can only fire
-# once every other trigger has already had time to act and traffic still
-# never resumed. Documented, NOT yet confirmed against a re-test (docs/11).
-BUS_SILENCE_TIMEOUT_S = 30.0
+STARTUP_TIMELINE_REFERENCE = [
+    ('0x1C2 heartbeat starts (immediate, no offset)', 0),
+    ('0x1DB/0x1DC start (placeholder values)', T_1DB_START),
+    ('0x55B/0x5BC start (SOC/SOH valid immediately)', T_55B_START),
+    ('0x1DB/0x1DC startup phase A -> B', T_PH_B),
+    ('0x1DB/0x1DC startup phase B -> C', T_PH_C),
+    ('0x59E/0x5C0/0x5EB start (fully normal immediately)', T_59E_START),
+    ('0x1DB/0x1DC/0x55B/0x5BC fields become fully valid', T_VALID),
+    ('0x1DB failsafe status -> normal; sequencer phase -> running', T_RUNNING),
+]
+
+SHUTDOWN_STAGING_REFERENCE = [
+    ('0x55B/0x5BC stop', PWRDOWN_STAGE2_MS),
+    ('0x1DB/0x1DC stop', PWRDOWN_STAGE3_MS),
+    ('0x1C2/0x1ED stop; sequencer phase -> stopped', PWRDOWN_STAGE4_MS),
+]
+
+IGNITION_IDS = {0x108, 0x1CB, 0x284}
+CHG_CMD_IDLE = 100
+
+# ── Engine timing (added 2026-08-14, GUI-editable as of the "Timing" tab,
+# user directive: "this app is kinda supposed to be a configurator for
+# the hardware version... what else could be changed for configuration?") -
+# every value here was previously a bare hardcoded module constant
+# (IGNITION_QUIET_S etc. in this file, DID_RESPONSE_TIMEOUT_S etc. in
+# rz450e_signals.py). None of these are ported/confirmed real-Leaf protocol
+# values (unlike TX_PERIOD_MS/T_*_START/PWRDOWN_*_MS above, which MUST stay
+# fixed - they're bit-verified against real captures, see the read-only
+# reference lists above) - they're this bridge's OWN wind-down/DID-polling
+# heuristics, provisional starting points a user running different hardware
+# (a different bench rig, a different pack's DID response latency) may
+# legitimately need to retune.
+# (key, label, lo, hi, step, default) - same 6-tuple shape as CHARGE_SLIDERS
+# above, seeds state.engine_timing (bridge/state.py) and drives
+# gui/panels.py's EngineTimingPanel the same generic way.
+ENGINE_TIMING_FIELDS = [
+    ('did_response_timeout_s', 'DID response timeout (s)', 0.5, 30.0, 0.1, 5.0),
+    ('did_inter_request_gap_s', 'DID inter-request pacing gap (s)', 0.0, 5.0, 0.05, 0.3),
+    ('did_temp_poll_interval_s', 'Temp probe (DID 0x1814) poll interval (s)', 1.0, 120.0, 1.0, 10.0),
+    ('did_temp_fresh_window_s', 'Temp probe (DID 0x1814) freshness window (s)', 1.0, 300.0, 1.0, 20.0),
+    ('ignition_quiet_s', 'Ignition-signal quiet window (s)', 0.1, 10.0, 0.1, 0.5),
+    ('ignition_off_delay_s', 'Ignition-off wind-down delay (s)', 0.0, 120.0, 1.0, 10.0),
+    ('ignition_grace_s', 'Ignition-off grace period after startup (s)', 0.0, 120.0, 1.0, 10.0),
+    ('chg_end_stop_s', 'Charge-session-end wind-down delay / replug-debounce gap (s)', 0.0, 120.0, 1.0, 3.0),
+    ('chg_stall_timeout_s', 'Charge-stall wind-down timeout (s)', 0.0, 300.0, 1.0, 15.0),
+    ('chg_cmd_fresh_s', '0x1F2 charge-command freshness window (s)', 0.05, 10.0, 0.05, 0.5),
+    # Sixth wind-down trigger, bridge-specific defensive addition (docs/07,
+    # added 2026-08-06) - NOT a ported/confirmed real-Leaf value like the
+    # four triggers above it, same category as the staleness watchdog's
+    # "fifth trigger". Added after a real bench test ("Charging to xx% the
+    # restart" log, 2026-08-05) showed the bridge staying awake and
+    # transmitting for 100+ seconds straight with no explanation found in
+    # the captured traffic - root cause not fully identified (docs/10 open
+    # question), but structurally a bench rig with no ignition wiring can
+    # only ever rely on the charge-session triggers above to ever wind down
+    # at all; if a real run ever lands in a state where none of those
+    # resolve, there is currently no fallback and the bridge would stay
+    # awake forever. This is that fallback: if the Leaf bus has been
+    # COMPLETELY silent (no frame of any ID) for this long, wind down
+    # regardless of any other trigger's state. Default set well above every
+    # other trigger's own timeout (chg_stall_timeout_s=15s default) so it
+    # never preempts a legitimate slower real condition - it can only fire
+    # once every other trigger has already had time to act and traffic
+    # still never resumed. Documented, NOT yet confirmed against a re-test
+    # (docs/11).
+    ('bus_silence_timeout_s', 'Leaf-bus total silence wind-down timeout (s)', 1.0, 600.0, 1.0, 30.0),
+]
+ENGINE_TIMING_BOUNDS = {k: (lo, hi) for k, _, lo, hi, _, _ in ENGINE_TIMING_FIELDS}
 
 
 # ── Frame builders (byte-verified against real captures, ported verbatim) ──

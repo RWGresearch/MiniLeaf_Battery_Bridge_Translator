@@ -57,7 +57,7 @@ def test_refuse_sleep_one_after_ignition_goes_stale():
     seq = ShutdownSequencer()
     seq.arm()
     seq.note_leaf_rx(0x108, b'\x00')
-    time.sleep(leaf_signals.IGNITION_QUIET_S + 0.15)
+    time.sleep(seq.config['ignition_quiet_s'] + 0.15)
     check('refuse_sleep flips to 1 once ignition IDs go stale (matches the real-capture '
           '~150ms key-off behavior, at this watchdog\'s granularity)',
           seq.refuse_sleep_value(time.monotonic()) == 1)
@@ -170,7 +170,7 @@ def test_unauthorized_charge_request_eventually_winds_down():
     seq.note_leaf_rx(CHG_ID, _chg_request_frame())
     seq._should_wind_down(False, charge_authorized=False)
     check('sanity: chg_end_since timer started', seq._chg_end_since is not None)
-    seq._chg_end_since = time.monotonic() - leaf_signals.CHG_END_STOP_S - 0.1   # force elapsed, no real sleep
+    seq._chg_end_since = time.monotonic() - seq.config['chg_end_stop_s'] - 0.1   # force elapsed, no real sleep
     result = seq._should_wind_down(False, charge_authorized=False)
     check('after CHG_END_STOP_S of "Leaf wants to charge but RZ450e has not authorized it," '
           'the sequencer decides to wind down', result is True)
@@ -186,7 +186,7 @@ def test_bus_silence_does_not_fire_before_the_timeout():
     seq.arm()
     seq.note_leaf_rx(0x999, b'\x00')   # arbitrary non-ignition/non-charge ID - just needs to wake the sequencer
     check('sanity: sequencer entered startup', seq.phase == 'startup')
-    seq.last_leaf_rx_t = time.monotonic() - (leaf_signals.BUS_SILENCE_TIMEOUT_S - 5.0)
+    seq.last_leaf_rx_t = time.monotonic() - (seq.config['bus_silence_timeout_s'] - 5.0)
     check('bus-silence trigger does not fire before BUS_SILENCE_TIMEOUT_S has elapsed',
           seq._should_wind_down(False) is False)
 
@@ -196,7 +196,7 @@ def test_bus_silence_eventually_winds_down_with_no_other_trigger_active():
     seq.arm()
     seq.note_leaf_rx(0x999, b'\x00')
     check('sanity: sequencer entered startup', seq.phase == 'startup')
-    seq.last_leaf_rx_t = time.monotonic() - leaf_signals.BUS_SILENCE_TIMEOUT_S - 0.1
+    seq.last_leaf_rx_t = time.monotonic() - seq.config['bus_silence_timeout_s'] - 0.1
     check('bus-silence trigger fires once the Leaf bus has been completely silent for '
           'BUS_SILENCE_TIMEOUT_S, with none of the other four triggers active',
           seq._should_wind_down(False) is True)
@@ -208,6 +208,34 @@ def test_bus_silence_trigger_does_not_preempt_active_traffic():
     seq.note_leaf_rx(0x108, b'\x00')   # fresh ignition traffic - ordinary running state
     check('bus-silence trigger stays quiet while the bus is genuinely active (last_leaf_rx_t fresh)',
           seq._should_wind_down(False) is False)
+
+
+# ── engine_timing config injection (added 2026-08-14, "Timing" tab
+# user directive) - confirms a custom config dict actually drives this
+# class's behavior, not just the default fallback every other test above
+# implicitly exercises (ShutdownSequencer() with no args) ─────────────────
+def test_custom_config_overrides_default_timing():
+    custom = {k: d for (k, _l, _lo, _hi, _s, d) in leaf_signals.ENGINE_TIMING_FIELDS}
+    custom['bus_silence_timeout_s'] = 0.1   # far below the 30.0s default
+    seq = ShutdownSequencer(config=custom)
+    seq.arm()
+    seq.note_leaf_rx(0x999, b'\x00')
+    check('sanity: sequencer entered startup', seq.phase == 'startup')
+    seq.last_leaf_rx_t = time.monotonic() - 0.15   # past the CUSTOM 0.1s timeout, well under the 30.0s default
+    check('a custom bus_silence_timeout_s actually drives the trigger (not the 30.0s code default)',
+          seq._should_wind_down(False) is True)
+
+
+def test_default_config_is_a_fresh_dict_not_shared_between_instances():
+    """Two ShutdownSequencer() instances with no explicit config must not
+    accidentally share one mutable dict - editing one's config must not
+    leak into the other, matching the "each engine has its own live state_
+    model" architecture (docs/06)."""
+    seq1 = ShutdownSequencer()
+    seq2 = ShutdownSequencer()
+    seq1.config['bus_silence_timeout_s'] = 0.1
+    check('editing one default-config instance does not affect a sibling instance',
+          seq2.config['bus_silence_timeout_s'] != 0.1)
 
 
 if __name__ == '__main__':

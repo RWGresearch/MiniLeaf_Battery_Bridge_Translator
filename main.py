@@ -1,4 +1,4 @@
-# REVISION: 63
+# REVISION: 74
 """MiniLeaf Battery Bridge Translator - entry point.
 
 Bridges a Lexus RZ450e HV battery to a Nissan Leaf's CAN bus: a configurable
@@ -13,8 +13,8 @@ GUI is plain tkinter/ttk (stdlib, no extra GUI dependency) - see gui/theme.py.
 """
 from gui.app import App
 
-REVISION = 64
-REV_DATE = '2026-08-09'
+REVISION = 74
+REV_DATE = '2026-08-14'
 
 # Rev 1: initial milestone-1 app - adapters, signal registries, mapping
 # engine, battery-management engine with researched defaults, real-time
@@ -2361,6 +2361,521 @@ REV_DATE = '2026-08-09'
 #     - docs/05, 09, 10, 12 updated (field names/values); docs/13/14 left
 #       as accurate historical record of what was true when written, same
 #       discipline as every other past field rename in this project.
+#
+# Rev 65: two items, same session.
+#   (1) Full regression audit of docs/13-review-checklist-2026-08-01.md (all
+#   ~85 items across Parts 1-17), per user request "confirm everything that
+#   was fixed is still fixed." All 12 tests/test_*.py files re-run directly
+#   and pass; tests/check_profile_drift.py shows 0 missing/orphaned fields.
+#   One real gap found and left open for now (not yet fixed): the "Emulate
+#   charger request" checkbox on the Charge Emulation tab (gui/panels.py)
+#   never got the ENABLED/DISABLED log line item 4.2's fix promised for
+#   every feature toggle on both tabs - every other toggle on both tabs has
+#   it, this one was missed when 4.2 was implemented.
+#   (2) GUI bug fix (user report: "the input boxes in the battery managment
+#   and charge emulation are to far to the left. they cover the wors
+#   [words]"). Root cause: gui/panels.py's ManagementPanel._build_feature()
+#   and ChargeEmulationPanel.__init__() pack each field's Label with a fixed
+#   width= (in characters) then pack the Entry immediately after it - but
+#   several labels added across later revisions are longer than the
+#   width that was set when that row was written (e.g. "Discharge hard stop
+#   °C (hottest probe, soft ramp)" is 49 chars against width=32; "Minimum
+#   power at/above (V/cell) - holds, does not stop charging" is 63 chars
+#   against width=32; the two DC-placeholder labels are 71 chars against
+#   width=60). A ttk.Label truncates text past its fixed width rather than
+#   wrapping it, so the Entry packed right after ends up sitting visually on
+#   top of the missing tail of the sentence. Widened every affected column
+#   to comfortably exceed its section's longest label: ManagementPanel's
+#   per-feature fields 32->52, ChargeEmulationPanel's main box fields
+#   (ramp target/uprate level/AC min-max kW) 32->40, its AC taper fields
+#   32->66, its DC/QC placeholder fields 60->74. Software-verified only (app
+#   launches with no error after the change) - not yet visually re-confirmed
+#   in the running GUI, since no screenshot/GUI-capture tool was available
+#   in this session; ask the user to eyeball both tabs on next run.
+#
+# Rev 66: new safety feature (user report: "we dont have any heat regualtion
+# for charging. AKA the battery temp should control the charge ramp... its
+# inportant that there is temp cut off's for charging... we need seprate
+# inputs for those temps for when charging in the charger tab. there not
+# the same values").
+#   Root cause: over_temperature_derate's graduated cold/hot ramp (Battery
+#   Management tab) was multiplying charger_limit_kw (AC charging) using the
+#   SAME thresholds it uses for driving-mode regen - no independently-
+#   tunable charging-specific temperature protection existed at all, unlike
+#   the voltage side, which already got this exact split on 2026-08-01
+#   (ac_charge_taper vs. charge_target_taper).
+#   Fix: new `ac_charge_temp_derate` feature (bridge/management_engine.py),
+#   config lives in charge_emulation (bridge/leaf_signals.py's new
+#   ac_temp_derate_enabled/ac_derate_low_start_c/ac_low_block_c/
+#   ac_derate_start_c/ac_hard_stop_c fields, seeded from over_temperature_
+#   derate's existing charge-side numbers as a starting point, independently
+#   tunable from here on) - own checkbox + 4 fields on the Charge Emulation
+#   tab (gui/panels.py), own status line, own AC_CHARGE_TEMP_DERATE_HELP
+#   text. Only ever touches charger_limit_kw, and only while
+#   charge_permission_input is genuinely active (same "fully separate
+#   control path from driving" gating ac_charge_taper already uses) - never
+#   reduces charger power while simply driving with nothing plugged in.
+#   Cold side ramps/blocks with no latch (auto-resumes as the pack warms,
+#   matching driving-mode's own cold-side behavior); hot side ramps to zero
+#   at ac_hard_stop_c and ALSO latches full_charge_flag (session ends,
+#   unplug/replug to resume via notify_charge_replug()/notify_session_start()
+#   - same convention ac_cutoff_v's own stop-charging cutoff already uses),
+#   since a pack that got this hot WHILE CHARGING deserves a deliberate
+#   stop, not a silent auto-retry. Two new fault_log entries:
+#   ac_charge_cold_block, ac_charge_temp_stop.
+#   over_temperature_derate's own graduated ramp no longer touches
+#   charger_limit_kw at all (that split was the actual ask - "there not the
+#   same values") - only its TRUE pack-wide emergency tier still zeroes it,
+#   as the final universal backstop regardless of source, same as every
+#   other hard-tier emergency in this engine.
+#   While fixing this, also found and closed a small pre-existing gap
+#   unrelated to this feature: `ac_cutoff_stop` (added 2026-08-06) had been
+#   tracked via fault_log.update() calls the whole session but was never
+#   actually registered in fault_log.py's FAULT_DEFINITIONS catalog - now
+#   registered alongside the two new entries above (bridge/fault_log.py).
+#   6 new tests in tests/test_management_engine.py (driving-mode isolation,
+#   cold-side ramp/auto-resume, hot-side ramp/latch/replug-clear, live
+#   disable, and a regression test confirming over_temperature_derate's
+#   graduated ramp no longer touches charger_limit_kw except the true
+#   emergency). All 12 test files pass; check_profile_drift.py correctly
+#   reports the 5 new fields as "missing from profile" (expected for any new
+#   feature, safely defaulted at load, same precedent as item 16.2's temp_
+#   data_cross_check rollout) until the profile is next re-saved.
+#   Full docs/ sweep done as a follow-up in the same session (user request:
+#   "read all the docs and update with the change") - every doc grepped for
+#   over_temperature_derate/charger_limit_kw/ac_charge_taper references, not
+#   just the three touched during implementation: docs/05 (new "AC charger
+#   temperature derate" section + table rows), docs/09 (regenerated JSON
+#   example), docs/11 (new verification-checklist row), docs/03 (charging-
+#   vs-driving control-path description updated to name both new gates),
+#   docs/06 (charge-ramp-vs-taper ordering note updated to name both
+#   features), docs/08 (new GUI-tab bullet for the AC charger temperature
+#   derate section; also fixed a small pre-existing unrelated staleness
+#   found along the way - the dc_min_kw/dc_max_kw placeholder fields'
+#   documented location still said the old "Future placeholder tab," but
+#   they'd actually already moved to the Charge Emulation tab back on
+#   2026-08-08), docs/15 (new B23 real-hardware test-plan section, same
+#   format as B6/B10 which it splits from). docs/10/12/13/14/16 checked and
+#   confirmed not affected (frozen historical records or genuinely
+#   unrelated). Software-verified only (unit tests + app launches with no
+#   error) - not yet tested against real charging hardware; the 4 new
+#   threshold values are documented starting points, not yet real-hardware-
+#   confirmed, same status as the driving-mode numbers they were seeded from.
+
+#   threshold values are documented starting points, not yet real-hardware-
+#   confirmed, same status as the driving-mode numbers they were seeded from.
+#
+# Rev 67: blind code-review pass (user request: trace main.py's full import
+#   graph for missing connections/config drift, no docs consulted) found 3
+#   real issues, user directed fixes on all 3 - bridge/management_engine.py,
+#   bridge/leaf_signals.py:
+#   (1) BUG FIX - ac_charge_temp_derate's 'not charging_active' branch was
+#       unconditionally clearing _ac_charge_temp_stop_latched (the AC-
+#       charger-stopped-on-heat latch) every tick, using a bare undebounced
+#       read of RZ450e's charge_permission_input - a momentary interlock
+#       glitch (not a real unplug) could silently resume charging right
+#       after a hard temperature stop. This latch is only supposed to clear
+#       via notify_session_start()/notify_charge_replug() (real, replug-
+#       debounced events), exactly as its sibling _ac_charge_stop_latched
+#       already does one block above (which correctly only READS the latch
+#       in this same branch, never clears it). Fixed to match: removed the
+#       clear, and the branch's fault_log.update() for 'ac_charge_temp_stop'
+#       now passes the live latch value instead of a hardcoded False, so
+#       Fault History correctly keeps showing it active while not charging
+#       too (previously would have shown "cleared" even if still latched).
+#   (2) BUG FIX - gids/qc_full_wh/qc_remain_wh were selectable Signal
+#       Mapping output targets but silently overwritten every tick by
+#       mapping_engine.derive_capacity_outputs() the moment soc_pct/
+#       capacity_ah are both live - same class of bug already fixed for
+#       relay_cut_request/capacity_empty/full_charge_flag/interlock (docs/13
+#       item 16.3), just not extended to these three. User confirmed derived/
+#       live data should win here (stale-data handling is a separate,
+#       already-existing watchdog concern) - added all three to
+#       leaf_signals.MANAGEMENT_EXCLUSIVE_KEYS, same mechanism as the
+#       original four. Confirmed no existing saved profile had a tie
+#       targeting any of the three, so no config migration needed.
+#   (3) Fixed temp_data_cross_check's live status text (4 f-strings) that
+#       labeled the probe-mismatch delta "F" (Fahrenheit) when the value has
+#       been Celsius, compared against config key max_delta_c, since the
+#       project's earlier F->C conversion pass - misleading whoever reads
+#       Fault History/Dashboard while diagnosing a real sensor mismatch.
+#       Changed to "C" in all 4 spots.
+#   (4) Investigated but NOT changed (user decision): gui/panels.py's
+#       vehicle['car_gen'] dropdown is stored/persisted but never read by
+#       any engine code - confirmed inert in both this project and the
+#       reference Leaf_BMS_Emulator project (no second car-type logic
+#       exists to gate), so left as-is rather than removed.
+#   All 11 test files (unittest-style, run individually - no pytest in this
+#   env) still pass after the fixes: test_can_backend, test_charge_ramp,
+#   test_config_profile, test_fault_log, test_management_engine,
+#   test_mapping_engine, test_output_clamping, test_realtime_engine,
+#   test_rz450e_signals, test_shutdown_sequencer all green.
+#
+# Rev 68: deep clamp/bounds audit pass (user follow-up on Rev 67's review),
+#   found 4 more issues - user directed fixes on 3, one confirmed
+#   intentional and documented instead - bridge/leaf_signals.py,
+#   bridge/management_engine.py, bridge/config_profile.py,
+#   bridge/mapping_engine.py, bridge/realtime_engine.py, gui/panels.py:
+#   (1) BUG FIX - NaN silently defeated every numeric clamp in the app.
+#       `float("nan")` doesn't raise ValueError, and `nan < x`/`nan > x` are
+#       both False in Python, so every existing bounds-check (GUI
+#       _set_float() handlers, leaf_signals.clamp_state(), every profile-
+#       load bounds clamp) was letting a NaN straight through as if it were
+#       in-range - typing 'nan' into e.g. emergency_low_v could permanently
+#       and invisibly disable that safety cutoff (the comparison it feeds
+#       is never true again), with the GUI showing nothing wrong. Confirmed
+#       via a full grep this was a genuine oversight, not intentional -
+#       zero existing NaN/isnan/isfinite handling anywhere in the project.
+#       Fixed with one new shared choke point, leaf_signals.
+#       parse_finite_float() (float() that also rejects NaN/+-inf) -
+#       swapped in at every site that previously called bare float() on a
+#       user- or config-supplied number: ManagementPanel/
+#       ChargeEmulationPanel/VehiclePanel/MappingPanel's GUI entry handlers
+#       (gui/panels.py - each already had a `except ValueError:` fallback,
+#       so this was a one-line swap at each site, no restructuring), the
+#       three profile-load bounds-clamp sites (ManagementEngine.from_dict(),
+#       config_profile.py's _apply_vehicle()/_apply_charge_emulation()),
+#       and MappingTie.from_dict() (new - see item 4). Also hardened
+#       clamp_state() itself as a last-resort backstop (in case a NaN ever
+#       reaches it some other way, e.g. a future computed-signal bug): a
+#       non-finite value now clamps to the field's `lo` bound and is
+#       reported through the same existing clamp-event logging path,
+#       instead of sailing through and later crashing int(round(nan)) in a
+#       frame builder. Verified all 4 layers directly (parse_finite_float
+#       rejecting nan/inf/-inf/Infinity while still accepting normal
+#       values; clamp_state, ManagementEngine.from_dict, MappingTie.from_dict,
+#       and ManagementPanel._set_float all confirmed to reject/neutralize a
+#       live NaN rather than accept it).
+#   (2) BUG FIX - the 4 AC-charger temperature thresholds (ac_derate_low_
+#       start_c, ac_low_block_c, ac_derate_start_c, ac_hard_stop_c, added
+#       Rev 65-ish) had no cross-field ordering sanity check, unlike every
+#       other threshold family in this file (voltage tiers, driving-mode
+#       temp tiers). Added the same 2 ordering checks the driving-mode temp
+#       feature already has (cold block < cold-derate-start, derate-start <
+#       hard-stop), direction confirmed against _ramp_factor()'s own
+#       floor/ceiling contract - _CHARGE_EMULATION_SANITY_CHECKS. Verified
+#       both directly: an inverted cold pair and an inverted hot pair each
+#       now produce a config_sanity violation.
+#   (3) NOT a bug (user confirmed intentional) - charger_limit_kw stays
+#       fully Signal-Mapping-selectable even though
+#       RealtimeEngine._apply_charge_ramp() overwrites it every tick during
+#       a real charge session, because "drive mode" (a mapping tie) and
+#       "charge mode" (the ramp) are two separate, legitimate control paths
+#       for the SAME output at different times - not the same class of bug
+#       as gids/qc_full_wh/qc_remain_wh (which have no legitimate mapping
+#       use at all). Documented this explicitly in two places so a future
+#       review doesn't re-flag it: leaf_signals.py right after
+#       MANAGEMENT_EXCLUSIVE_KEYS, and _apply_charge_ramp()'s own docstring
+#       in realtime_engine.py.
+#   (4) Mapping-tie scale/offset params previously had zero validation on
+#       profile load (MappingTie.from_dict()) or GUI edit (MappingPanel),
+#       unlike every other config category in the project - this was the
+#       most direct entry point for item 1's NaN. Added validation (not a
+#       bounds clamp - scale/offset are legitimately unbounded, a signal
+#       conversion can need any real slope/intercept - just a finite-number
+#       check): from_dict() now coerces a non-finite scale/offset to the
+#       safe default (1.0/0.0), same "drop the bad value, keep the default"
+#       convention as every other bounds-clamped config category; the GUI
+#       row gained a new 'invalid' flag label next to the scale/offset
+#       entries (previously silently swallowed via a bare `except
+#       ValueError: pass` with zero visual feedback, unlike every other
+#       numeric field in the app). Verified: from_dict() with a NaN scale
+#       and an inf offset coerces both to 1.0/0.0.
+#   New tests/test_nan_validation.py (22 checks) - permanent regression
+#   coverage for all of the above (parse_finite_float's rejection list,
+#   clamp_state()'s backstop, ManagementEngine.from_dict()'s drop-and-keep-
+#   default behavior, MappingTie.from_dict()'s scale/offset coercion, and
+#   both new AC-charger temp sanity checks). All 11 test files pass.
+#
+# Rev 69: SoC blended into discharge_power_taper/charge_target_taper as a
+#   primary/smoothing input alongside voltage (user directive: "use SOC as
+#   the primary control and the battery voltage as a secondary... the quick
+#   cutoff still works with voltage but the SOC will help smooth out our
+#   change as SOC does not dramatically drop like voltage does") -
+#   bridge/management_engine.py, gui/panels.py:
+#   - Root-cause investigation first (new tests/check_taper_smoothness.py,
+#     rerunnable diagnostic): replayed the real captured cell-voltage trace
+#     from logs/minileaf_20260809_080913-power and regen settings test.trc
+#     through the actual engine and found the "jumpy" discharge/regen output
+#     wasn't a hysteresis-timing problem - it was voltage's own quantization
+#     amplified by a too-narrow taper window. Per-cell voltage is a 12-bit
+#     value over 0-5V (rz450e_signals.py decode_020/decode_frame), so every
+#     reading is quantized to 1.22mV/count no matter what - that session's
+#     20mV-wide taper window meant a SINGLE raw ADC count of sensor noise
+#     produced a 6.71kW output jump (measured on the real trace, matching
+#     the analytical prediction span_kw/window_v*1.22mV exactly). Raising
+#     recovery_ramp_s (tested at 3/8/20/45s against the same real trace)
+#     cut total output churn ~7x but left the reversal COUNT and time-at-
+#     zero unchanged - the drop side is deliberately instant (fast-attack
+#     cell protection), so hysteresis alone can't fix a window narrower than
+#     the sensor's own noise floor.
+#   - Fix: both tapers now compute an independent SoC-based factor
+#     alongside the existing voltage-based one, combined via
+#     min(voltage_factor, soc_factor) - never averaged, never a replacement.
+#     SoC is polled far less often (~every 15s via DID, not every CAN tick,
+#     docs/06) and moves smoothly across a wide %, so spreading the same kW
+#     range across a wide SoC window is inherently smoother per update, and
+#     under normal conditions it's usually the tighter (lower) of the two -
+#     it dominates the smooth day-to-day ramp. Voltage stays fully live as
+#     the secondary/quick-cutoff input: a real sag/spike still independently
+#     and instantly pulls the combined factor down the moment it crosses its
+#     own window, regardless of what SoC says - deliberately preserves Rev
+#     2's original fix ("the CC->CV taper must be driven ONLY by individual
+#     cell voltage, continuously, at any SoC - a single imbalanced cell can
+#     approach the ceiling early"), NOT a reversion of it: voltage alone can
+#     still restrict power at any SoC, min() just adds a second, independent
+#     restrictor on top. No SoC data yet -> that factor defaults to 1.0
+#     (does not restrict), degrading exactly to the pre-existing voltage-
+#     only behavior.
+#   - New config fields (both features' emergency/hard-cut tiers are
+#     UNCHANGED - still voltage-only, still instantaneous):
+#     discharge_power_taper.taper_start_soc_pct/taper_zero_soc_pct (default
+#     20%/8% - zero point deliberately lands at low_voltage_cutoff's own
+#     min_soc_pct backup-check floor, same pairing taper_zero_v already has
+#     with min_cell_v) and charge_target_taper.regen_full_soc_pct/
+#     regen_zero_soc_pct (default 80%/100% - full point matches
+#     charge_emulation's existing daily_target_pct default). Starting
+#     values, not yet researched or real-hardware-confirmed (docs/11) - a
+#     brand-new tunable, same status as every other new default this
+#     project has shipped. FEATURE_FIELD_BOUNDS/_CONFIG_SANITY_CHECKS
+#     entries added for both new field pairs (0-100% bound, zero < start /
+#     full < zero ordering), GUI sliders added to ManagementPanel.
+#   New tests in tests/test_management_engine.py (14 checks): SoC-alone
+#   tapers with healthy voltage (both directions), voltage-alone still cuts
+#   with healthy SoC (both directions, confirms Rev 2's property survives),
+#   full power when both are healthy (both directions), missing-SoC
+#   fallback degrades to voltage-only exactly (both directions), and the two
+#   new config-sanity ordering checks. All existing tests (management
+#   engine, charge ramp, output clamping, NaN validation, realtime engine,
+#   fault log, config profile) still pass unchanged - the new SoC factor
+#   defaults to non-restrictive (1.0) at every existing test's default
+#   soc_pct=60.0, confirmed via a full suite rerun before and after.
+#
+# Rev 70: field rename - user follow-up on Rev 69 (user directive: "it states
+#   'zero' but we added a min value so those should state the min not zero
+#   also, make sure those changes are in the help box") -
+#   bridge/management_engine.py, gui/panels.py, docs/05-battery-management-
+#   safety.md, tests/test_management_engine.py, tests/check_taper_smoothness.py:
+#   `taper_zero_v` -> `taper_min_v` (discharge_power_taper) and `regen_zero_v`
+#   -> `regen_min_v` (charge_target_taper), plus the brand-new Rev 69 SoC
+#   pair `taper_zero_soc_pct` -> `taper_min_soc_pct` / `regen_zero_soc_pct`
+#   -> `regen_min_soc_pct` (renamed before ever shipping under the old name,
+#   except in this project's own live-app-autosave window - see below). Same
+#   precedent/reasoning as the pre-existing `ac_zero_v` -> `ac_min_v` rename
+#   (2026-08-06): once `discharge_min_kw`/`regen_min_kw` (2026-08-08) made
+#   the taper's floor a configurable value instead of a hardcoded true zero,
+#   a field literally named "zero" was actively misleading. Plain 1:1 key
+#   renames, no value conversion. Migrated on profile load
+#   (`ManagementEngine.from_dict()`'s new `_migrate_zero_to_min_keys()`, same
+#   "old key -> new key, only if the new key isn't already present" pattern
+#   as the existing °F->°C and `ac_zero_v` migrations) - verified directly
+#   against the user's own real `config/profile.json` (which already had all
+#   4 old-named keys, including a real `regen_full_soc_pct=90.0` the user had
+#   already tuned live in the running app before this rename): every value
+#   round-trips through `from_dict()` unchanged under its new name.
+#   Everywhere a "zero"/"Zero" label or tooltip described these two
+#   features' floor point is now "min"/"Min" - GUI field labels, both
+#   features' full INFO_TEXT help-box bodies, live status text
+#   (`status['discharge_power_taper']`/`status['charge_target_taper']`'s
+#   `min <=`/`min >=` wording), the two new config-sanity violation
+#   messages, and docs/05's feature table + defaults table + prose
+#   sections. All 11 test files still pass; `check_profile_drift.py`
+#   correctly flags the renamed pairs as "orphaned"/"missing" (it's a raw
+#   JSON-key diff with no knowledge of `from_dict()`'s migrations, not an
+#   actual gap - confirmed separately above).
+#
+# Rev 71: DID 0x1814 (16 temp probes) added as the PRIMARY source for
+#   temp_01..temp_16, with the 0x4AA CAN broadcast as the BACKUP - user
+#   directive: DID's real 1/256C resolution beats the CAN broadcast's
+#   whole-degree quantization, for both GUI display and the Leaf-output data.
+#   Plus a new temp_probe_cross_check feature comparing the two sources
+#   directly, per probe ("this is key to make sure we have good data").
+#   - bridge/rz450e_signals.py: DID_TEMP_PROBES (0x18,0x14) constant;
+#     decode_temp_probes_did() (uint16/256.0-50.0 per probe, °C, ported from
+#     Refrance/RZ450e_battery_can_decode_Project's confirmed DID/PID
+#     reference, with the reference project's own °F conversion step dropped
+#     since this project stores °C); DID_TEMP_POLL_INTERVAL_S (10s) and
+#     DID_TEMP_FRESH_WINDOW_S (20s, both user-directed, documented starting
+#     points - see docs/11); registry rows for temp_NN_did/temp_NN_can
+#     (16 each); temp_probe_did_keys()/temp_probe_can_keys() helpers;
+#     _plausible_key() strips a _did/_can suffix before a PLAUSIBLE_RANGES
+#     lookup so both new per-source key sets share temp_NN's existing range
+#     instead of needing it duplicated.
+#   - bridge/realtime_engine.py: _ingest_rz_bus()'s new ID_TEMPS branch always
+#     writes the 0x4AA backup copy (temp_NN_can), and only promotes it to the
+#     front-door temp_NN keys (what every consumer - mapping_engine, the GUI,
+#     temp_data_cross_check/temp_probe_cross_check, over_temperature_derate -
+#     actually reads) when temp_01_did's age exceeds DID_TEMP_FRESH_WINDOW_S
+#     (all 16 probes share one DID response timestamp, so checking one is
+#     representative). _did_poll_loop() polls DID 0x1814 on its OWN gate
+#     (DID_TEMP_POLL_INTERVAL_S), deliberately NOT a 4th slot in the SoC/
+#     capacity/primary-V-I round-robin - docs/02's own measured ~9s/poll
+#     cadence for that EXISTING 3-item cycle showed a 4th item there would
+#     slow every item for no benefit, since temperature (thermal mass)
+#     doesn't need that cadence. Whenever a DID response arrives it's written
+#     to both the backup key AND the front-door key together (DID always
+#     wins the instant it's fresh). Both paths use genuine timestamps only
+#     (never artificially refreshed), so the general staleness watchdog still
+#     correctly detects a true RZ450e dropout on temp_NN.
+#   - bridge/management_engine.py: new temp_probe_cross_check feature
+#     (max_delta_c=2.0 default - tighter than temp_data_cross_check's 5.6C
+#     since this compares the SAME probe via two sources, no spatial
+#     gradient involved, just CAN's ~1.0C quantization + a small sampling-
+#     time-gap allowance - vs. 60s soft/+5s hard, same pattern as the two
+#     pre-existing cross-checks), FEATURE_FIELD_BOUNDS entries,
+#     _temp_probe_cross_check_since state.
+#   - bridge/fault_log.py: temp_probe_mismatch/temp_probe_mismatch_hard
+#     registered in FAULT_DEFINITIONS.
+#   - gui/panels.py: temp_probe_cross_check wired into FEATURE_FIELDS/LABELS/
+#     MANAGEMENT_FEATURE_HELP (checkbox + max-delta/soft-cut/hard-escalation
+#     fields + "?" popup, same generic pattern as every other feature block -
+#     no other GUI code needed); the plain temp_NN registry row's label
+#     updated to note it's now the merged/effective value.
+#   - Tests (new coverage - the feature had none before this):
+#     tests/test_rz450e_signals.py (decode formula, too-short-response guard,
+#     _plausible_key suffix sharing); tests/test_management_engine.py
+#     (temp_probe_cross_check soft/hard escalation, no-data-yet, disable-
+#     clears-live, boundary delta - mirrors the existing temp_data_cross_
+#     check tests); tests/test_realtime_engine.py (three new tests drive
+#     real frames through the actual _ingest_rz_bus() thread - CAN promoted
+#     to front-door when no DID data has ever arrived, front-door stays on
+#     DID while fresh and is NOT overwritten by CAN, falls back to CAN once
+#     the DID reading goes stale - the only tests in this project exercising
+#     the primary/backup SOURCE SELECTION logic itself, not just a downstream
+#     feature consuming its output).
+#   - Docs: 02 (DID 0x1814 entry rewritten - was previously documented as
+#     "prefer 0x4AA for live use," now inverted for this specific signal;
+#     also fixed two long-stale °F-formula table cells left over from the
+#     2026-08-09 Celsius conversion), 05 (new feature row + defaults table
+#     entries + DID_TEMP_POLL_INTERVAL_S/DID_TEMP_FRESH_WINDOW_S citations;
+#     also fixed a stale "10°F" reference in temp_data_cross_check's own
+#     defaults row, same leftover as 02's), 06 (new section 1b: the full
+#     primary/backup state-machine description), 08 (GUI feature-block
+#     mention), 09 (STM32 export schema keys + a stateful-logic note for
+#     firmware, same pattern as the existing taper hysteresis note), 10 (new
+#     open question #18: all three new numbers are user-directed starting
+#     points, not real-hardware-confirmed), 11 (new verification-checklist
+#     row; fixed the same stale "10°F" leftover as 05), 14 (boundary-test +
+#     new-coverage entries, Part 2 provisional-number list), 15 (new B24
+#     section; fixed the same stale "10°F" leftover as 05/11).
+#
+# Rev 72: new "Engine Timing" GUI tab (user directive: "this app is kinda
+#   supposed to be a configurator for the hardware version... what else
+#   could be changed for configuration?"). 11 fields moved from bare
+#   hardcoded module constants to a live, GUI-editable, profile-persisted
+#   dict - 4 DID-polling fields (previously rz450e_signals.
+#   DID_RESPONSE_TIMEOUT_S/DID_INTER_REQUEST_GAP_S/DID_TEMP_POLL_INTERVAL_S/
+#   DID_TEMP_FRESH_WINDOW_S, added Rev 71) + 7 wind-down/charge-detection
+#   fields (previously leaf_signals.IGNITION_QUIET_S/IGNITION_OFF_DELAY_S/
+#   IGNITION_GRACE_S/CHG_END_STOP_S/CHG_STALL_TIMEOUT_S/CHG_CMD_FRESH_S/
+#   BUS_SILENCE_TIMEOUT_S). Preceded by a codebase-wide survey (research
+#   pass, no code changes from it directly) of every other hardcoded
+#   constant, to separate genuine tunables from protocol-mandated values
+#   that must stay fixed (Leaf per-message TX periods, startup/shutdown
+#   phase-boundary ms tables, checksum/CRC math, CAN IDs/DIDs,
+#   PLAUSIBLE_RANGES, opaque replay tables) - user picked this
+#   wind-down/charge-detection group for this round; CAN bitrate/reconnect
+#   interval, the AC-taper convergence-rate table, and cosmetic UI-refresh
+#   timers were surveyed but deliberately left out of scope.
+#   - bridge/leaf_signals.py: new ENGINE_TIMING_FIELDS table (11×
+#     `(key, label, lo, hi, step, default)` tuples, same shape as
+#     CHARGE_SLIDERS) + ENGINE_TIMING_BOUNDS (derived (lo, hi) dict, same
+#     pattern as CHARGE_EMULATION_BOUNDS). The 7 wind-down bare constants
+#     removed; IGNITION_IDS/CHG_CMD_IDLE (structural CAN ID set / a decode
+#     threshold, not timing) stay as module constants.
+#   - bridge/rz450e_signals.py: the 4 DID-timing bare constants removed
+#     (their defaults now live in leaf_signals.ENGINE_TIMING_FIELDS).
+#   - bridge/state.py: new `self.engine_timing` dict, seeded from
+#     ENGINE_TIMING_FIELDS' defaults, same pattern as `charge_emulation`.
+#   - bridge/realtime_engine.py: `ShutdownSequencer.__init__` takes an
+#     optional `config` dict (defaults to a FRESH copy of ENGINE_TIMING_
+#     FIELDS' defaults when None - built inside `__init__`, not a mutable
+#     default arg, so sibling instances never share one dict - verified by
+#     a new test). Every internal `leaf_signals.CONST` read replaced with
+#     `self.config['key']`. `RealtimeEngine` passes `state.engine_timing`
+#     (the SAME dict the GUI edits) at both construction sites (`__init__`
+#     and `start()`). `_did_poll_loop()` and `_apply_charge_ramp()`'s
+#     replug-debounce gap now read `self.state.engine_timing[...]` live,
+#     every pass, not cached.
+#   - bridge/config_profile.py: `build_profile_dict()`/`apply_profile()`
+#     gained an `engine_timing` section; new `_apply_engine_timing()`
+#     (bounds-clamped on load, exact same pattern as
+#     `_apply_charge_emulation()` - a corrupted/hand-edited profile.json
+#     can't set a value outside what the GUI itself would allow).
+#   - gui/panels.py: new `EngineTimingPanel` - a single generic loop over
+#     `ENGINE_TIMING_FIELDS` (two labeled groups: DID polling, wind-down/
+#     charge-session detection), reusing ChargeEmulationPanel's exact
+#     `_set_float` invalid/clamped-feedback pattern. gui/app.py: new
+#     "Engine Timing" tab between Charge Emulation and the Future
+#     placeholder. Manually verified end-to-end by launching the real app
+#     (screenshot-driven): all 11 fields render with correct defaults,
+#     typing an out-of-range value into `did_response_timeout_s` correctly
+#     clamps + flags, matching Charge Emulation's own behavior exactly.
+#   - Tests (new coverage - every one of these 11 fields had zero test
+#     injecting a custom value before this): tests/test_shutdown_
+#     sequencer.py (`test_custom_config_overrides_default_timing`,
+#     `test_default_config_is_a_fresh_dict_not_shared_between_instances`);
+#     tests/test_config_profile.py (round-trip, bounds-clamp, and
+#     missing-section-keeps-defaults tests for `engine_timing`, mirroring
+#     the existing `charge_emulation`/`vehicle` round-trip tests). Fixed 3
+#     pre-existing test files that referenced the now-removed bare
+#     constants directly (tests/test_charge_ramp.py, tests/test_realtime_
+#     engine.py, tests/test_shutdown_sequencer.py) - switched to reading
+#     the live config dict instead (`seq.config[...]`/
+#     `state.engine_timing[...]`), which is also strictly better test
+#     hygiene than the old `rz450e_signals.DID_TEMP_FRESH_WINDOW_S =
+#     ...; finally: restore` monkeypatch one of them used to need.
+#   - tests/check_profile_drift.py: added an `engine_timing` section to the
+#     drift report (was silently uncovered - the report has no knowledge of
+#     a section it was never told about).
+#   - Docs: 02/05 (DID-timing field citations updated from bare constant
+#     names to `state.engine_timing` keys, "not GUI-editable" corrected to
+#     "GUI-editable"), 06 (new section 1c: the engine_timing architecture),
+#     07 (wind-down trigger section now notes all 5 timing values are
+#     GUI-editable, not protocol-mandated), 08 (new "Engine Timing tab"
+#     section, ASCII layout diagram updated), 09 (STM32 export: engine_timing
+#     added to the example JSON, items 5/6 updated from "still to be added"
+#     to "DONE" for the DID/wind-down half specifically), 10/14/15 (every
+#     stale "engine constant, not GUI-editable" claim from Rev 71 corrected;
+#     new B25 real-hardware checklist section; new docs/14 test-coverage
+#     entry).
+#
+# Rev 73: same-day follow-up to Rev 72 - user: "engen timming sounds odd.
+#   lets change that to 'timming'" - renamed the "Engine Timing" tab/help-
+#   popup title to "Timing" everywhere user-facing (gui/app.py's tab label,
+#   gui/panels.py's panel header + help-popup title + ENGINE_TIMING_HELP's
+#   own heading line). Internal identifiers unchanged (still `EngineTimingPanel`
+#   class, `state.engine_timing` dict, `ENGINE_TIMING_FIELDS`/`ENGINE_TIMING_
+#   HELP` module names) - only the string a user actually sees changed.
+#   Docs 02/05/07/08/10/14/15 and tests/test_shutdown_sequencer.py's comment
+#   updated to match (bulk text replace of the literal phrase "Engine Timing"
+#   -> "Timing" - safe since none of the internal snake_case/CamelCase
+#   identifiers contain that exact two-word phrase with a space). Verified by
+#   relaunching the real app and screenshotting the tab bar.
+#
+# Rev 74: same-day follow-up - user asked whether the per-CAN-message Leaf TX
+#   timing should also go on the Timing tab; agreed it should be READ-ONLY
+#   (protocol-mandated, bit-verified against real captures, unlike the 11
+#   editable fields above), then asked whether that was everything in this
+#   category - it wasn't, so also added the startup timeline and shutdown
+#   staging tables plus the re-arm cooldown, all in the same read-only
+#   reference section.
+#   - bridge/leaf_signals.py: new TX_PERIOD_LABELS dict (CAN ID -> display
+#     name, e.g. 0x1DB -> "Battery status"), STARTUP_TIMELINE_REFERENCE and
+#     SHUTDOWN_STAGING_REFERENCE lists ((label, ms) tuples, chronological
+#     order) - all placed right after the existing TX_PERIOD_MS/T_*_START/
+#     PWRDOWN_*_MS constants they describe, purely for display, no new
+#     values invented (every number here already existed in code).
+#   - gui/panels.py: EngineTimingPanel gained a third box, "Real-Leaf
+#     protocol timing (fixed - reference only)", built from a new
+#     _build_reference_section() helper - plain ttk.Label pairs, no Entry/
+#     StringVar/trace/bounds-clamp at all, so there is structurally no way
+#     to edit these values from the GUI (not just a disabled Entry - no
+#     Entry exists). New PROTOCOL_TIMING_HELP text explains why this group
+#     is different from the two editable ones above it. Verified end-to-end
+#     by relaunching the real app and screenshotting the new section - all
+#     TX-period rows render with correct labels/values.
+#   - docs/08: new subsection describing the third group and its rationale.
 
 if __name__ == '__main__':
     app = App()

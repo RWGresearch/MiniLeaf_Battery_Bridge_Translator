@@ -55,6 +55,69 @@ likely trip the VCM's own timeout logic.
   `03-target-signals-leaf.md`) are driven by the TX loop's own counters, same as the Leaf project
   already does, unaffected by RX timing entirely.
 
+## 1b. Temp probe primary/backup source selection (added 2026-08-14)
+
+Distinct from the known-good startup cache in section 2 below (which bridges the gap before ANY
+live data has arrived) — this is an ongoing choice between two SIMULTANEOUSLY live sources for the
+same 16 signals (`temp_01`-`temp_16`), per user directive: use DID `0x1814` (real 1/256°C
+resolution) as the PRIMARY input, with the `0x4AA` CAN broadcast (whole-degree resolution) as the
+BACKUP, for both GUI display and the data generated for the Leaf output.
+
+- `RealtimeEngine._ingest_rz_bus()`'s `ID_TEMPS` branch decodes every `0x4AA` frame into a BACKUP
+  copy (`temp_NN_can`) unconditionally, then checks the age of `temp_01_did` (all 16 probes share
+  one DID response timestamp, since DID `0x1814` returns them in a single request — checking one is
+  representative of all 16). Only when that age exceeds `did_temp_fresh_window_s` (20s default,
+  GUI-editable via `state.engine_timing` — see section 1c below, `docs/11-manual-verification-
+  checklist.md`) does the CAN value get promoted to the front-door `temp_NN` key that every
+  consumer (mapping engine, GUI, `temp_data_cross_check`, `temp_probe_cross_check`,
+  `over_temperature_derate`) actually reads.
+- `RealtimeEngine._did_poll_loop()` polls DID `0x1814` on its own gate (`did_temp_poll_interval_s`,
+  10s default) — deliberately NOT a 4th slot in the SoC/capacity/primary-V-I round-robin, since
+  `02-source-signals-rz450e.md` documents that existing 3-item cycle's slowest item at ~9s/poll in
+  real testing; folding temps in would slow every item for no benefit, since temperature (thermal
+  mass) changes slowly and doesn't need that cadence. Whenever a DID response arrives, it's written
+  to the backup key (`temp_NN_did`) AND
+  the front-door key (`temp_NN`) together — DID always wins the instant it's fresh, no separate
+  "promote" step needed on that side.
+- Both timestamps are genuine (never artificially refreshed), so the general staleness watchdog
+  (section 3 below) still correctly detects a true RZ450e dropout on `temp_NN` — the front-door key
+  only advances when one of the two real sources actually produced new data, never on a fixed
+  per-tick cadence.
+- `temp_probe_cross_check` (`05-battery-management-safety.md`) compares the two backup copies
+  directly, per probe, as a live data-integrity check on the primary/backup switch itself.
+
+## 1c. Engine timing configuration (added 2026-08-14)
+
+User directive: "this app is kinda supposed to be a configurator for the hardware version...
+what else could be changed for configuration?" - every value below was previously a bare
+hardcoded module constant (`rz450e_signals.DID_RESPONSE_TIMEOUT_S` etc.,
+`leaf_signals.IGNITION_QUIET_S` etc.). None of these are ported/confirmed real-Leaf protocol
+values (unlike the per-message TX periods and startup/shutdown phase timing in
+`07-startup-shutdown-plan.md`, which stay fixed in code, bit-verified against real captures) -
+they're this bridge's own DID-polling cadence and wind-down/charge-detection heuristics, so they're
+now edited the same live-tunable way every other feature in this app is.
+
+- **`leaf_signals.ENGINE_TIMING_FIELDS`** — a single `(key, label, lo, hi, step, default)` table
+  (same 6-tuple shape as `CHARGE_SLIDERS`), 11 entries: 4 DID-polling fields
+  (`did_response_timeout_s`, `did_inter_request_gap_s`, `did_temp_poll_interval_s`,
+  `did_temp_fresh_window_s`) + 7 wind-down/charge fields (`ignition_quiet_s`,
+  `ignition_off_delay_s`, `ignition_grace_s`, `chg_end_stop_s`, `chg_stall_timeout_s`,
+  `chg_cmd_fresh_s`, `bus_silence_timeout_s`). `leaf_signals.ENGINE_TIMING_BOUNDS` derives the
+  `(lo, hi)` clamp table from it, same pattern as `CHARGE_EMULATION_BOUNDS`.
+- **`state.engine_timing`** — a plain live dict seeded from `ENGINE_TIMING_FIELDS`' defaults, same
+  pattern as `state.charge_emulation`. `gui/panels.py`'s `EngineTimingPanel` edits it directly (two
+  labeled groups: DID polling, wind-down/charge-session detection); `config_profile.py` persists it
+  (`_apply_engine_timing()`, bounds-clamped on load, same pattern as `_apply_charge_emulation()`).
+- **`ShutdownSequencer(config=...)`** — takes the timing dict as a constructor param instead of
+  reading `leaf_signals` module constants directly. `RealtimeEngine` passes `state.engine_timing`
+  (the SAME dict object the GUI edits, for live effect with no reload step) at both construction
+  sites (`__init__` and `start()`). Defaults to a fresh copy of `ENGINE_TIMING_FIELDS`' own defaults
+  when `config=None`, so direct/isolated unit tests of the class
+  (`tests/test_shutdown_sequencer.py`) keep working unchanged.
+- **DID polling** (`RealtimeEngine._did_poll_loop`) and the charge-ramp replug-debounce gap
+  (`RealtimeEngine._apply_charge_ramp`) read `self.state.engine_timing[...]` live, every loop pass -
+  not cached - so an edit while the bridge is running takes effect on the very next request/tick.
+
 ## 2. Known-good startup memory
 
 On app startup, before any live RZ450e data has arrived, the TX loop must already have something
@@ -201,8 +264,10 @@ every HVBAT ID, idle vs. real charge-session captures) and gated behind a GUI ch
 **on** as of 2026-08-01) — see `03-target-signals-leaf.md` for the field-level description.
 
 `RealtimeEngine._apply_charge_ramp()` runs once per tick, inside `_compose_leaf_state()`, **before**
-the management engine's per-cell overvoltage taper — so that safety feature always gets the final
-say over the ramped `charger_limit_kw` value, never bypassed. It requires **all** of:
+the management engine's per-cell overvoltage taper (`ac_charge_taper`) AND its AC-charger-specific
+temperature derate (`ac_charge_temp_derate`, added 2026-08-11) — so those two safety features always
+get the final say over the ramped `charger_limit_kw` value, never bypassed; either can reduce it
+further, independently of the other. It requires **all** of:
 
 - the `charge_emulate` checkbox being on;
 - a fresh, real `0x1F2` charge request from the Leaf — reuses `ShutdownSequencer.charge_active()`,

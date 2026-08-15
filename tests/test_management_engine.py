@@ -49,6 +49,20 @@ def set_all_temps(rz, temp_c, exceptions=None):
         rz.update_input(key, exceptions.get(key, temp_c))
 
 
+def set_all_temps_did(rz, temp_c, exceptions=None):
+    exceptions = exceptions or {}
+    for i in range(1, 17):
+        key = f'temp_{i:02d}_did'
+        rz.update_input(key, exceptions.get(key, temp_c))
+
+
+def set_all_temps_can(rz, temp_c, exceptions=None):
+    exceptions = exceptions or {}
+    for i in range(1, 17):
+        key = f'temp_{i:02d}_can'
+        rz.update_input(key, exceptions.get(key, temp_c))
+
+
 def base_inputs(rz, cell_v=3.70, temp_max=25.0, temp_min=25.0, current=0.0, soc=60.0):
     set_all_cells(rz, cell_v)
     rz.update_input('temp_max', temp_max)
@@ -970,6 +984,101 @@ def test_temp_data_cross_check_disabling_clears_fault_log_live():
           out.get('relay_cut_request', 0) == 3)
 
 
+# ── temp_probe_cross_check (added 2026-08-14, user directive: "add the cross
+# check. this is key to make sure we have good data") - DID 0x1814 (primary)
+# vs 0x4AA CAN (backup), per-probe, distinct from temp_data_cross_check
+# above (which only compares the 0x4A7 pack-extremes summary against the
+# probe array as a whole) ───────────────────────────────────────────────────
+def test_temp_probe_cross_check_soft_and_hard_escalation():
+    eng, rz = fresh()
+    eng.config['temp_probe_cross_check']['soft_cut_s'] = 0.05
+    eng.config['temp_probe_cross_check']['hard_escalation_s'] = 0.05
+    set_all_cells(rz, 3.70)
+    set_all_temps_did(rz, 25.0)
+    set_all_temps_can(rz, 25.0, exceptions={'temp_09_can': 15.0})  # probe 9 disagrees by 10C
+    rz.update_input('temp_max', 25.0)
+    rz.update_input('temp_min', 25.0)
+    rz.update_input('current', 0.0)
+
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('probe cross-check: not yet latched on the very first tick (persistence guard)',
+          out.get('capacity_empty', 0) == 0)
+    check('...but the mismatch is already visible in the status text, naming the worst probe',
+          'probe 9' in eng.status.get('temp_probe_cross_check', ''), eng.status.get('temp_probe_cross_check'))
+    check('temp_probe_mismatch fault_log entry NOT yet active (persistence not elapsed)',
+          eng.fault_log.entries['temp_probe_mismatch']['active'] is False)
+
+    time.sleep(0.08)
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('probe cross-check: soft cut fires once the mismatch has persisted past soft_cut_s',
+          out.get('capacity_empty', 0) == 1)
+    check('temp_probe_mismatch fault_log entry is now active',
+          eng.fault_log.entries['temp_probe_mismatch']['active'] is True)
+    check('temp_probe_mismatch_hard NOT yet active (only +hard_escalation_s beyond soft)',
+          eng.fault_log.entries['temp_probe_mismatch_hard']['active'] is False)
+
+    time.sleep(0.08)
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('probe cross-check: escalates to a hard cut after the additional hard_escalation_s',
+          out.get('relay_cut_request', 0) == 3)
+    check('temp_probe_mismatch_hard fault_log entry is now active',
+          eng.fault_log.entries['temp_probe_mismatch_hard']['active'] is True)
+
+    # Recovery: bring the DID and CAN readings for every probe back into agreement.
+    rz2 = SharedState()
+    set_all_cells(rz2, 3.70)
+    set_all_temps_did(rz2, 25.0)
+    set_all_temps_can(rz2, 25.0)
+    rz2.update_input('temp_max', 25.0)
+    rz2.update_input('temp_min', 25.0)
+    rz2.update_input('current', 0.0)
+    eng.apply(dict(leaf_signals.DEFAULTS), rz2)
+    check('temp_probe_mismatch clears once the sources agree again (auto-clear, not latched)',
+          eng.fault_log.entries['temp_probe_mismatch']['active'] is False)
+    check('temp_probe_mismatch_hard also clears',
+          eng.fault_log.entries['temp_probe_mismatch_hard']['active'] is False)
+
+
+def test_temp_probe_cross_check_no_data_yet_does_not_false_trigger():
+    """base_inputs() never sets any temp_XX_did/temp_XX_can key (only the
+    0x4A7 temp_max/temp_min pair) - confirms this feature correctly reports
+    'no data' (not a false mismatch) before either source has ever arrived,
+    e.g. before the app's DID poll loop has completed its first temp probe
+    request."""
+    eng, rz = fresh()
+    base_inputs(rz)
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('no DID/CAN probe data yet -> reports "no data", does not cut',
+          eng.status.get('temp_probe_cross_check') == 'no data to cross-check yet',
+          eng.status.get('temp_probe_cross_check'))
+    check('does not assert capacity_empty from missing probe data alone',
+          out.get('capacity_empty', 0) == 0)
+
+
+def test_temp_probe_cross_check_disabling_clears_fault_log_live():
+    eng, rz = fresh()
+    eng.config['temp_probe_cross_check']['soft_cut_s'] = 0.0
+    eng.config['temp_probe_cross_check']['hard_escalation_s'] = 0.0
+    set_all_cells(rz, 3.70)
+    set_all_temps_did(rz, 25.0)
+    set_all_temps_can(rz, 15.0)
+    rz.update_input('temp_max', 25.0)
+    rz.update_input('temp_min', 25.0)
+    rz.update_input('current', 0.0)
+    eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('sanity: mismatch is active before disabling',
+          eng.fault_log.entries['temp_probe_mismatch_hard']['active'] is True)
+
+    eng.config['temp_probe_cross_check']['enabled'] = False
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('disabling the feature clears temp_probe_mismatch live, same tick',
+          eng.fault_log.entries['temp_probe_mismatch']['active'] is False)
+    check('disabling the feature clears temp_probe_mismatch_hard live, same tick',
+          eng.fault_log.entries['temp_probe_mismatch_hard']['active'] is False)
+    check('the hard-cut latch correctly stays asserted (disabling a feature does not un-latch it)',
+          out.get('relay_cut_request', 0) == 3)
+
+
 # ── ManagementEngine must be the sole, EXPLICIT authority over capacity_
 # empty/relay_cut_request/interlock - not just conditionally force them
 # toward a cut, but also explicitly clear them back (docs/13 item 16.3,
@@ -1040,7 +1149,7 @@ def test_discharge_power_taper_hysteresis_fast_attack_slow_release():
     rz.update_input('current', 0.0)
     eng.apply(dict(leaf_signals.DEFAULTS), rz)   # establish the factor=1.0 baseline
 
-    set_all_cells(rz, 2.50)   # sudden dip well below taper_zero_v (2.60V)
+    set_all_cells(rz, 2.50)   # sudden dip well below taper_min_v (2.60V)
     out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
     check('fast attack: discharge power snaps straight to zero the SAME tick as the dip',
           out['discharge_limit_kw'] == 0.0, f"discharge_limit_kw={out['discharge_limit_kw']}")
@@ -1069,7 +1178,7 @@ def test_charge_target_taper_regen_hysteresis_fast_attack_slow_release():
     rz.update_input('charge_permission_input', 0.0)
     eng.apply(dict(leaf_signals.DEFAULTS), rz)   # establish the factor=1.0 baseline
 
-    # 4.18V: above regen_zero_v (4.15V), so the taper's OWN hysteresis already
+    # 4.18V: above regen_min_v (4.15V), so the taper's OWN hysteresis already
     # reads instant_factor=0.0 - deliberately still below emergency_high_v
     # (4.20V) so this exercises the taper's ramp logic, not the separate
     # emergency-tier direct-set-to-0 branch.
@@ -1113,7 +1222,7 @@ def test_discharge_power_taper_respects_configured_floor_and_ceiling():
     check('ceiling: full-power output caps at the configured 80.0kW, not the static 110.0kW default',
           out['discharge_limit_kw'] == 80.0, f"discharge_limit_kw={out['discharge_limit_kw']}")
 
-    set_all_cells(rz, 2.50)   # well below taper_zero_v (2.60V) - taper factor bottoms out
+    set_all_cells(rz, 2.50)   # well below taper_min_v (2.60V) - taper factor bottoms out
     out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
     check('floor: bottomed-out output holds at the configured 10.0kW, not true zero',
           out['discharge_limit_kw'] == 10.0, f"discharge_limit_kw={out['discharge_limit_kw']}")
@@ -1132,7 +1241,7 @@ def test_charge_target_taper_regen_respects_configured_floor_and_ceiling():
     check('ceiling: full-power regen output caps at the configured 40.0kW, not the static 70.0kW default',
           out['charge_limit_kw'] == 40.0, f"charge_limit_kw={out['charge_limit_kw']}")
 
-    set_all_cells(rz, 4.18)   # above regen_zero_v (4.15V), still below emergency_high_v (4.20V)
+    set_all_cells(rz, 4.18)   # above regen_min_v (4.15V), still below emergency_high_v (4.20V)
     out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
     check('floor: bottomed-out regen output holds at the configured 5.0kW, not true zero',
           out['charge_limit_kw'] == 5.0, f"charge_limit_kw={out['charge_limit_kw']}")
@@ -1322,6 +1431,32 @@ def test_boundary_cell_data_cross_check_delta_and_escalation_timing():
           out4.get('relay_cut_request', 0) == 3, f"relay_cut_request={out4.get('relay_cut_request')}")
 
 
+def test_boundary_temp_probe_cross_check_delta():
+    # max_delta_c boundary (2.0C default) - no persistence needed to observe this part.
+    eng, rz = fresh()
+    set_all_cells(rz, 3.70)
+    set_all_temps_did(rz, 25.0)
+    set_all_temps_can(rz, 25.0, exceptions={'temp_05_can': 23.01})  # delta = 1.99C, just BELOW 2.0C
+    rz.update_input('temp_max', 25.0)
+    rz.update_input('temp_min', 25.0)
+    rz.update_input('current', 0.0)
+    eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('boundary: 1.99C probe delta does NOT trigger the 2.0C threshold',
+          'ok' in eng.status.get('temp_probe_cross_check', ''), eng.status.get('temp_probe_cross_check'))
+
+    eng2, rz2 = fresh()
+    set_all_cells(rz2, 3.70)
+    set_all_temps_did(rz2, 25.0)
+    set_all_temps_can(rz2, 25.0, exceptions={'temp_05_can': 22.99})  # delta = 2.01C, just ABOVE 2.0C
+    rz2.update_input('temp_max', 25.0)
+    rz2.update_input('temp_min', 25.0)
+    rz2.update_input('current', 0.0)
+    eng2.apply(dict(leaf_signals.DEFAULTS), rz2)
+    check('boundary: 2.01C probe delta DOES trigger the 2.0C threshold (mismatch counting down to soft cut)',
+          'mismatch probe 5' in eng2.status.get('temp_probe_cross_check', ''),
+          eng2.status.get('temp_probe_cross_check'))
+
+
 def test_boundary_staleness_watchdog_soft_and_hard_escalation():
     eng, rz = fresh()
     # Shrunk soft_cut_s/hard_escalation_s (0.15s each) so the test doesn't
@@ -1349,6 +1484,250 @@ def test_boundary_staleness_watchdog_soft_and_hard_escalation():
     out4 = eng.apply(dict(leaf_signals.DEFAULTS), rz)
     check('boundary: staleness hard cut ACTIVE just after soft_cut_s+hard_escalation_s',
           out4.get('relay_cut_request', 0) == 3, f"relay_cut_request={out4.get('relay_cut_request')}")
+
+
+# ── AC charger temperature derate (added 2026-08-11, user report: "we dont
+# have any heat regulation for charging... we need separate inputs for
+# those temps for when charging in the charger tab. there not the same
+# values"). Same split already applied to voltage (ac_charge_taper vs.
+# charge_target_taper): independently-tunable cold/hot thresholds, only
+# ever touches charger_limit_kw, only while a real charge session is
+# active. ────────────────────────────────────────────────────────────────
+def test_ac_charge_temp_derate_leaves_charger_limit_kw_untouched_while_driving():
+    eng, rz = fresh()
+    base_inputs(rz, temp_max=50.0, temp_min=50.0)   # well inside the hot-derate window - NOT charging (base_inputs defaults charge_permission_input to 0)
+    leaf_state = dict(leaf_signals.DEFAULTS)
+    leaf_state['charger_limit_kw'] = 92.3   # idle placeholder, as mapping/ramp would leave it while driving
+    out = eng.apply(leaf_state, rz)
+    check('charger_limit_kw is left completely untouched by ac_charge_temp_derate while not actually charging',
+          out['charger_limit_kw'] == 92.3, f"charger_limit_kw={out['charger_limit_kw']}")
+
+
+def test_ac_charge_temp_derate_cold_side_ramps_and_blocks_no_latch():
+    eng, rz = fresh()
+    base_inputs(rz, temp_max=-6.7, temp_min=-6.7)   # well below ac_low_block_c (0.0C default)
+    rz.update_input('charge_permission_input', 1.0)
+    leaf_state = dict(leaf_signals.DEFAULTS)
+    leaf_state['charger_limit_kw'] = 6.6
+    out = eng.apply(leaf_state, rz)
+    check('AC charging blocked (charger_limit_kw=0) when coldest probe is at/below ac_low_block_c',
+          out['charger_limit_kw'] == 0.0, f"charger_limit_kw={out['charger_limit_kw']}")
+    check('ac_charge_cold_block fault_log entry is active',
+          eng.fault_log.entries['ac_charge_cold_block']['active'] is True)
+    check('cold-side block does NOT latch a session stop (no full_charge_flag)',
+          out.get('full_charge_flag', 0) == 0, f"full_charge_flag={out.get('full_charge_flag')}")
+
+    # Warming back up above ac_derate_low_start_c must auto-resume with no
+    # latch/replug needed - mirrors driving-mode's own cold-side behavior.
+    base_inputs(rz, temp_max=15.0, temp_min=15.0)
+    rz.update_input('charge_permission_input', 1.0)
+    out2 = eng.apply(dict(leaf_state), rz)
+    check('AC charging auto-resumes to full power once the coldest probe warms back above ac_derate_low_start_c',
+          out2['charger_limit_kw'] == 6.6, f"charger_limit_kw={out2['charger_limit_kw']}")
+    check('ac_charge_cold_block fault_log entry auto-clears',
+          eng.fault_log.entries['ac_charge_cold_block']['active'] is False)
+
+
+def test_ac_charge_temp_derate_hot_side_ramps_and_latches_stop():
+    eng, rz = fresh()
+    base_inputs(rz, temp_max=45.0, temp_min=25.0)   # exactly at ac_hard_stop_c (45.0C default)
+    rz.update_input('charge_permission_input', 1.0)
+    leaf_state = dict(leaf_signals.DEFAULTS)
+    leaf_state['charger_limit_kw'] = 6.6
+    out = eng.apply(leaf_state, rz)
+    check('reaching ac_hard_stop_c sets full_charge_flag (session ends, not just a derate)',
+          out.get('full_charge_flag', 0) == 1, f"full_charge_flag={out.get('full_charge_flag')}")
+    check('charge_limit_kw is forced to 0.0 at the AC charging hard-stop temp',
+          out.get('charge_limit_kw') == 0.0, f"charge_limit_kw={out.get('charge_limit_kw')}")
+    check('charger_limit_kw is forced to -10.0 (raw idle-stop value) at the AC charging hard-stop temp',
+          out.get('charger_limit_kw') == -10.0, f"charger_limit_kw={out.get('charger_limit_kw')}")
+    check('ac_charge_temp_stop fault_log entry is active',
+          eng.fault_log.entries['ac_charge_temp_stop']['active'] is True)
+
+    # Latch must survive the pack cooling back down - same discipline as
+    # ac_cutoff_v's own stop-charging latch (test above).
+    base_inputs(rz, temp_max=25.0, temp_min=25.0)
+    rz.update_input('charge_permission_input', 1.0)
+    out2 = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('AC charge stop stays latched once the triggering temp recovers (does not silently resume)',
+          out2.get('full_charge_flag', 0) == 1, f"full_charge_flag={out2.get('full_charge_flag')}")
+
+    # Only a genuine replug clears it.
+    eng.notify_charge_replug()
+    base_inputs(rz, temp_max=25.0, temp_min=25.0)
+    rz.update_input('charge_permission_input', 1.0)
+    out3 = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('notify_charge_replug() clears the AC charging temp-stop latch, allowing charging to resume',
+          out3.get('full_charge_flag', 0) == 0, f"full_charge_flag={out3.get('full_charge_flag')}")
+
+
+def test_ac_charge_temp_derate_disabled_clears_fault_log_live():
+    eng, rz = fresh()
+    base_inputs(rz, temp_max=45.0, temp_min=25.0)   # would otherwise latch a stop
+    rz.update_input('charge_permission_input', 1.0)
+    eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('sanity: ac_charge_temp_stop is active before disabling',
+          eng.fault_log.entries['ac_charge_temp_stop']['active'] is True)
+
+    rz.charge_emulation['ac_temp_derate_enabled'] = False
+    base_inputs(rz, temp_max=45.0, temp_min=25.0)
+    rz.update_input('charge_permission_input', 1.0)
+    eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('disabling ac_charge_temp_derate immediately clears ac_charge_temp_stop live, not frozen active',
+          eng.fault_log.entries['ac_charge_temp_stop']['active'] is False)
+    check('disabling ac_charge_temp_derate immediately clears ac_charge_cold_block live too',
+          eng.fault_log.entries['ac_charge_cold_block']['active'] is False)
+
+
+def test_over_temperature_derate_no_longer_touches_charger_limit_kw_except_true_emergency():
+    # Regression coverage for the 2026-08-11 fix: over_temperature_derate's
+    # graduated (non-emergency) ramp used to also multiply charger_limit_kw
+    # using the DRIVING-mode thresholds - now that's ac_charge_temp_derate's
+    # own job (with its own thresholds, tested above), so the graduated
+    # ramp here must leave charger_limit_kw alone. The true pack-wide
+    # emergency tier is the one exception - it must still zero
+    # charger_limit_kw as the final universal backstop.
+    eng, rz = fresh()
+    base_inputs(rz, temp_max=40.0, temp_min=25.0)   # inside over_temperature_derate's charge_derate_start_c(32)..charge_hard_stop_c(45) ramp window - a real graduated derate, not full power
+    rz.update_input('charge_permission_input', 0.0)   # driving - ac_charge_temp_derate stays inactive, isolating this check to over_temperature_derate alone
+    leaf_state = dict(leaf_signals.DEFAULTS)
+    leaf_state['charger_limit_kw'] = 92.3
+    out = eng.apply(leaf_state, rz)
+    check('graduated over_temperature_derate no longer reduces charger_limit_kw (that is ac_charge_temp_derate\'s job now)',
+          out['charger_limit_kw'] == 92.3, f"charger_limit_kw={out['charger_limit_kw']}")
+    check('sanity: the graduated ramp DID reduce charge_limit_kw (regen), confirming the feature is genuinely active this tick',
+          out['charge_limit_kw'] < leaf_signals.DEFAULTS['charge_limit_kw'],
+          f"charge_limit_kw={out['charge_limit_kw']}")
+
+    eng2, rz2 = fresh()
+    base_inputs(rz2, temp_max=65.0, temp_min=25.0)   # above emergency_temp_c (61.0C default) - a genuine pack-wide emergency
+    rz2.update_input('charge_permission_input', 0.0)
+    leaf_state2 = dict(leaf_signals.DEFAULTS)
+    leaf_state2['charger_limit_kw'] = 92.3
+    out2 = eng2.apply(leaf_state2, rz2)
+    check('the TRUE over-temperature emergency still zeroes charger_limit_kw as the final universal backstop',
+          out2['charger_limit_kw'] == 0.0, f"charger_limit_kw={out2['charger_limit_kw']}")
+
+
+# ── SoC blending for discharge_power_taper / charge_target_taper (added
+# 2026-08-13, user directive: "use SOC as the primary control and the
+# battery voltage as a secondary... SOC does not dramatically drop like
+# voltage does" - see tests/check_taper_smoothness.py for the investigation
+# that motivated this and default_config()'s own comment for the full
+# design rationale). Combined via min(voltage_factor, soc_factor), never a
+# straight replacement of the pre-existing voltage-only behavior. Uses
+# fresh()'s code defaults (default_config()), NOT config/profile.json's own
+# tuned values - taper_start_v=3.00/taper_min_v=2.60 (discharge),
+# regen_full_v=4.00/regen_min_v=4.15 (regen). ─────────────────────────────
+def test_discharge_soc_factor_tapers_with_healthy_voltage():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=3.70, soc=14.0)   # healthy voltage (full power), SoC exactly at the midpoint of the default 20%/8% window
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    factor = out['discharge_limit_kw'] / leaf_signals.DEFAULTS['discharge_limit_kw']
+    check('SoC alone tapers discharge power to exactly half at the midpoint of its window (14% between '
+          '20%/8%), even with fully healthy per-cell voltage',
+          abs(factor - 0.5) < 1e-9, f'factor={factor!r} (expected exactly 0.5)')
+    check('status text names SoC as the binding (more restrictive) factor',
+          'binding=SoC' in eng.status.get('discharge_power_taper', ''), eng.status.get('discharge_power_taper'))
+
+
+def test_discharge_voltage_still_provides_quick_cutoff_despite_healthy_soc():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=2.80, soc=60.0)   # voltage at the midpoint of its 3.00/2.60 window, SoC well above its own 20% full-power floor
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    factor = out['discharge_limit_kw'] / leaf_signals.DEFAULTS['discharge_limit_kw']
+    check('a real voltage sag still restricts discharge power even with a fully healthy SoC reading - the '
+          '"quick cutoff still works with voltage" property the SoC blending must not remove',
+          abs(factor - 0.5) < 1e-9, f'factor={factor!r} (expected exactly 0.5)')
+    check('status text names voltage as the binding (more restrictive) factor',
+          'binding=voltage' in eng.status.get('discharge_power_taper', ''), eng.status.get('discharge_power_taper'))
+
+
+def test_discharge_full_power_when_both_soc_and_voltage_are_healthy():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=3.70, soc=60.0)   # both well above their respective full-power floors
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('full discharge power when neither voltage nor SoC is anywhere near its taper window',
+          out['discharge_limit_kw'] == leaf_signals.DEFAULTS['discharge_limit_kw'],
+          f"discharge_limit_kw={out['discharge_limit_kw']}")
+
+
+def test_discharge_missing_soc_falls_back_to_voltage_only():
+    eng, rz = fresh()
+    # SoC deliberately never set - simulates it never having arrived yet
+    # (a genuinely slow DID-polled signal, docs/06), unlike base_inputs()
+    # which always sets it.
+    set_all_cells(rz, 2.80)   # voltage at the midpoint of its taper window
+    rz.update_input('temp_max', 25.0)
+    rz.update_input('temp_min', 25.0)
+    rz.update_input('current', 0.0)
+    rz.update_input('charge_permission_input', 0.0)
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    factor = out['discharge_limit_kw'] / leaf_signals.DEFAULTS['discharge_limit_kw']
+    check('with no SoC data at all, the combined factor degrades exactly to the pre-existing voltage-only '
+          'behavior (SoC factor defaults to 1.0, never restricts)',
+          abs(factor - 0.5) < 1e-9, f'factor={factor!r} (expected exactly 0.5, matching voltage alone)')
+
+
+def test_regen_soc_factor_tapers_with_healthy_voltage():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=3.70, soc=90.0)   # healthy voltage (full power), SoC exactly at the midpoint of the default 80%/100% window
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    factor = out['charge_limit_kw'] / leaf_signals.DEFAULTS['charge_limit_kw']
+    check('SoC alone tapers regen power to exactly half at the midpoint of its window (90% between '
+          '80%/100%), even with fully healthy per-cell voltage',
+          abs(factor - 0.5) < 1e-9, f'factor={factor!r} (expected exactly 0.5)')
+    check('status text names SoC as the binding (more restrictive) factor',
+          'binding=SoC' in eng.status.get('charge_target_taper', ''), eng.status.get('charge_target_taper'))
+
+
+def test_regen_voltage_still_provides_quick_cutoff_despite_healthy_soc():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=4.075, soc=60.0)   # voltage at the midpoint of its 4.00/4.15 window, SoC well below its own 80% full-power ceiling
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    factor = out['charge_limit_kw'] / leaf_signals.DEFAULTS['charge_limit_kw']
+    check('a real voltage rise still restricts regen power even with a fully healthy SoC reading',
+          abs(factor - 0.5) < 1e-9, f'factor={factor!r} (expected exactly 0.5)')
+    check('status text names voltage as the binding (more restrictive) factor',
+          'binding=voltage' in eng.status.get('charge_target_taper', ''), eng.status.get('charge_target_taper'))
+
+
+def test_regen_full_power_when_both_soc_and_voltage_are_healthy():
+    eng, rz = fresh()
+    base_inputs(rz, cell_v=3.70, soc=60.0)
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('full regen power when neither voltage nor SoC is anywhere near its taper window',
+          out['charge_limit_kw'] == leaf_signals.DEFAULTS['charge_limit_kw'],
+          f"charge_limit_kw={out['charge_limit_kw']}")
+
+
+def test_regen_missing_soc_falls_back_to_voltage_only():
+    eng, rz = fresh()
+    set_all_cells(rz, 4.075)   # voltage at the midpoint of its regen taper window
+    rz.update_input('temp_max', 25.0)
+    rz.update_input('temp_min', 25.0)
+    rz.update_input('current', 0.0)
+    rz.update_input('charge_permission_input', 0.0)
+    out = eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    factor = out['charge_limit_kw'] / leaf_signals.DEFAULTS['charge_limit_kw']
+    check('with no SoC data at all, regen degrades exactly to the pre-existing voltage-only behavior',
+          abs(factor - 0.5) < 1e-9, f'factor={factor!r} (expected exactly 0.5, matching voltage alone)')
+
+
+def test_config_sanity_flags_inverted_soc_ordering():
+    eng, rz = fresh()
+    eng.config['discharge_power_taper']['taper_min_soc_pct'] = 25.0   # inverted vs. taper_start_soc_pct (20.0 default)
+    base_inputs(rz, cell_v=3.70, soc=60.0)
+    eng.apply(dict(leaf_signals.DEFAULTS), rz)
+    check('config-sanity check flags an inverted discharge taper SoC ordering',
+          'taper_min_soc_pct' in eng.status.get('config_sanity', ''), eng.status.get('config_sanity'))
+
+    eng2, rz2 = fresh()
+    eng2.config['charge_target_taper']['regen_full_soc_pct'] = 100.0   # not < regen_min_soc_pct (100.0 default)
+    base_inputs(rz2, cell_v=3.70, soc=60.0)
+    eng2.apply(dict(leaf_signals.DEFAULTS), rz2)
+    check('config-sanity check flags an inverted/equal regen taper SoC ordering',
+          'regen_full_soc_pct' in eng2.status.get('config_sanity', ''), eng2.status.get('config_sanity'))
 
 
 if __name__ == '__main__':

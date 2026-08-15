@@ -130,6 +130,9 @@
     all 16 individually-read `0x4AA` probes (`temp_data_cross_check` in `management_engine.py`) - a
     mismatch soft/hard-cuts. So there's no open "should we derive max from the 16 probes instead"
     sub-question; that's already effectively what happens, with a safety net if the two disagree.
+    (Update 2026-08-14: the 16-probe side of that comparison is now itself DID `0x1814`-primary,
+    `0x4AA`-backup - see item 18 below - so `temp_data_cross_check` transparently benefits from the
+    better resolution whenever DID is the active source, with no change needed to this reasoning.)
     What remains unconfirmed is narrower: whether the 0-60°C -> 0-100% *window/formula* matches
     what a real Leaf dash actually shows for this field. Tracked as a to-do in
     `docs/14-validation-test-plan.md`.
@@ -193,6 +196,45 @@
     - any future re-test attempt should start from that file (timestamped Log-panel lines plus the
     session's actual settings snapshot) alongside the .trc capture, rather than manually
     cross-referencing the two by hand.
+17. **No active check that a reconnected CAN channel is actually carrying the traffic it's supposed
+    to (found 2026-08-13, real bench test `minileaf_20260813_162758_discharge regen using SOC.trc`).**
+    During that session the RZ450e connection dropped and was manually reconnected via the app
+    (`ConnectionsPanel._toggle()`, `gui/panels.py`) several times in a row; one reconnect landed on
+    `PCAN_USBBUS2` instead of the `PCAN_USBBUS1` every prior connect/reconnect in the session had
+    used, even though the user never physically changed which adapter was plugged into which port.
+    Root cause: `BusConnection._auto_reconnect_loop()` (`bridge/can_backend.py`) always retries the
+    exact channel string it was last given - it never re-scans - so the channel can only change via
+    an explicit `connect(channel, ...)` call (a Connect-button click with a specific channel selected
+    in the dropdown). This IS a known PEAK/Windows driver quirk: a PCAN-USB adapter's assigned
+    `PCAN_USBBUSx` slot isn't guaranteed stable across a USB-level disconnect/reconnect, especially
+    with more than one adapter attached, so a manual reconnect during a rough patch can land on a
+    different bus number than before with nothing wrong. In THIS specific session it's very unlikely
+    the two logical connections (`rz450e`/`leaf`) actually got swapped onto each other's physical
+    adapter - if they had, RZ450e-specific signals would never have decoded from whatever's really on
+    the Leaf bus, and the staleness watchdog (60s soft/65s hard) would have fired again almost
+    immediately, but the very next `running` window ran clean for 43+ minutes with no staleness event
+    - but the app currently has no way to confirm that itself; it just opens whatever channel is
+    selected and starts decoding. **Proposed fix, not yet built (2026-08-13 user directive: note it,
+    don't build it yet)**: after a (re)connect, confirm real traffic matching that role's expected
+    CAN IDs/checksums actually arrives within some short window, and warn distinctly (not just via
+    the general staleness watchdog, which takes up to 65s) if it doesn't - this would catch a genuine
+    mis-wire in seconds instead of relying on the staleness watchdog's much longer schedule.
+
+18. **Temp probe DID `0x1814` primary-source timing values and `temp_probe_cross_check`'s
+    `max_delta_c` are all provisional, user-directed 2026-08-14, not yet real-hardware-confirmed.**
+    `did_temp_poll_interval_s` (10s default) and `did_temp_fresh_window_s` (20s default,
+    `state.engine_timing`, GUI-editable via the "Timing" tab as of 2026-08-14) were chosen
+    from the DID round-robin's real measured cadence (`02-source-signals-rz450e.md`'s ~9s/poll
+    figure for the existing 3-item cycle) plus reasoning about headroom, not from an actual
+    observed DID `0x1814` round-trip time on this pack -
+    real-hardware logging could show the DID responds faster or slower than assumed, which would
+    argue for a different freshness window. Separately, `temp_probe_cross_check`'s 2.0°C
+    `max_delta_c` (`05-battery-management-safety.md`) assumes CAN quantization (~1.0°C) plus a small
+    sampling-time-gap allowance is the only real source of DID-vs-CAN disagreement for the SAME
+    probe - real bench data could reveal a larger systematic offset between the two decode paths
+    that this starting point doesn't yet account for. Needs a real-hardware session with both
+    sources live to confirm or retune all three numbers - see `docs/11-manual-verification-
+    checklist.md` and `docs/15-real-hardware-test-checklist.md`.
 
 ## Inherited from `Refrance/RZ450e_battery_can_decode_Project/`
 

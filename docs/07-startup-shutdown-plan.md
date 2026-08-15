@@ -84,7 +84,13 @@ no "shutting down" flag exists.
 ### Four independent triggers for starting wind-down
 
 Implement all four — each was added upstream after a specific real-world failure mode the others
-didn't cover:
+didn't cover. Every timing value below (0.5s/10s quiet+delay, 10s grace, 3.0s charge-end, 15s stall)
+is GUI-editable as of 2026-08-14 (`state.engine_timing`, "Timing" tab) - was a bare
+`leaf_signals` module constant before that (`ignition_quiet_s`/`ignition_off_delay_s`/
+`ignition_grace_s`/`chg_end_stop_s`/`chg_stall_timeout_s` respectively) - see
+`06-realtime-engine-and-watchdog.md` section 1c. None of these are ported/confirmed real-Leaf
+protocol values (unlike the startup-timeline/shutdown-staging tables above/below, which stay fixed
+in code), they're this bridge's own detection heuristics, hence editable:
 
 1. **Ignition-off detector** — watch `0x108`/`0x1CB`/`0x284`; once all three have been seen at
    least once and are quiet for 0.5s, wait 10s, then wind down (cancel if any reappears). 10s grace
@@ -154,9 +160,11 @@ structural gap: a bench rig with no ignition wiring can only ever wind down via 
 any reason, there was previously no way out short of Stop Bridge.
 
 **Bus silence timeout** — if the Leaf bus goes completely silent (no frame of any ID, not just
-ignition/charge IDs) for `leaf_signals.BUS_SILENCE_TIMEOUT_S` (30.0s, deliberately well above every
+ignition/charge IDs) for `bus_silence_timeout_s` (30.0s default, deliberately well above every
 other trigger's own timeout so it never preempts a legitimate slower condition) while in `startup`
-or `running`, wind down. Implemented in `ShutdownSequencer._should_wind_down()`, reusing the
+or `running`, wind down. GUI-editable as of 2026-08-14 (`state.engine_timing`, "Timing" tab -
+see `06-realtime-engine-and-watchdog.md` section 1c) - was a bare `leaf_signals.BUS_SILENCE_
+TIMEOUT_S` module constant before that. Implemented in `ShutdownSequencer._should_wind_down()`, reusing the
 already-tracked `last_leaf_rx_t` field (no new state). **Documented, not yet confirmed** against a
 re-test — see `docs/11-manual-verification-checklist.md`.
 

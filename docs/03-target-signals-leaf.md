@@ -78,18 +78,27 @@ this is computed fresh every tick (not a sticky latch) — see the open re-arm q
 The per-cell overvoltage taper (`05-battery-management-safety.md`'s `ac_charge_taper` — split from
 `charge_target_taper` 2026-08-01, since `charge_target_taper` now governs only `charge_limit_kw`)
 still gets the final say over the ramped value every tick while a real charge session is active — it
-can reduce it further; it is never bypassed by this feature.
+can reduce it further; it is never bypassed by this feature. `ac_charge_temp_derate` (added
+2026-08-11, same section) gets an independent, additional say too — it multiplies whatever
+`ac_charge_taper` already produced by its own hot/cold temperature factor, so both a voltage AND a
+temperature limit can be in effect at once, whichever is more restrictive dominating the transmitted
+value.
 
 **Charging and driving are two fully separate control paths for these two fields** (user directive,
 2026-08-07 — confirmed against `Refrance/Leaf_BMS_Emulator`'s bit-level-diff real-hardware notes:
 `LB_MAX_POWER_FOR_CHARGER` sits fixed at the 1023/92.3kW idle placeholder whenever not actually
 charging, never becoming a live per-cell-voltage-managed value outside a real charge session).
-`ac_charge_taper` — the taper reduction above AND its own `ac_emergency_v` hard cut — only runs
-while RZ450e's `charge_permission_input` interlock is actually granted; while just driving,
-`charger_limit_kw` is left completely untouched (whatever the Signal Mapping tab or the idle
-92.3kW placeholder already produced). Driving-mode overvoltage protection is entirely
+`ac_charge_taper` and `ac_charge_temp_derate` — the two taper reductions above, `ac_charge_taper`'s
+own `ac_emergency_v` hard cut, and `ac_charge_temp_derate`'s own hard-stop-temp session-ending
+latch — only run while RZ450e's `charge_permission_input` interlock is actually granted; while just
+driving, `charger_limit_kw` is left completely untouched (whatever the Signal Mapping tab or the
+idle 92.3kW placeholder already produced). Driving-mode overvoltage protection is entirely
 `charge_target_taper`'s job instead (the regen taper, unconditional by design — it drives the
-shared `charge_limit_kw` field for both regen-while-driving and charge-while-plugged-in).
+shared `charge_limit_kw` field for both regen-while-driving and charge-while-plugged-in);
+driving-mode over-temperature protection (both `charge_limit_kw`/regen AND `discharge_limit_kw`) is
+`over_temperature_derate`'s job (`05-battery-management-safety.md`) — its graduated ramp no longer
+touches `charger_limit_kw` at all as of the 2026-08-11 split, only its true pack-wide emergency tier
+still does, as a final backstop regardless of source.
 
 ## Two cutoff tiers (drives the battery-management design in `05-battery-management-safety.md`)
 

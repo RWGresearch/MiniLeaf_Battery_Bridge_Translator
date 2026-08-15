@@ -40,9 +40,23 @@ FAULT_DEFINITIONS = [
     ('overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut - regen (per-cell)', 'hard'),
     ('ac_overvoltage_emergency', 'Cell overvoltage EMERGENCY hard cut - AC charger (per-cell)', 'hard'),
     ('over_temp_emergency', 'Over-temperature EMERGENCY hard cut (hottest probe)', 'hard'),
-    ('charge_cold_block', 'Charge/regen blocked - coldest probe at/below freezing', 'warn'),
+    ('charge_cold_block', 'Regen blocked - coldest probe at/below freezing', 'warn'),
     ('discharge_temp_zero', 'Discharge power at zero - over-temperature', 'warn'),
-    ('charge_temp_zero', 'Charge/regen power at zero - over-temperature', 'warn'),
+    ('charge_temp_zero', 'Regen power at zero - over-temperature', 'warn'),
+    # Added 2026-08-11: was already tracked via fault_log.update() calls in
+    # management_engine.py's ac_charge_taper block since 2026-08-06, but
+    # never registered here - a pre-existing gap found while adding the two
+    # entries below (this meant it only ever appeared in the Fault History
+    # window/tier grouping AFTER first actually firing, unlike every other
+    # catalog entry, which always shows a "never triggered" placeholder row).
+    ('ac_cutoff_stop', 'AC charger stop-charging cutoff reached (per-cell)', 'warn'),
+    # Added 2026-08-11 (user report: no heat regulation existed for
+    # charging at all) - bridge/management_engine.py's new
+    # ac_charge_temp_derate block, independently-tunable from the
+    # driving-mode charge_cold_block/charge_temp_zero pair above.
+    ('ac_charge_cold_block', 'AC charger blocked - coldest probe at/below freezing', 'warn'),
+    ('ac_charge_temp_stop', 'AC charger stopped - hottest probe over the charging-specific hard-stop temp',
+     'warn'),
     ('cell_imbalance_warn', 'Cell imbalance warning (spread)', 'warn'),
     ('overcurrent_discharge_warn', 'Overcurrent warning - discharge', 'warn'),
     ('overcurrent_charge_warn', 'Overcurrent warning - charge/regen', 'warn'),
@@ -54,6 +68,11 @@ FAULT_DEFINITIONS = [
     ('cell_data_mismatch_hard', 'Cell data cross-check mismatch - hard cut escalation', 'hard'),
     ('temp_data_mismatch', 'Temperature data cross-check mismatch (0x4A7 extremes vs 0x4AA per-probe)', 'soft'),
     ('temp_data_mismatch_hard', 'Temperature data cross-check mismatch - hard cut escalation', 'hard'),
+    # Added 2026-08-14: DID 0x1814 (primary, per-probe) vs 0x4AA CAN
+    # broadcast (backup, per-probe) - see temp_probe_cross_check in
+    # bridge/management_engine.py.
+    ('temp_probe_mismatch', 'Temp probe cross-check mismatch (DID 0x1814 vs 0x4AA per-probe)', 'soft'),
+    ('temp_probe_mismatch_hard', 'Temp probe cross-check mismatch - hard cut escalation', 'hard'),
     ('config_sanity', 'Battery-management config has an inverted/nonsensical threshold ordering', 'warn'),
     ('hard_cut_latch', 'Hard cut LATCHED (relay_cut_request/interlock still asserted)', 'hard'),
 ]

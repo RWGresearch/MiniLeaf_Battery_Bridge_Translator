@@ -59,8 +59,9 @@ meaningful question.
 - Notes: _____________________________________________________
 
 ### A2. `discharge_limit_kw` ("Discharge power limit") — NO min/max config exists
-- Driven by: `discharge_power_taper` (per-cell voltage ramp, `taper_start_v`/`taper_zero_v`/
-  `recovery_ramp_s`) — multiplies whatever value was already there by a 0.0-1.0 factor.
+- Driven by: `discharge_power_taper` (per-cell voltage ramp, `taper_start_v`/`taper_min_v`/
+  `recovery_ramp_s` — `taper_min_v` renamed from `taper_zero_v` 2026-08-13, see `docs/05`) —
+  multiplies whatever value was already there by a 0.0-1.0 factor.
 - "Whatever value was already there" = the Signal Mapping tie's output if one exists, otherwise
   the static `SLIDERS` default (**110.0 kW**) — there is currently **no dedicated ceiling** the
   taper caps its own input against (unlike `ac_max_kw` capping the AC charger's request to a real
@@ -92,7 +93,8 @@ meaningful question.
 
 ### A3. `charge_limit_kw` ("Charge/regen power limit") — NO min/max config exists
 - Driven by: `charge_target_taper` (REGEN ONLY, per-cell voltage ramp, `regen_full_v`/
-  `regen_zero_v`/`recovery_ramp_s`) — same 0.0-1.0 multiplicative pattern as discharge above, no
+  `regen_min_v`/`recovery_ramp_s` — `regen_min_v` renamed from `regen_zero_v` 2026-08-13, see
+  `docs/05`) — same 0.0-1.0 multiplicative pattern as discharge above, no
   separate ceiling/floor config. **Also** forced to `0.0` by `ac_charge_taper`'s stop-charging
   cutoff/target-reached logic while actually charging (that part's fine — it's an explicit stop,
   not a ceiling question).
