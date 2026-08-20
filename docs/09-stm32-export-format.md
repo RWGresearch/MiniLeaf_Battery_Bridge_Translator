@@ -306,6 +306,26 @@ to the same `input_validation.enabled` flag), and both `profile.json` management
 firmware reading a saved profile directly should apply the same bounds rather than trusting the
 file blindly.
 
+## Phase 2 status (started 2026-08-18)
+
+The offline codegen script this doc describes above ("Python, run offline — not on the STM32
+itself") now actually exists: `tools/export_stm32_config.py`. It loads `config/profile.json`
+through the exact same validated path the GUI uses (`bridge/config_profile.py`'s
+`apply_profile()` — same bounds-clamping, same key-rename/unit migrations), then emits
+`STM32_MiniLeaf_Bridge_Translator_uVision/Software/CANBRIDGE-2port/source/Inc/bridge_config_gen.h`
+— compile-time `#define`s and a `bridge_mapping_tie_t[]` array, never hand-edited, never read by
+the firmware at runtime (one-time compile+flash, no on-device JSON parsing). `--check` runs the
+same load/validate/diff path without writing the file — this doubles as the "configurator that
+pulls from the .json" — and prints every place a loaded value differed from what got clamped/
+defaulted into the header, so nothing is silently different between `profile.json` and what ships.
+Firmware modules that actually consume this generated header are later phases — see the STM32 port
+plan for the full phase breakdown (project memory `project_stm32_port_2026-08-18`).
+
+One schema gap found while building this: **`sleep_idle_timeout_s`** (a bridge-only idle-sleep
+timeout, no Python-app equivalent since the PC app never sleeps) still needs to be added to
+`config/profile.json`'s `engine_timing` section — deferred to port Phase 2 alongside the firmware
+skeleton, not added yet.
+
 ## What this is NOT
 
 - Not a runtime file read by the Python app moment-to-moment (that's the internal state model,
@@ -317,3 +337,15 @@ file blindly.
 - **Not the log panel or Dashboard window** (`08-gui-design.md`) — both are Python-GUI-only
   conveniences for a human operator watching a live PC session. Neither has any bearing on
   firmware behavior and neither is persisted in this schema.
+- **Not `cell_imbalance_monitor`/`overcurrent_monitor`** (removed from the STM32 firmware
+  2026-08-20, flash-size reduction). Both are monitor-only in the Python app too (never cut or
+  derate anything, `05-battery-management-safety.md`) — their only real consumer there is the
+  GUI status panel / `fault_log.py`'s persistent history, neither of which exists on this MCU.
+  `cell_imbalance_monitor`/`overcurrent_monitor` still exist in `config/profile.json` and
+  `bridge/management_engine.py` (and still get emitted as unused `BRIDGE_CFG_MF_CELL_IMBALANCE_
+  MONITOR_*`/`BRIDGE_CFG_MF_OVERCURRENT_MONITOR_*` `#define`s by `tools/export_stm32_config.py`,
+  since codegen emits every feature's fields generically) — only the C-side computation and its
+  `ManagementState` tracking fields (`cell_imbalance_warn`, `overcurrent_pending`,
+  `overcurrent_since_tick`, `overcurrent_direction`, `overcurrent_discharge_warn`,
+  `overcurrent_charge_warn`) were deleted from `management_engine.c`/`.h`. If a GPIO/UART fault
+  indicator is ever added to this hardware, this is the first place to re-derive.

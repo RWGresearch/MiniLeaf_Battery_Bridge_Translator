@@ -1,4 +1,4 @@
-# REVISION: 74
+# REVISION: 75
 """MiniLeaf Battery Bridge Translator - entry point.
 
 Bridges a Lexus RZ450e HV battery to a Nissan Leaf's CAN bus: a configurable
@@ -13,8 +13,8 @@ GUI is plain tkinter/ttk (stdlib, no extra GUI dependency) - see gui/theme.py.
 """
 from gui.app import App
 
-REVISION = 74
-REV_DATE = '2026-08-14'
+REVISION = 75
+REV_DATE = '2026-08-20'
 
 # Rev 1: initial milestone-1 app - adapters, signal registries, mapping
 # engine, battery-management engine with researched defaults, real-time
@@ -2876,6 +2876,54 @@ REV_DATE = '2026-08-14'
 #     by relaunching the real app and screenshotting the new section - all
 #     TX-period rows render with correct labels/values.
 #   - docs/08: new subsection describing the third group and its rationale.
+#
+# Rev 75: STM32 firmware audit + one size-reduction removal (no Python app
+#   changes this round - REVISION bumped anyway per this project's "bump on
+#   every change" convention, since the STM32 port is tracked in this same
+#   changelog per Rev 74's precedent). User asked for a line-by-line audit of
+#   the ported C firmware against this app's bridge/ modules, looking for
+#   missing/incorrect ports and dead code removable under the 32KB flash cap.
+#   Four parallel subsystem audits (sequencing, management engine, RZ450e
+#   ingest/UDS, leaf output/mapping) found the port faithful overall: no
+#   incorrect logic anywhere, one real-but-currently-unexercised codegen gap
+#   (temp_NN_did/temp_NN_can can't be used as mapping-tie inputs -
+#   tools/export_stm32_config.py's _rz_field_expr() only resolves plain
+#   temp_NN, not flagged for a fix yet), and one confirmed dead config path
+#   (BRIDGE_CFG_MF_INPUT_VALIDATION_ENABLED/CHECKSUM_VALIDATION_ENABLED are
+#   generated but never read by the firmware - checksum/plausibility
+#   validation is unconditionally on in C regardless of what profile.json
+#   says, unlike the Python app's live-toggleable checkboxes - left as-is,
+#   arguably safer, just flagged as a known config/firmware mismatch).
+#
+#   User then asked to remove cell_imbalance_monitor/overcurrent_monitor from
+#   the STM32 build to save flash space - both are monitor-only in Python too
+#   (never cut/derate anything, docs/05) and their only real consumer there
+#   (GUI status panel, fault_log.py's persistent history) has no equivalent
+#   on this MCU, so the C port's computation had zero consumers.
+#   - STM32_.../Src/management_engine.c: deleted both features' ~50-line
+#     block (was lines 512-563).
+#   - STM32_.../Inc/management_engine.h: removed the 6 ManagementState
+#     fields those features used (cell_imbalance_warn, overcurrent_pending/
+#     _since_tick/_direction, overcurrent_discharge_warn/_charge_warn).
+#   - docs/09-stm32-export-format.md: new "What this is NOT" bullet
+#     documenting the removal and where to re-derive it if a GPIO/UART fault
+#     indicator is ever added to this hardware.
+#   - config/profile.json and bridge/management_engine.py are UNCHANGED -
+#     both features remain fully real, tested, and enabled in the Python
+#     app; only the STM32 C computation was removed. tools/
+#     export_stm32_config.py still generates their BRIDGE_CFG_MF_* #defines
+#     (emitted generically for every feature) - now simply unused by the
+#     firmware, costing 0 bytes since an unreferenced #define isn't a symbol.
+#   Verified: `clang -fsyntax-only -Wall -Wextra -Wconversion -pedantic
+#   -DSTM32F105xC` on all 6 firmware .c files individually - 0 errors, same
+#   expected "unused function bridge_config_apply_mapping_ties" warning in 5
+#   of 6 files as before (mapping_engine.c is the one that calls it) - no
+#   new warnings introduced. **Confirmed on real Keil rebuild (user-
+#   reported): ~158 bytes saved.** Small relative to the earlier mapping-
+#   engine codegen rewrite (that was the real fix for the 32KB overage, see
+#   Rev-independent STM32 port memory) - this was a pure "no known consumer,
+#   remove it" cleanup, not a size-crisis fix, so a modest number was
+#   expected.
 
 if __name__ == '__main__':
     app = App()

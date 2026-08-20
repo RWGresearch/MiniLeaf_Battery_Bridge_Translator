@@ -11,7 +11,7 @@ import os
 import queue
 import time
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from bridge import config_profile
 from bridge.can_backend import BITRATE, BusConnection
@@ -23,7 +23,9 @@ from bridge.trc_log import TrcLogger
 from gui.dashboard import DashboardWindow
 from gui.fault_history_window import FaultHistoryWindow
 from gui.info_popup import help_btn
+from gui.stm32_bench_window import Stm32BenchReplayWindow
 from gui.theme import apply_style, ACC, BASE_FONT, BG, ERR, FG_DIM, FIELD, FG, OK
+from tools import export_stm32_config as stm32_codegen
 from gui.panels import (ConnectionsPanel, LiveMonitorPanel, MappingPanel, ManagementPanel,
                          GeneratedSignalsPanel, ChargeEmulationPanel, EngineTimingPanel,
                          FuturePlaceholderPanel, VehiclePanel,
@@ -69,6 +71,7 @@ class App(tk.Tk):
         self.log_lines = collections.deque(maxlen=2000)
         self.dashboard = None
         self.fault_window = None
+        self.stm32_bench_window = None
         self.trc_logger = TrcLogger()
         # Companion "<name>_log_output.txt" file (added 2026-08-08, user
         # request) - opened/closed alongside the .trc capture, never written
@@ -274,7 +277,7 @@ class App(tk.Tk):
         # of the app (was minsize=400, width=800).
         self.paned.add(self.middle_frame, minsize=340, width=680, stretch='always')
         self.middle_frame.grid_columnconfigure(0, weight=1)
-        self.middle_frame.grid_rowconfigure(2, weight=1)
+        self.middle_frame.grid_rowconfigure(3, weight=1)
 
         top = ttk.Frame(self.middle_frame)
         top.grid(row=0, column=0, sticky='ew', padx=8, pady=(8, 0))
@@ -296,8 +299,23 @@ class App(tk.Tk):
         self.bridge_status_lbl.pack(side='left', padx=(12, 0))
         self._refresh_bridge_status()
 
+        # STM32 firmware-port tooling (added 2026-08-18) - the same two
+        # command-line tools (tools/export_stm32_config.py, tools/
+        # stm32_bench_replay.py) as one-click buttons instead of requiring a
+        # terminal. Grouped in their own row rather than crowded into the
+        # top toolbar above, since these are a separate workflow (STM32
+        # firmware config/bench testing) from this app's own live-bridge
+        # controls.
+        stm32_row = ttk.Frame(self.middle_frame)
+        stm32_row.grid(row=2, column=0, sticky='ew', padx=8, pady=(0, 8))
+        ttk.Label(stm32_row, text='STM32:', foreground=FG_DIM).pack(side='left')
+        ttk.Button(stm32_row, text='Export STM32 Config', style='Small.TButton',
+                   command=self._export_stm32_config).pack(side='left', padx=(6, 2))
+        ttk.Button(stm32_row, text='Bench Replay...', style='Small.TButton',
+                   command=self._open_stm32_bench_replay).pack(side='left', padx=2)
+
         self.tabs_holder = ttk.Frame(self.middle_frame)
-        self.tabs_holder.grid(row=2, column=0, sticky='nsew', padx=4, pady=(0, 4))
+        self.tabs_holder.grid(row=3, column=0, sticky='nsew', padx=4, pady=(0, 4))
         self.tabs_holder.grid_columnconfigure(0, weight=1)
         self.tabs_holder.grid_rowconfigure(0, weight=1)
         self._populate_middle_tabs()
@@ -355,6 +373,44 @@ class App(tk.Tk):
             self.fault_window.focus()
             return
         self.fault_window = FaultHistoryWindow(self, self.management)
+
+    # ── STM32 firmware-port tooling ─────────────────────────────────────
+    def _export_stm32_config(self):
+        """GUI wrapper around tools/export_stm32_config.py's own main() -
+        saves the current live settings to config/profile.json first (same
+        file the script reads by default), so "what's in the GUI right now"
+        and "what gets exported" can never silently diverge, then runs the
+        exact same load/validate/generate path the command-line tool uses."""
+        config_profile.save_profile(self.state_model, self.mapping, self.management)
+        self.log('Profile saved (config/profile.json) before STM32 export.')
+
+        warnings = stm32_codegen.Warnings()
+        try:
+            state, mapping, mgmt, profile_name = stm32_codegen.load_and_validate(
+                stm32_codegen.DEFAULT_PROFILE_PATH, warnings)
+            ties, lookup_tables = stm32_codegen._build_mapping_model(mapping)
+            header = stm32_codegen.generate_header(state, mapping, mgmt, profile_name, ties, lookup_tables)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            self.log(f'STM32 export FAILED: {exc}')
+            messagebox.showerror('Export STM32 Config', f'Failed to generate the STM32 header:\n{exc}',
+                                  parent=self)
+            return
+
+        for msg in warnings.items:
+            self.log(f'STM32 export warning: {msg}')
+
+        out_path = stm32_codegen.DEFAULT_OUTPUT_PATH
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(header)
+        suffix = f' ({len(warnings.items)} warning(s) - see Log)' if warnings.items else ''
+        self.log(f'STM32 config exported: {out_path}{suffix}')
+
+    def _open_stm32_bench_replay(self):
+        if self.stm32_bench_window is not None and self.stm32_bench_window.winfo_exists():
+            self.stm32_bench_window.focus()
+            return
+        self.stm32_bench_window = Stm32BenchReplayWindow(self, self.log)
 
     def _simulate_power_down(self):
         self.engine.request_shutdown()

@@ -95,6 +95,14 @@ def read_trc_rows(path):
             yield {
                 'timestamp': f'{ts:.6f}',
                 'bus': _TRC_NUM_TO_BUS.get(int(bus_num), 'U'),
+                # Raw numeric channel, alongside the label above - added
+                # 2026-08-18 so a consumer that doesn't trust the label (a
+                # past session that connected the RZ450e/Leaf adapters to
+                # the GUI's two connection roles "the wrong way around"
+                # writes a file that's internally consistent but mislabeled)
+                # can re-derive which channel is which empirically instead.
+                # See tools/stm32_bench_replay.py's _detect_rz450e_bus_num().
+                'bus_num': int(bus_num),
                 'dir': 'TX' if typ == 'Tx' else 'RX',
                 'can_id_hex': id_hex,
                 'dlc': dlc,

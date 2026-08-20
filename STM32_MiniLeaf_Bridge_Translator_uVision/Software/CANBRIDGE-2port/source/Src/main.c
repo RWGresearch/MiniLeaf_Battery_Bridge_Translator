@@ -22,16 +22,15 @@
 
 #include "stdio.h"
 #include <string.h>
-#include "can-bridge-firmware.h"
-#include "enhanced_rolling_counter_Steering_Sensor.h"
+#include "bridge_sequencer.h" /* MiniLeaf bridge logic (replaces the old Mini-Cooper can-bridge-firmware.h) */
 
 static MYCAN_Errors mErrors[2] = {0};
-// last_tick removed -- sleep/wake now handled by bridge_should_sleep()
+// last_tick removed -- sleep/wake now handled by bridge_sequencer_should_sleep()
 uint32_t au32_UID[3] = {0}; 
 static const uint8_t au8_lock[12] = {0x33,0x44,0x55,0x66,0x11,0x22,0x33,0x44,0x77,0x66,0x55,0x44};
 static uint8_t config_Bits[2] = {0};
 static uint32_t canErrors = 0;
-// idleTick removed -- replaced by configurable keepalive in bridge_should_sleep()
+// idleTick removed -- replaced by configurable keepalive in bridge_sequencer_should_sleep()
 
 void SystemClock_Config(void);
 
@@ -74,8 +73,9 @@ int main(void)
     AddCANFilters( &hcan1 );
     AddCANFilters( &hcan2 );
 
-    // Initialize steering processor for 0x0C4 to 0x10A conversion
-    init_steering_processor();
+    // Initialize the MiniLeaf bridge sequencer (STM32 port Phase 2 skeleton -
+    // see STM32_MiniLeaf_Bridge_Translator_uVision/.../Inc/bridge_sequencer.h)
+    bridge_sequencer_init();
 
     while (1)
     {
@@ -85,22 +85,22 @@ int main(void)
         while (LenCan(MYCAN1, CAN_RX) > 0)
         {
             PopCan(MYCAN1, CAN_RX, &frame);
-            can_handler(MYCAN1, &frame);
+            bridge_sequencer_on_frame(MYCAN1, &frame);
         }
         while (LenCan(MYCAN2, CAN_RX) > 0)
         {
             PopCan(MYCAN2, CAN_RX, &frame);
-            can_handler(MYCAN2, &frame);
+            bridge_sequencer_on_frame(MYCAN2, &frame);
         }
 
         // === Phase 2: Generate periodic output (independent timing) ===
-        bridge_periodic_output();
+        bridge_sequencer_tick();
 
         // === Phase 3: Transmit pending TX frames ===
         sendCan(MYCAN1);
         sendCan(MYCAN2);
 
-        // === Phase 4: Error monitoring ===
+        // === Phase 4: Error monitoring + bus-off recovery ===
         canErrors = hcan1.Instance->ESR;
         mErrors[0].rec = canErrors >> 24;
         mErrors[0].trans = ( canErrors >> 16 ) &0xff;
@@ -108,6 +108,18 @@ int main(void)
         mErrors[0].boff = ( canErrors & 0x04 ) >> 2;
         mErrors[0].passive = ( canErrors & 0x02 ) >> 1;
         mErrors[0].errorFlag = canErrors & 1;
+        // mErrors was already being filled in every loop but never acted on -
+        // ABOM (AutoBusOff=ENABLE in can.c) lets the peripheral itself clear
+        // bus-off once the bus goes idle, but if that never happens (or takes
+        // too long), nothing here ever forced it. Stop+Start is the documented
+        // bxCAN software bus-off recovery: entering/leaving INIT mode clears
+        // the error counters and bus-off state. Filters survive this (they
+        // live in a separate FINIT-gated register block, untouched by INRQ).
+        if( mErrors[0].boff )
+        {
+            HAL_CAN_Stop( &hcan1 );
+            HAL_CAN_Start( &hcan1 );
+        }
 
         canErrors = hcan2.Instance->ESR;
         mErrors[1].rec = canErrors >> 24;
@@ -116,9 +128,14 @@ int main(void)
         mErrors[1].boff = ( canErrors & 0x04 ) >> 2;
         mErrors[1].passive = ( canErrors & 0x02 ) >> 1;
         mErrors[1].errorFlag = canErrors & 1;
+        if( mErrors[1].boff )
+        {
+            HAL_CAN_Stop( &hcan2 );
+            HAL_CAN_Start( &hcan2 );
+        }
 
         // === Phase 5: Sleep check ===
-        if (bridge_should_sleep())
+        if (bridge_sequencer_should_sleep())
         {
             HAL_SuspendTick();
             HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);

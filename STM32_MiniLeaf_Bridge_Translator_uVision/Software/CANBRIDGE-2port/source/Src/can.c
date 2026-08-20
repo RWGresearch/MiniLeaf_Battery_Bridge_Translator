@@ -82,7 +82,7 @@ void MX_CAN2_Init(void)
 
   /* USER CODE END CAN2_Init 1 */
   hcan2.Instance = CAN2;
-  hcan2.Init.Prescaler = 4; // set to 4 for 500k buad OR 20 for 100k buad this is typicaly (20) 100K for mini-leaf bridge.
+  hcan2.Init.Prescaler = 4; // set to 4 for 500k buad OR 20 for 100k buad - both CAN1 and CAN2 run 500k on the MiniLeaf bridge (comment previously said 20/100k here, which no longer matched the code - see STM32 port Phase 2)
   hcan2.Init.Mode = CAN_MODE_NORMAL;
   hcan2.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan2.Init.TimeSeg1 = CAN_BS1_15TQ;

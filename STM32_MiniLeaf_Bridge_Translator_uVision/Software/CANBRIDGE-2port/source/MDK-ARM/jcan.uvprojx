@@ -55,7 +55,7 @@
           <CreateHexFile>1</CreateHexFile>
           <DebugInformation>1</DebugInformation>
           <BrowseInformation>1</BrowseInformation>
-          <ListingPath></ListingPath>
+          <ListingPath>..\..\..\..\..\..\..\</ListingPath>
           <HexFormatSelection>1</HexFormatSelection>
           <Merge32K>0</Merge32K>
           <CreateBatchFile>0</CreateBatchFile>
@@ -374,7 +374,7 @@
             <ScatterFile></ScatterFile>
             <IncludeLibs></IncludeLibs>
             <IncludeLibsPath></IncludeLibsPath>
-            <Misc></Misc>
+            <Misc>--info=stack</Misc>
             <LinkerInputFile></LinkerInputFile>
             <DisabledWarnings></DisabledWarnings>
           </LDads>
@@ -394,11 +394,6 @@
         <Group>
           <GroupName>Application/User</GroupName>
           <Files>
-            <File>
-              <FileName>can-bridge-firmware.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Src\can-bridge-firmware.c</FilePath>
-            </File>
             <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
@@ -430,9 +425,34 @@
               <FilePath>../Src/stm32f1xx_hal_msp.c</FilePath>
             </File>
             <File>
-              <FileName>enhanced_rolling_counter_Steering_Sensor.c</FileName>
+              <FileName>bridge_sequencer.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\Src\enhanced_rolling_counter_Steering_Sensor.c</FilePath>
+              <FilePath>..\Src\bridge_sequencer.c</FilePath>
+            </File>
+            <File>
+              <FileName>mapping_engine.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\mapping_engine.c</FilePath>
+            </File>
+            <File>
+              <FileName>management_engine.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\management_engine.c</FilePath>
+            </File>
+            <File>
+              <FileName>leaf_output.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\leaf_output.c</FilePath>
+            </File>
+            <File>
+              <FileName>rz450e_ingest.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\rz450e_ingest.c</FilePath>
+            </File>
+            <File>
+              <FileName>rz450e_uds.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\rz450e_uds.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -989,11 +1009,6 @@
           <GroupName>Application/User</GroupName>
           <Files>
             <File>
-              <FileName>can-bridge-firmware.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Src\can-bridge-firmware.c</FilePath>
-            </File>
-            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Src/main.c</FilePath>
@@ -1024,9 +1039,34 @@
               <FilePath>../Src/stm32f1xx_hal_msp.c</FilePath>
             </File>
             <File>
-              <FileName>enhanced_rolling_counter_Steering_Sensor.c</FileName>
+              <FileName>bridge_sequencer.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\Src\enhanced_rolling_counter_Steering_Sensor.c</FilePath>
+              <FilePath>..\Src\bridge_sequencer.c</FilePath>
+            </File>
+            <File>
+              <FileName>mapping_engine.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\mapping_engine.c</FilePath>
+            </File>
+            <File>
+              <FileName>management_engine.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\management_engine.c</FilePath>
+            </File>
+            <File>
+              <FileName>leaf_output.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\leaf_output.c</FilePath>
+            </File>
+            <File>
+              <FileName>rz450e_ingest.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\rz450e_ingest.c</FilePath>
+            </File>
+            <File>
+              <FileName>rz450e_uds.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\rz450e_uds.c</FilePath>
             </File>
           </Files>
         </Group>
