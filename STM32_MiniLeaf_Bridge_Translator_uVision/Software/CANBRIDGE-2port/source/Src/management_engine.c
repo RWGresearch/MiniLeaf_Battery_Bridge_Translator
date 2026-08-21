@@ -133,6 +133,24 @@ void management_engine_notify_session_start(void)
     g_mgmt_state.first_apply_tick = HAL_GetTick();
 }
 
+void management_engine_reset_all_conditions(void)
+{
+    // Unlike notify_session_start() above (latches only, deliberately
+    // conservative), this also clears every escalation/pending timer that
+    // FEEDS the latches - so a still-active condition must re-accumulate
+    // through its full timeout before it can re-latch, instead of
+    // re-tripping on the very next tick. OPTION A (2026-08-21): called from
+    // the Inp2 fault-reset button (bridge_sequencer.c) only - NOT the normal
+    // bus-rewake path above, which stays as-is.
+    management_engine_notify_session_start();
+    g_mgmt_state.low_v_condition_pending = 0;
+    g_mgmt_state.cell_cross_check_pending = 0;
+    g_mgmt_state.temp_cross_check_pending = 0;
+    g_mgmt_state.temp_probe_cross_check_pending = 0;
+    g_mgmt_state.stale_pending = 0;
+    g_mgmt_state.staleness_hard_cut = 0;
+}
+
 void management_engine_notify_charge_replug(void)
 {
     // A genuine unplug/replug - corrected 2026-08-19, this comment

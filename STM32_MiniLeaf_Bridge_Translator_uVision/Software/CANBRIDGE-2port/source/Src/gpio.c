@@ -50,16 +50,28 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin : PtPin */
+  /* Inp4 (PA15): awake indicator output - ON while running, OFF during
+     sleep (toggled in main.c's Phase 5 sleep block). */
+  HAL_GPIO_WritePin(Inp4_GPIO_Port, Inp4_Pin, GPIO_PIN_SET);
   GPIO_InitStruct.Pin = Inp4_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(Inp4_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PCPin PCPin PCPin */
-  GPIO_InitStruct.Pin = Inp3_Pin|Inp2_Pin|Inp1_Pin;
+  /*Configure GPIO pins : PCPin PCPin */
+  GPIO_InitStruct.Pin = Inp2_Pin|Inp1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* Inp3 (PC10): fault-active indicator output, driven from
+     g_mgmt_state's 3 latches in bridge_sequencer.c. */
+  HAL_GPIO_WritePin(Inp3_GPIO_Port, Inp3_Pin, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin = Inp3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
 }

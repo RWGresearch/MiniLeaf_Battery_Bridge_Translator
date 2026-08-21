@@ -118,6 +118,13 @@ void management_engine_apply(LeafState *out);
  * startup, i.e. a real bus wake) - clears the hard-cut and AC-stop latches. */
 void management_engine_notify_session_start(void);
 
+/* OPTION A (2026-08-21): fuller manual reset than notify_session_start() -
+ * clears the 3 latches AND every escalation/pending timer that feeds them,
+ * so a still-active condition must re-accumulate through its full timeout
+ * before it can re-latch. Called from the Inp2 fault-reset button
+ * (bridge_sequencer.c) only. See docs/17-stm32-gpio-reference.md. */
+void management_engine_reset_all_conditions(void);
+
 /* Call when charge_permission_input has been continuously absent for at
  * least BRIDGE_CFG_ET_CHG_END_STOP_S before a new charge request arrives (a
  * genuine unplug/replug, not a brief interlock glitch) - clears the same

@@ -458,6 +458,38 @@ void bridge_sequencer_tick(void)
 {
     uint32_t now = HAL_GetTick();
 
+    // Inp2 low = manual fault-latch reset (edge-triggered, so holding it
+    // down doesn't repeatedly re-arm the staleness watchdog reference).
+    static uint8_t fault_reset_prev_high = 1u;
+    uint8_t fault_reset_now_high = (HAL_GPIO_ReadPin(Inp2_GPIO_Port, Inp2_Pin) == GPIO_PIN_SET) ? 1u : 0u;
+    if (fault_reset_prev_high && !fault_reset_now_high) { management_engine_reset_all_conditions(); }
+    fault_reset_prev_high = fault_reset_now_high;
+
+    // Inp3/Inp4 indicator lights - independent blink phases, deliberately
+    // different rates so the two are visually distinguishable at a glance.
+    static uint32_t fault_blink_next = 0;
+    static uint8_t fault_blink_on = 0;
+    if ((int32_t)(now - fault_blink_next) >= 0) { fault_blink_on ^= 1u; fault_blink_next = now + 500u; }
+    static uint32_t data_blink_next = 0;
+    static uint8_t data_blink_on = 0;
+    if ((int32_t)(now - data_blink_next) >= 0) { data_blink_on ^= 1u; data_blink_next = now + 100u; }
+
+    // Inp3 = fault-active light: blinks at 0.5s while any of the 3 latches
+    // are set, off otherwise. Runs every tick (not just while RUNNING) so
+    // the blink keeps going even if a fault is still latched during an idle
+    // period.
+    uint8_t fault_active = (g_mgmt_state.hard_latched || g_mgmt_state.ac_charge_stop_latched
+                             || g_mgmt_state.ac_charge_temp_stop_latched) ? 1u : 0u;
+    HAL_GPIO_WritePin(Inp3_GPIO_Port, Inp3_Pin, (fault_active && fault_blink_on) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+    // Inp4 = awake light: blinks at 0.1s (faster than Inp3's 0.5s, so it
+    // reads distinctly) while CAN data is actively arriving on either bus
+    // (last_activity_tick, same "any CAN activity" signal the sleep timer
+    // uses), steady on while awake but idle. Fully off only while genuinely
+    // asleep (main.c's WFI block, not reachable from here).
+    uint8_t has_data = ((now - last_activity_tick) < 1000u) ? 1u : 0u;   // 1s = generous vs. real HVBAT/battery TX periods
+    HAL_GPIO_WritePin(Inp4_GPIO_Port, Inp4_Pin, (has_data ? data_blink_on : 1u) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
     // Free-running 10ms PRUN/latch/tick10 (bridge/realtime_engine.py's
     // _prun_tick_loop, its own dedicated thread) - always ticking,
     // independent of sequencer phase, same "just a free-running counter"

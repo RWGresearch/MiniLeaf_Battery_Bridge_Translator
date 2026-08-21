@@ -24,6 +24,30 @@
 #include <string.h>
 #include "bridge_sequencer.h" /* MiniLeaf bridge logic (replaces the old Mini-Cooper can-bridge-firmware.h) */
 
+/* FIRMWARE_REVISION changelog (this port's equivalent of main.py's REVISION):
+ * Rev 1 (2026-08-21): Inp4 awake-indicator output (on while running, off
+ *   during WFI sleep, see Phase 5 below); Inp3 fault-active-indicator output
+ *   (mirrors g_mgmt_state's 3 latches, driven in bridge_sequencer.c); Inp2
+ *   active-low manual fault-latch-reset input (edge-triggered, calls
+ *   management_engine_notify_session_start(), also in bridge_sequencer.c).
+ *   See docs/17-stm32-gpio-reference.md for the pin table and rationale.
+ * Rev 2 (2026-08-21): Inp2's reset call swapped to the new
+ *   management_engine_reset_all_conditions() (management_engine.c) - "Option
+ *   A" soft reset, also clears the escalation/pending timers feeding the 3
+ *   latches, not just the latches themselves (measured +48B Code/+0B RAM vs.
+ *   Rev 1's plain notify_session_start()). Inp3 now blinks at 0.5s while a
+ *   fault is active (was steady-on); Inp4 now blinks at 0.5s while CAN data
+ *   is actively arriving on either bus, steady-on while awake-but-idle, off
+ *   only when genuinely asleep (measured +60B Code/+8B RAM over Rev 1).
+ *   Both driven from one shared blink-phase timer in bridge_sequencer_tick().
+ * Rev 3 (2026-08-21): Inp4's blink rate split off from Inp3's - Inp4 (CAN
+ *   data) now blinks at 0.1s instead of sharing Inp3's 0.5s, so the two read
+ *   as visually distinct rates instead of looking identical at a glance.
+ *   Inp3 (fault) stays at 0.5s. Two independent blink-phase timers now
+ *   (measured +32B Code/+8B RAM over Rev 2's single shared timer).
+ */
+#define FIRMWARE_REVISION 3
+
 static MYCAN_Errors mErrors[2] = {0};
 // last_tick removed -- sleep/wake now handled by bridge_sequencer_should_sleep()
 uint32_t au32_UID[3] = {0}; 
@@ -137,9 +161,11 @@ int main(void)
         // === Phase 5: Sleep check ===
         if (bridge_sequencer_should_sleep())
         {
+            HAL_GPIO_WritePin(Inp4_GPIO_Port, Inp4_Pin, GPIO_PIN_RESET);  // awake light off
             HAL_SuspendTick();
             HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
             HAL_ResumeTick();
+            HAL_GPIO_WritePin(Inp4_GPIO_Port, Inp4_Pin, GPIO_PIN_SET);    // awake light on
         }
     }
 }
