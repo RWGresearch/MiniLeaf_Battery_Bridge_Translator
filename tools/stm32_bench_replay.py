@@ -16,9 +16,20 @@ CAPTURE (CAN2, optional, needs a SECOND adapter): with --capture-channel
 set, simultaneously listens on a second PCAN adapter wired to the board's
 CAN2/Leaf-facing header and records every frame the board actually
 transmits into a new .trc file - this is the "board's real output" half of
-Phase 7's bench validation. See tests/check_stm32_golden_vectors.py (not
-yet built) for diffing that captured file against what bridge/ itself
-computes for the same input.
+Phase 7's bench validation. See tests/check_stm32_golden_vectors.py for
+diffing that captured file against what bridge/ itself computes for the
+same input.
+
+INJECT-SIDE RECORDING (CAN1, optional, added 2026-08-20): with
+--capture-inject (or --capture-inject-output), also records everything
+actually sent/received on the INJECT channel itself - the broadcast frames
+above plus the UDS DID request/response exchange - into its own .trc file.
+Without this, only the board's CAN2 output was ever recorded; a discrepancy
+between the SOURCE .trc's bytes and what genuinely reached the board over
+the wire couldn't be told apart from a real board-side decode issue. Added
+after exactly that ambiguity came up diagnosing a brief pack_current_a
+startup transient in check_stm32_golden_vectors.py's diff output - see
+run_replay()'s own docstring.
 
 The board only starts transmitting ANYTHING on CAN2 once it has seen at
 least one frame arrive there (bridge_sequencer.c/bridge/realtime_engine.py's
@@ -57,6 +68,8 @@ Usage:
     py tools/stm32_bench_replay.py --trc "logs/some_capture.trc" --channel PCAN_USBBUS1 --no-uds-responder
     py tools/stm32_bench_replay.py --trc "logs/some_capture.trc" --channel PCAN_USBBUS1 \\
         --capture-channel PCAN_USBBUS2 --capture-output "logs/some_capture_board_output.trc"
+    py tools/stm32_bench_replay.py --trc "logs/some_capture.trc" --channel PCAN_USBBUS1 \\
+        --capture-channel PCAN_USBBUS2 --capture-inject
 """
 import argparse
 import os
@@ -279,11 +292,17 @@ class UdsResponder(threading.Thread):
     inter-frame gap between response frames, not the original capture's own
     (irrelevant) timing for this part."""
 
-    def __init__(self, bus, did_responses, log_fn):
+    def __init__(self, bus, did_responses, log_fn, logger=None):
         super().__init__(daemon=True, name='UdsResponder')
         self.bus = bus
         self.did_responses = did_responses
         self.log_fn = log_fn
+        # Optional TrcLogger (added 2026-08-20, run_replay()'s inject_output)
+        # - when given, records this DID request/response exchange under the
+        # same 'rz450e' (CAN1) role as the broadcast frames run_replay()
+        # itself sends, so a bench run's full CAN1 traffic (broadcast TX +
+        # UDS RX/TX) lands in one .trc file.
+        self.logger = logger
         self._stop = threading.Event()
         self.requests_seen = 0
         self.responses_sent = 0
@@ -301,6 +320,8 @@ class UdsResponder(threading.Thread):
             if kind != 'rx':
                 continue
             data = bytes(msg.data)
+            if self.logger:
+                self.logger.log_frame('rz450e', False, msg.arbitration_id, len(data), data)
             if msg.arbitration_id != TOYOTA_REQ_ID or len(data) < 4 or data[0] != 0x03 or data[1] != 0x22:
                 continue
             did = (data[2], data[3])
@@ -314,19 +335,37 @@ class UdsResponder(threading.Thread):
                 continue
             for frame in frames:
                 self.bus.send(TOYOTA_RESP_ID, frame)
+                if self.logger:
+                    self.logger.log_frame('rz450e', True, TOYOTA_RESP_ID, len(frame), frame)
                 time.sleep(0.005)
             self.responses_sent += 1
             self.log_fn(f'UDS request for DID {did[0]:02X}{did[1]:02X} -> replayed cached response '
                         f'({len(frames)} frame(s))')
 
 
-def run_replay(broadcast_frames, did_responses, channel, speed, use_responder, log_fn, stop_event=None):
+def run_replay(broadcast_frames, did_responses, channel, speed, use_responder, log_fn, stop_event=None,
+               inject_output=None):
     """`stop_event` (optional threading.Event) lets a caller cancel a
     replay early - e.g. a GUI's Stop button (gui/stm32_bench_window.py).
     The CLI's own KeyboardInterrupt path (below) still works standalone
     without one. Sleeps between frames in short slices so a Stop request
     is noticed within ~0.1s even during a long inter-frame gap, rather than
-    only being checked once per frame."""
+    only being checked once per frame.
+
+    `inject_output` (optional path, added 2026-08-20) - when given, records
+    everything actually sent/received on THIS (CAN1/inject) channel into a
+    NEW .trc file, under the 'rz450e' role (bridge/trc_log.py) - the missing
+    other half of check_stm32_golden_vectors.py's bench validation: until
+    now, capture_output() below recorded what the board transmitted on CAN2,
+    but nothing recorded what actually went out (or came back) on CAN1
+    during the same run, so a discrepancy between the SOURCE .trc's bytes
+    and what genuinely reached the board over the wire couldn't be told
+    apart from a real board-side decode issue. Covers both the broadcast
+    frames sent below AND the UDS DID request/response exchange (handled by
+    UdsResponder, which receives the SAME logger instance) - RX DID requests
+    are only ever drained (and so only ever logged) while the responder is
+    active; with --no-uds-responder nothing consumes this channel's rx_queue
+    at all, same limitation that already existed before this option."""
     bus = can_backend.BusConnection('inject', demo=False)
     bus.log_fn = log_fn
     bus.connect(channel)
@@ -334,47 +373,108 @@ def run_replay(broadcast_frames, did_responses, channel, speed, use_responder, l
         log_fn(f'ERROR: could not connect to {channel} - {_connect_fail_reason(bus)}')
         return False
 
+    inject_logger = None
+    if inject_output:
+        out_dir = os.path.dirname(inject_output)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        inject_logger = TrcLogger()
+        inject_logger.start(inject_output, can_backend.BITRATE)
+        log_fn(f'Recording everything sent/received on {channel} (CAN1/inject) -> {inject_output}')
+
     responder = None
     if use_responder:
-        responder = UdsResponder(bus, did_responses, log_fn)
+        responder = UdsResponder(bus, did_responses, log_fn, logger=inject_logger)
         responder.start()
         log_fn(f'UDS responder active - {len(did_responses)} DID(s) with a cached response available')
 
     log_fn(f'Replaying {len(broadcast_frames)} broadcast frames at {speed}x speed on {channel}...')
-    t_prev = 0.0
+    # Anchored to ONE absolute start time, not accumulated per-frame sleeps
+    # (fixed 2026-08-20 - real bug found via a fresh inject-side capture,
+    # compared against the SOURCE .trc's own timestamps: the old loop's
+    # `gap = (t_rel - t_prev) / speed` only ever accounted for the requested
+    # SLEEP duration, never the real wall-clock time actually spent in
+    # bus.send()/inject_logger.log_frame() (a PCAN USB write + a file write,
+    # tens of thousands of times per session) - that unaccounted overhead
+    # compounded every single frame, producing a constant ~1.165x slowdown
+    # (measured directly: a 169.7s source session took 197.7s of real time
+    # to actually replay) rather than a one-off jitter. Over a multi-minute
+    # session this grew to 20+ seconds of accumulated lag between what a
+    # board-output capture's timestamps nominally mean and when the board
+    # actually received the corresponding data - the real explanation for
+    # check_stm32_golden_vectors.py's "pack_current_a startup blip" (a fast-
+    # changing signal compared against the wrong, unadjusted moment in a
+    # long session) and the loss_of_data_on_batt soft-cut timing gap - NOT a
+    # firmware issue. Computing each frame's absolute due time from the same
+    # single `replay_start` anchor is self-correcting: a frame sent late
+    # because the previous send()/log_frame() took real time just gets a
+    # shorter sleep before it, instead of every frame after it inheriting
+    # that same debt forever.
+    replay_start = time.monotonic()
     sent = 0
     stopped = False
+    # Isolates where real per-frame time actually goes (added 2026-08-20,
+    # right after the replay_start anchor fix above made ZERO measurable
+    # difference to a real bench run's total drift - proved the drift isn't
+    # compounding-sleep-math at all, but a genuine throughput ceiling: total
+    # real per-frame cost exceeding the per-frame time budget the source
+    # capture's own frame rate demands. This tells the NEXT run exactly
+    # which call (bus.send() - almost certainly the PCAN USB driver round-
+    # trip - vs. inject_logger.log_frame()) is actually eating that budget,
+    # instead of guessing.
+    send_time_total = 0.0
+    log_time_total = 0.0
     try:
         for t_rel, can_id, data in broadcast_frames:
             if stop_event is not None and stop_event.is_set():
                 stopped = True
                 break
-            gap = (t_rel - t_prev) / speed
-            while gap > 0:
+            due = replay_start + t_rel / speed
+            while True:
+                remaining = due - time.monotonic()
+                if remaining <= 0:
+                    break
                 if stop_event is not None and stop_event.is_set():
                     stopped = True
                     break
-                slice_s = min(gap, 0.1)
-                time.sleep(slice_s)
-                gap -= slice_s
+                time.sleep(min(remaining, 0.1))
             if stopped:
                 break
-            t_prev = t_rel
+            t_send0 = time.monotonic()
             bus.send(can_id, data)
+            t_send1 = time.monotonic()
+            send_time_total += t_send1 - t_send0
+            if inject_logger:
+                inject_logger.log_frame('rz450e', True, can_id, len(data), data)
+                log_time_total += time.monotonic() - t_send1
             sent += 1
             if sent % 2000 == 0:
-                log_fn(f'  ...{sent}/{len(broadcast_frames)} frames sent (t={t_rel:.1f}s of capture)')
+                lag = time.monotonic() - due
+                log_fn(f'  ...{sent}/{len(broadcast_frames)} frames sent (t={t_rel:.1f}s of capture, '
+                       f'{lag:+.2f}s behind schedule, avg send()={1000*send_time_total/sent:.3f}ms'
+                       + (f', avg log_frame()={1000*log_time_total/sent:.3f}ms' if inject_logger else ''))
     except KeyboardInterrupt:
         stopped = True
     finally:
         if responder:
             responder.stop()
         bus.disconnect()
+        if inject_logger:
+            inject_logger.stop()
 
     if stopped:
         log_fn(f'Stopped - {sent}/{len(broadcast_frames)} broadcast frames sent.')
     else:
         log_fn(f'Done - {sent} broadcast frames sent.')
+    if sent:
+        elapsed = time.monotonic() - replay_start
+        budget_ms = 1000 * elapsed / sent
+        send_ms = 1000 * send_time_total / sent
+        log_ms = 1000 * log_time_total / sent if inject_logger else 0.0
+        log_fn(f'Timing breakdown: {sent} frames, {elapsed:.1f}s real elapsed '
+               f'(per-frame budget {budget_ms:.3f}ms) - avg bus.send()={send_ms:.3f}ms'
+               + (f', avg inject_logger.log_frame()={log_ms:.3f}ms' if inject_logger else '')
+               + f', accounted for {100*(send_time_total + log_time_total)/elapsed:.1f}% of real elapsed time')
     if responder:
         log_fn(f'UDS responder: {responder.requests_seen} request(s) seen, '
                f'{responder.responses_sent} answered, {len(responder.unknown_dids)} unknown DID(s).')
@@ -573,7 +673,7 @@ def _interruptible_sleep(seconds, stop_event, log_fn=None):
 def replay_and_capture(broadcast_frames, did_responses, inject_channel, capture_channel, capture_out_path,
                         speed, use_responder, log_fn, stop_event=None, send_wake=True, leaf_track=None,
                         test_wind_down=False, wind_down_wait_s=None, wind_down_tail_s=DEFAULT_WIND_DOWN_TAIL_S,
-                        profile_path=None):
+                        profile_path=None, inject_output=None):
     """Runs capture_output() in a background thread and run_replay() in the
     calling thread, so a single call drives both adapters together - the
     normal way to actually run Phase 7's bench test (inject known-good
@@ -601,7 +701,12 @@ def replay_and_capture(broadcast_frames, did_responses, inject_channel, capture_
     useful even with a real leaf_track, e.g. if that track's own real
     session never happened to include a real wind-down. Keeps recording for
     `wind_down_tail_s` afterward so the recovery is visible in the captured
-    .trc."""
+    .trc.
+
+    `inject_output` (optional path) - passed straight through to
+    run_replay() to also record everything sent/received on the CAN1/inject
+    side, alongside the CAN2/capture side this function already records -
+    see run_replay()'s own docstring."""
     capture_ready = threading.Event()
     capture_stop = threading.Event()
     resend_wake = threading.Event()
@@ -618,7 +723,7 @@ def replay_and_capture(broadcast_frames, did_responses, inject_channel, capture_
     replay_start = time.monotonic()
     try:
         ok = run_replay(broadcast_frames, did_responses, inject_channel, speed, use_responder, log_fn,
-                         stop_event=stop_event)
+                         stop_event=stop_event, inject_output=inject_output)
         if test_wind_down and ok and leaf_track:
             # leaf_track plays out inside the OTHER thread (capture_output())
             # on its own clock - if it runs longer than the CAN1 replay just
@@ -649,6 +754,11 @@ def replay_and_capture(broadcast_frames, did_responses, inject_channel, capture_
 def default_capture_output_path(trc_path):
     base = os.path.splitext(os.path.basename(trc_path))[0]
     return os.path.join(HARDWARE_OUTPUT_DIR, base + '_board_output.trc')
+
+
+def default_inject_output_path(trc_path):
+    base = os.path.splitext(os.path.basename(trc_path))[0]
+    return os.path.join(HARDWARE_OUTPUT_DIR, base + '_inject_output.trc')
 
 
 # How long identify_channel() listens before reporting - long enough to
@@ -738,6 +848,15 @@ def main():
     parser.add_argument('--capture-output',
                          help='Path to write the captured board-output .trc (default: logs/'
                               'Hardwere_Output_Tests/<trc name>_board_output.trc)')
+    parser.add_argument('--capture-inject', action='store_true',
+                         help='Also record everything actually sent/received on the CAN1/inject channel '
+                              '(broadcast TX + UDS DID request/response) to --capture-inject-output - the '
+                              'other half of a bench run, alongside --capture-channel\'s CAN2 recording. '
+                              'Works standalone too (no --capture-channel needed) if you only want to '
+                              'confirm what went out on CAN1.')
+    parser.add_argument('--capture-inject-output',
+                         help='Path to write the CAN1/inject-side .trc (default: logs/'
+                              'Hardwere_Output_Tests/<trc name>_inject_output.trc) - implies --capture-inject')
     parser.add_argument('--no-wake-frame', action='store_true',
                          help='Do not send the synthetic CAN2 wake frame before capturing - the board only '
                               'starts transmitting on CAN2 after seeing traffic there, so this only makes '
@@ -799,15 +918,20 @@ def main():
     if args.test_wind_down and not args.capture_channel:
         parser.error('--test-wind-down requires --capture-channel')
 
+    inject_output = None
+    if args.capture_inject or args.capture_inject_output:
+        inject_output = args.capture_inject_output or default_inject_output_path(args.trc)
+
     if args.capture_channel:
         capture_out_path = args.capture_output or default_capture_output_path(args.trc)
         ok = replay_and_capture(broadcast_frames, did_responses, args.channel, args.capture_channel,
                                  capture_out_path, args.speed, not args.no_uds_responder, log_fn,
                                  send_wake=not args.no_wake_frame, leaf_track=leaf_track,
-                                 test_wind_down=args.test_wind_down, wind_down_wait_s=args.wind_down_wait)
+                                 test_wind_down=args.test_wind_down, wind_down_wait_s=args.wind_down_wait,
+                                 inject_output=inject_output)
     else:
         ok = run_replay(broadcast_frames, did_responses, args.channel, args.speed,
-                         not args.no_uds_responder, log_fn)
+                         not args.no_uds_responder, log_fn, inject_output=inject_output)
     sys.exit(0 if ok else 1)
 
 

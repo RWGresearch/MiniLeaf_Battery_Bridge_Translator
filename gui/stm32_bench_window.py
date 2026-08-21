@@ -44,6 +44,8 @@ class Stm32BenchReplayWindow(tk.Toplevel):
         self.channel_var = tk.StringVar(value='')
         self.speed_var = tk.StringVar(value='1.0')
         self.responder_var = tk.BooleanVar(value=True)
+        self.inject_capture_var = tk.BooleanVar(value=False)
+        self.inject_output_var = tk.StringVar(value='')
         self.capture_var = tk.BooleanVar(value=True)
         self.capture_channel_var = tk.StringVar(value='')
         self.capture_output_var = tk.StringVar(value='')
@@ -92,6 +94,24 @@ class Stm32BenchReplayWindow(tk.Toplevel):
         ttk.Entry(opt_row, textvariable=self.speed_var, width=6).pack(side='left', padx=(4, 12))
         ttk.Checkbutton(opt_row, text='UDS responder (answer live DID requests with cached responses)',
                          variable=self.responder_var).pack(side='left')
+
+        inj_cap_row = ttk.Frame(self)
+        inj_cap_row.pack(fill='x', padx=8, pady=2)
+        ttk.Checkbutton(
+            inj_cap_row,
+            text='Also record everything sent/received on CAN1 itself (broadcast TX + UDS RX/TX) - '
+                 'the other half of the bench run, to tell a replay-side issue apart from a real board bug',
+            variable=self.inject_capture_var, command=self._on_inject_capture_toggle).pack(anchor='w')
+
+        inj_out_row = ttk.Frame(self)
+        inj_out_row.pack(fill='x', padx=8, pady=2)
+        ttk.Label(inj_out_row, text='CAN1 output .trc:', width=14).pack(side='left')
+        self.inject_output_entry = ttk.Entry(inj_out_row, textvariable=self.inject_output_var, width=28,
+                                              state='disabled')
+        self.inject_output_entry.pack(side='left', padx=(0, 4), fill='x', expand=True)
+        self.inject_output_browse_btn = ttk.Button(inj_out_row, text='Browse...', style='Small.TButton',
+                                                     command=self._browse_inject_output, state='disabled')
+        self.inject_output_browse_btn.pack(side='left')
 
         # ── Capture (CAN2) ──
         cap_head = ttk.Frame(self)
@@ -175,6 +195,11 @@ class Stm32BenchReplayWindow(tk.Toplevel):
 
         self._on_capture_toggle()
 
+    def _on_inject_capture_toggle(self):
+        state = 'normal' if self.inject_capture_var.get() else 'disabled'
+        self.inject_output_entry.configure(state=state)
+        self.inject_output_browse_btn.configure(state=state)
+
     def _on_capture_toggle(self):
         state = 'readonly' if self.capture_var.get() else 'disabled'
         entry_state = 'normal' if self.capture_var.get() else 'disabled'
@@ -193,11 +218,21 @@ class Stm32BenchReplayWindow(tk.Toplevel):
         self._trc_path = path
         self.trc_path_var.set(os.path.basename(path))
         self.capture_output_var.set(stm32_bench_replay.default_capture_output_path(path))
+        self.inject_output_var.set(stm32_bench_replay.default_inject_output_path(path))
         self._loaded = None
         self.start_btn.configure(state='disabled')
         self.status_var.set(f'Loading {os.path.basename(path)}... (large captures can take a while)')
         self._load_thread = threading.Thread(target=self._load_worker, args=(path,), daemon=True)
         self._load_thread.start()
+
+    def _browse_inject_output(self):
+        initial = self.inject_output_var.get() or 'logs'
+        path = filedialog.asksaveasfilename(
+            defaultextension='.trc', initialdir=os.path.dirname(initial) or 'logs',
+            initialfile=os.path.basename(initial) or 'inject_output.trc',
+            filetypes=[('PCAN Trace', '*.trc'), ('All', '*.*')])
+        if path:
+            self.inject_output_var.set(path)
 
     def _browse_capture_output(self):
         initial = self.capture_output_var.get() or 'logs'
@@ -293,6 +328,11 @@ class Stm32BenchReplayWindow(tk.Toplevel):
             messagebox.showerror('STM32 Bench Replay', 'Speed must be a positive number.', parent=self)
             return
 
+        inject_output = self.inject_output_var.get() if self.inject_capture_var.get() else None
+        if self.inject_capture_var.get() and not inject_output:
+            messagebox.showerror('STM32 Bench Replay', 'No CAN1 output path set.', parent=self)
+            return
+
         use_capture = self.capture_var.get()
         capture_channel = self.capture_channel_var.get()
         capture_output = self.capture_output_var.get()
@@ -313,35 +353,38 @@ class Stm32BenchReplayWindow(tk.Toplevel):
         self._stop_event = threading.Event()
         self.start_btn.configure(state='disabled')
         self.stop_btn.configure(state='normal')
+        inject_note = f', also recording CAN1 -> {inject_output}' if inject_output else ''
         if use_capture:
             self.status_var.set(f'Replaying on {channel} at {speed}x, capturing on {capture_channel}...')
             self.log_fn(f'STM32 Bench Replay: starting on {channel} at {speed}x '
                         f'({"with" if self.responder_var.get() else "without"} UDS responder), '
-                        f'capturing board output on {capture_channel} -> {capture_output}')
+                        f'capturing board output on {capture_channel} -> {capture_output}{inject_note}')
         else:
             self.status_var.set(f'Replaying on {channel} at {speed}x...')
             self.log_fn(f'STM32 Bench Replay: starting on {channel} at {speed}x '
-                        f'({"with" if self.responder_var.get() else "without"} UDS responder)')
+                        f'({"with" if self.responder_var.get() else "without"} UDS responder){inject_note}')
         self._replay_thread = threading.Thread(
             target=self._replay_worker,
             args=(broadcast_frames, did_responses, channel, speed, self.responder_var.get(),
                   use_capture, capture_channel, capture_output, self.wake_frame_var.get(),
-                  leaf_track if use_leaf_track else None, self.test_wind_down_var.get(), self._stop_event),
+                  leaf_track if use_leaf_track else None, self.test_wind_down_var.get(), self._stop_event,
+                  inject_output),
             daemon=True)
         self._replay_thread.start()
         self._poll_replay_done()
 
     def _replay_worker(self, broadcast_frames, did_responses, channel, speed, use_responder,
                         use_capture, capture_channel, capture_output, send_wake, leaf_track, test_wind_down,
-                        stop_event):
+                        stop_event, inject_output):
         if use_capture:
             stm32_bench_replay.replay_and_capture(
                 broadcast_frames, did_responses, channel, capture_channel, capture_output,
                 speed, use_responder, self.log_fn, stop_event=stop_event, send_wake=send_wake,
-                leaf_track=leaf_track, test_wind_down=test_wind_down)
+                leaf_track=leaf_track, test_wind_down=test_wind_down, inject_output=inject_output)
         else:
             stm32_bench_replay.run_replay(broadcast_frames, did_responses, channel, speed,
-                                           use_responder, self.log_fn, stop_event=stop_event)
+                                           use_responder, self.log_fn, stop_event=stop_event,
+                                           inject_output=inject_output)
 
     def _poll_replay_done(self):
         if not self.winfo_exists():

@@ -26,6 +26,18 @@ hardcoded startup-only byte patterns (byte-verified against real captures,
 same tier as CODE_1DC/SEQ_5EB - see leaf_output.c's leaf_build_1db_startup())
 that were never derived from RZ450e data at all, so diffing them against
 "what mapping/management would compute" would compare apples to oranges.
+Applied PER WAKE CYCLE, not just once at the file's start (2026-08-20 fix,
+_detect_cycle_starts) - a source .trc with several real wake/sleep cycles
+back-to-back produces a board-output file with several of these startup-only
+windows in it.
+
+DID-sourced signals (soc_pct, capacity_packN_ah, primary_pack_v/current_a)
+are re-fed into the reference timeline every DID_REFEED_INTERVAL_S (2026-
+08-20 fix) rather than once at t=0 - see _build_rz_oracle's docstring for
+why feeding them only once made ManagementEngine's staleness_watchdog trip
+in this script's OWN reference computation after soft_cut_s, producing
+spurious charge_limit_kw/charger_limit_kw mismatches unrelated to anything
+the real board actually did.
 
 Compares 9 fields carried by 0x1DB/0x1DC/0x55B/0x5BC - the ones that
 actually flow through mapping_engine/management_engine (the two modules a
@@ -46,6 +58,7 @@ Usage:
         --profile config/some-other-profile.json
 """
 import argparse
+import bisect
 import os
 import sys
 import time as time_module
@@ -60,11 +73,20 @@ from tools.stm32_bench_replay import BROADCAST_IDS, TOYOTA_REQ_ID, TOYOTA_RESP_I
 DID_SOC = (0x1F, 0x5B)
 DID_CAPACITY = (0x1D, 0x3E)
 DID_PRIMARY_VI = (0x1F, 0x9A)
+DID_TEMP_PROBES = rz450e_signals.DID_TEMP_PROBES  # (0x18, 0x14)
 
 _DID_DECODERS = {
     DID_SOC: rz450e_signals.decode_soc,
     DID_CAPACITY: rz450e_signals.decode_capacity,
     DID_PRIMARY_VI: rz450e_signals.decode_primary_v_i,
+    # Added 2026-08-20 alongside the DID_REFEED_INTERVAL_S fix below - this
+    # DID was missing here entirely, so temp_01_did..temp_16_did were NEVER
+    # fed into the reference timeline at all (not even once at t=0), which
+    # on its own was enough to trip staleness_watchdog's "never seen this
+    # session" since_start clock past soft_cut_s regardless of the other 3
+    # DIDs being re-fed - the actual root cause of the charge_limit_kw/
+    # charger_limit_kw false mismatches, not (only) the once-at-t=0 issue.
+    DID_TEMP_PROBES: rz450e_signals.decode_temp_probes_did,
 }
 
 
@@ -231,12 +253,24 @@ def _verify_decoders(iterations=2000, seed=20260818):
     return mismatches
 
 
+# How often to re-feed each DID's last-known payload into the reference
+# timeline (see _build_rz_oracle's docstring below). Must stay comfortably
+# under any realistic staleness_watchdog.soft_cut_s (clamped 1.0-600.0s in
+# bridge/management_engine.py, but every real profile seen so far uses
+# 60.0s) - 5.0s matches the real DID round-robin's own per-request cadence
+# (did_response_timeout_s default 5.0s), so it's also a reasonably faithful
+# stand-in for "the real board's own live DID polling never actually goes
+# stale," not just an arbitrary small number.
+DID_REFEED_INTERVAL_S = 5.0
+
+
 def _build_rz_oracle(source_rows, rz_bus_num):
     """Returns [(t_rel, key, value), ...] sorted by time - every RZ450e
     signal update the source capture contains, decoded with the REAL
     bridge.rz450e_signals functions (not re-derived)."""
     t0 = float(source_rows[0]['timestamp'])
     events = []
+    t_last = 0.0
     for row in source_rows:
         if row['bus_num'] != rz_bus_num or row['dir'] != 'RX':
             continue
@@ -245,8 +279,23 @@ def _build_rz_oracle(source_rows, rz_bus_num):
             continue
         data = bytes(int(x, 16) for x in row['data_hex'].split()) if row['data_hex'].strip() else b''
         t_rel = float(row['timestamp']) - t0
-        for k, v in rz450e_signals.decode_frame(can_id, data).items():
+        t_last = max(t_last, t_rel)
+        decoded = rz450e_signals.decode_frame(can_id, data)
+        for k, v in decoded.items():
             events.append((t_rel, k, v))
+        if can_id == rz450e_signals.ID_TEMPS and decoded:
+            # bridge/realtime_engine.py's real ingest thread ALWAYS writes
+            # the temp_NN_can backup copy on every 0x4AA frame, alongside
+            # (or instead of, once DID goes stale) the front-door temp_NN
+            # key - see its own comment at the 0x4AA branch. temp_NN_can is
+            # a SEPARATE registered input (rz450e_signals.temp_probe_can_
+            # keys()) that staleness_watchdog watches too - added
+            # 2026-08-20 alongside the DID_TEMP_PROBES fix above, found the
+            # same way: without it, every temp_NN_can key sits "never seen"
+            # for the whole session and alone was enough to trip the
+            # watchdog regardless of the two DID-related fixes.
+            for k, v in decoded.items():
+                events.append((t_rel, f'{k}_can', v))
 
     # DID-sourced signals (soc_pct, capacity_packN_ah, primary_pack_v/
     # current_a) are DELIBERATELY NOT fed as a time-varying series matching
@@ -260,9 +309,24 @@ def _build_rz_oracle(source_rows, rz_bus_num):
     # these as time-varying (as the first version of this script did)
     # produced 100% spurious mismatches on fine_soc_pct even though the
     # board was behaving exactly as the real bench-replay tooling intends.
-    # Fed once at t=0 here - available "from wake," a reasonable proxy given
-    # comparisons only start at T_RUNNING (2.1s) anyway, plenty of time for
-    # a real DID round-robin cycle to have completed at least once.
+    #
+    # RE-FED every DID_REFEED_INTERVAL_S from t=0 through the end of the
+    # session (added 2026-08-20, fixing a real bug found the same day this
+    # comment above was written: feeding each DID-sourced key ONCE only,
+    # at t=0, means ManagementEngine's staleness_watchdog - which covers
+    # EVERY registered input signal, not just the 3 alive counters, see
+    # management_engine.py's own comment there - sees these keys' age climb
+    # past soft_cut_s and zeroes charge_limit_kw/charger_limit_kw in THIS
+    # SCRIPT's reference computation only, starting at t=soft_cut_s and
+    # never recovering for the rest of the session. Produced ~50-60%
+    # "mismatch" on charge_limit_kw/charger_limit_kw on every single
+    # session checked 2026-08-20, including plain non-charging drives -
+    # confirmed a script bug, not a firmware one, by directly checking the
+    # real board's output: it stayed correctly parked at the idle default
+    # the whole time, because its OWN live DID polling never actually goes
+    # stale. Re-feeding periodically (not modeling exact real timestamps,
+    # same reasoning as the "fed once" comment above) keeps this script's
+    # reference in the same "never stale" state the real board is in.
     last_did_payload = {}
     for _t_rel, did, payload in _iter_did_payloads(source_rows, rz_bus_num):
         last_did_payload[did] = payload
@@ -270,11 +334,44 @@ def _build_rz_oracle(source_rows, rz_bus_num):
         decoder = _DID_DECODERS.get(did)
         if not decoder:
             continue
-        for k, v in decoder(payload).items():
-            events.append((0.0, k, v))
+        decoded = decoder(payload)
+        t = 0.0
+        while t <= t_last:
+            for k, v in decoded.items():
+                events.append((t, k, v))
+            t += DID_REFEED_INTERVAL_S
 
     events.sort(key=lambda e: e[0])
     return events
+
+
+# A gap this long in the board's own transmitted traffic means it went
+# through winding_down -> stopped -> waiting_for_wake and later woke again
+# within the SAME capture file (added 2026-08-20 - a source .trc with
+# several real wake/sleep cycles back-to-back, e.g. a repeated charge-
+# session test, produces a board-output file with several of the fixed
+# hardcoded startup-only windows in it, not just one at the very start of
+# the file). Comfortably bigger than any normal inter-frame gap (TX_PERIOD_
+# MS tops out well under 1s) but comfortably smaller than the real
+# multi-second stopped/waiting_for_wake dwell every session in practice
+# shows in its own log_output.txt.
+RESTART_GAP_S = 2.0
+
+
+def _detect_cycle_starts(board_rows, board_t0):
+    """Returns a sorted list of t_rel values where the board's own
+    transmitted traffic resumes after a gap >= RESTART_GAP_S (or the very
+    first row) - one entry per real wake within this capture file."""
+    starts = []
+    t_prev = None
+    for row in board_rows:
+        if row['bus_num'] != 2 or row['dir'] != 'RX':
+            continue
+        t_rel = float(row['timestamp']) - board_t0
+        if t_prev is None or (t_rel - t_prev) >= RESTART_GAP_S:
+            starts.append(t_rel)
+        t_prev = t_rel
+    return starts
 
 
 def run_diff(source_path, board_output_path, profile_path, log_fn=print):
@@ -295,6 +392,11 @@ def run_diff(source_path, board_output_path, profile_path, log_fn=print):
     if not board_rows:
         raise ValueError(f'{board_output_path}: no parseable rows found')
     board_t0 = float(board_rows[0]['timestamp'])
+    cycle_starts = _detect_cycle_starts(board_rows, board_t0)
+    if len(cycle_starts) > 1:
+        log_fn(f'Detected {len(cycle_starts)} separate wake cycles in board-output capture '
+               f'(gaps >= {RESTART_GAP_S:g}s in board TX) - skipping each one\'s own fixed '
+               f'startup-only window, not just the file\'s first: {[f"{t:.1f}s" for t in cycle_starts]}')
 
     fake_now = [0.0]
     real_monotonic = time_module.monotonic
@@ -322,13 +424,29 @@ def run_diff(source_path, board_output_path, profile_path, log_fn=print):
     results = {k: {'checked': 0, 'mismatches': 0, 'max_delta': 0.0} for k in _TOLERANCES}
     examples = []
 
+    # staleness_watchdog reads these 3 via SharedState.counter_stale_age(),
+    # which is populated ONLY by note_counter() (change-detection semantics -
+    # tracks last ACTUAL VALUE CHANGE, not last write) - see bridge/state.py
+    # and bridge/realtime_engine.py's own note_counter() calls for
+    # counter_5s/alive_3f1/alive_358. update_input() does not touch that
+    # tracking at all, so feeding these 3 keys through update_input() (as
+    # every other key correctly is) left counter_stale_age() returning None
+    # forever, which the watchdog treats as "never seen" and ages from
+    # session start - found 2026-08-20 as the last of three stacked causes
+    # (alongside the DID_TEMP_PROBES and temp_NN_can fixes above) of the
+    # same false charge_limit_kw/charger_limit_kw staleness trip.
+    _COUNTER_KEYS = {'alive_3f1', 'alive_358', 'counter_5s'}
+
     def _tick_to(t_target):
         nonlocal ev_idx, next_tick_t, expected
         while next_tick_t <= t_target:
             while ev_idx < len(events) and events[ev_idx][0] <= next_tick_t:
                 ev_t, key, value = events[ev_idx]
                 fake_now[0] = ev_t
-                state.update_input(key, value)
+                if key in _COUNTER_KEYS:
+                    state.note_counter(key, int(value))
+                else:
+                    state.update_input(key, value)
                 ev_idx += 1
             fake_now[0] = next_tick_t
             # Mirrors bridge/realtime_engine.py's _compose_leaf_state() /
@@ -358,7 +476,11 @@ def run_diff(source_path, board_output_path, profile_path, log_fn=print):
                 continue
 
             _tick_to(t_rel)
-            if t_rel < skip_before_s:
+            # Skip this row's own cycle's fixed startup-only window (see
+            # _detect_cycle_starts), not just the file's very first one.
+            cycle_idx = bisect.bisect_right(cycle_starts, t_rel) - 1
+            cycle_start = cycle_starts[cycle_idx] if cycle_idx >= 0 else 0.0
+            if t_rel - cycle_start < skip_before_s:
                 continue
 
             actual = decoder(data)

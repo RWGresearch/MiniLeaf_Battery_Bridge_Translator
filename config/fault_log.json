@@ -27,7 +27,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "proactive regen taper factor=1.00 (binding=SoC; voltage_factor=1.00 [3.475V, full <= 4.05V, min >= 4.1V]; soc_factor=1.00 [12.9%, full <= 90%, min >= 95%])"
+    "last_detail": "proactive regen taper factor=1.00 (binding=SoC; voltage_factor=1.00 [3.485V, full <= 4.05V, min >= 4.1V]; soc_factor=1.00 [13.7%, full <= 90%, min >= 95%])"
   },
   "ac_overvoltage_emergency": {
     "label": "Cell overvoltage EMERGENCY hard cut - AC charger (per-cell)",
@@ -37,7 +37,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "not actively charging per RZ450e interlock - AC taper inactive, \"Max power for charger\" left at its mapped/idle value (driving-mode overvoltage protection is charge_target_taper's per-cell regen power limit, above, not this feature)"
+    "last_detail": "AC charger taper factor=1.00 (worst cell 3.485V - full <= 4.13V, min >= 4.17V, floor 1kW)"
   },
   "over_temp_emergency": {
     "label": "Over-temperature EMERGENCY hard cut (hottest probe)",
@@ -47,7 +47,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "discharge_factor=1.00, regen_factor=1.00 (coldest probe 27.0C, hottest probe 28.0C)"
+    "last_detail": "discharge_factor=1.00, regen_factor=1.00 (coldest probe 26.0C, hottest probe 27.0C)"
   },
   "charge_cold_block": {
     "label": "Regen blocked - coldest probe at/below freezing",
@@ -57,7 +57,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "discharge_factor=1.00, regen_factor=1.00 (coldest probe 27.0C, hottest probe 28.0C)"
+    "last_detail": "discharge_factor=1.00, regen_factor=1.00 (coldest probe 26.0C, hottest probe 27.0C)"
   },
   "discharge_temp_zero": {
     "label": "Discharge power at zero - over-temperature",
@@ -67,7 +67,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "discharge_factor=1.00, regen_factor=1.00 (coldest probe 27.0C, hottest probe 28.0C)"
+    "last_detail": "discharge_factor=1.00, regen_factor=1.00 (coldest probe 26.0C, hottest probe 27.0C)"
   },
   "charge_temp_zero": {
     "label": "Regen power at zero - over-temperature",
@@ -77,7 +77,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "discharge_factor=1.00, regen_factor=1.00 (coldest probe 27.0C, hottest probe 28.0C)"
+    "last_detail": "discharge_factor=1.00, regen_factor=1.00 (coldest probe 26.0C, hottest probe 27.0C)"
   },
   "cell_imbalance_warn": {
     "label": "Cell imbalance warning (spread)",
@@ -97,7 +97,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (charge 0.0A)"
+    "last_detail": "ok (charge 0.2A)"
   },
   "overcurrent_charge_warn": {
     "label": "Overcurrent warning - charge/regen",
@@ -107,7 +107,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (charge 0.0A)"
+    "last_detail": "ok (charge 0.2A)"
   },
   "config_sanity": {
     "label": "Battery-management config has an inverted/nonsensical threshold ordering",
@@ -137,7 +137,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (delta 0mV)"
+    "last_detail": "ok (delta 1mV)"
   },
   "cell_data_mismatch_hard": {
     "label": "Cell data cross-check mismatch - hard cut escalation",
@@ -147,36 +147,36 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (delta 0mV)"
+    "last_detail": "ok (delta 1mV)"
   },
   "staleness_soft": {
     "label": "Staleness watchdog - soft cut (stale data)",
     "level": "soft",
-    "count": 0,
+    "count": 1,
     "active": false,
-    "first_triggered": null,
-    "last_triggered": null,
-    "last_cleared": null,
-    "last_detail": "ok (worst age 4.9s, counter:counter_5s)"
+    "first_triggered": 1787267281.8228016,
+    "last_triggered": 1787267281.8228016,
+    "last_cleared": 1787267400.7341278,
+    "last_detail": "ok (worst age 1.2s, soc_pct)"
   },
   "staleness_hard": {
     "label": "Staleness watchdog - hard cut escalation",
     "level": "hard",
-    "count": 0,
+    "count": 1,
     "active": false,
-    "first_triggered": null,
-    "last_triggered": null,
-    "last_cleared": null,
-    "last_detail": "ok (worst age 4.9s, counter:counter_5s)"
+    "first_triggered": 1787267286.824406,
+    "last_triggered": 1787267286.824406,
+    "last_cleared": 1787267400.734137,
+    "last_detail": "ok (worst age 1.2s, soc_pct)"
   },
   "hard_cut_latch": {
     "label": "Hard cut LATCHED (relay_cut_request/interlock still asserted)",
     "level": "hard",
-    "count": 0,
+    "count": 1,
     "active": false,
-    "first_triggered": null,
-    "last_triggered": null,
-    "last_cleared": null,
+    "first_triggered": 1787267286.8244107,
+    "last_triggered": 1787267286.8244107,
+    "last_cleared": 1787267400.738455,
     "last_detail": "not latched"
   },
   "clamp_qc_full_wh": {
@@ -207,7 +207,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (delta 0.1C)"
+    "last_detail": "ok (delta 0.8C)"
   },
   "temp_data_mismatch_hard": {
     "label": "Temperature data cross-check mismatch - hard cut escalation",
@@ -217,7 +217,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (delta 0.1C)"
+    "last_detail": "ok (delta 0.8C)"
   },
   "ac_cutoff_stop": {
     "label": "AC charger stop-charging cutoff reached (per-cell)",
@@ -227,7 +227,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "not actively charging per RZ450e interlock - AC taper inactive, \"Max power for charger\" left at its mapped/idle value (driving-mode overvoltage protection is charge_target_taper's per-cell regen power limit, above, not this feature)"
+    "last_detail": "AC charger taper factor=1.00 (worst cell 3.485V - full <= 4.13V, min >= 4.17V, floor 1kW)"
   },
   "ac_charge_cold_block": {
     "label": "AC charger blocked - coldest probe at/below freezing",
@@ -237,7 +237,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "not actively charging per RZ450e interlock - AC charging-specific temp derate inactive (driving-mode over-temperature protection is over_temperature_derate, above, not this feature)"
+    "last_detail": "charger_factor=1.00 (coldest probe 26.0C, hottest probe 27.0C, cold block <= 0.0C, hard stop >= 50.0C)"
   },
   "ac_charge_temp_stop": {
     "label": "AC charger stopped - hottest probe over the charging-specific hard-stop temp",
@@ -247,7 +247,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "not actively charging per RZ450e interlock - AC charging-specific temp derate inactive (driving-mode over-temperature protection is over_temperature_derate, above, not this feature)"
+    "last_detail": "charger_factor=1.00 (coldest probe 26.0C, hottest probe 27.0C, cold block <= 0.0C, hard stop >= 50.0C)"
   },
   "temp_probe_mismatch": {
     "label": "Temp probe cross-check mismatch (DID 0x1814 vs 0x4AA per-probe)",
@@ -257,7 +257,7 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (worst delta probe 15 1.0C)"
+    "last_detail": "ok (worst delta probe 14 1.0C)"
   },
   "temp_probe_mismatch_hard": {
     "label": "Temp probe cross-check mismatch - hard cut escalation",
@@ -267,6 +267,6 @@
     "first_triggered": null,
     "last_triggered": null,
     "last_cleared": null,
-    "last_detail": "ok (worst delta probe 15 1.0C)"
+    "last_detail": "ok (worst delta probe 14 1.0C)"
   }
 }
